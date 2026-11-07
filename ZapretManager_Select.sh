@@ -1,26 +1,22 @@
 #!/bin/sh
+# Based on StressOzz/Zapret-Manager 5.041; modified for Forkop and NFQWS2.
 GREEN="\033[1;32m"; CYAN="\033[1;36m"; YELLOW="\033[1;33m"; MAGENTA="\033[1;35m"; NC="\033[0m"; DGRAY="\033[38;5;244m"
-ZMS_URL="https://raw.githubusercontent.com/StressOzz/Zapret-Manager/refs/heads/main/ZapretManager_LuCI.sh"
+ZMS_URL="${ZM_INSTALLER_URL:-}"
 ZMS_MIRRORS="gh-proxy.org ghfast.top gh.llkk.cc ghproxy.net"
 ZMS_SRC="/tmp/zm-select-full.sh"
 ZMS_STATE="/opt/zapret-manager-luci/state"
 V="/www/luci-static/resources/view/zapret-manager"
-IDS="strategy zapret2 steer forkozz bytetube tgproxy mixomo hosts adblock doh awg tailscale terminal monitor openwrt"
-LIST='strategy|Zapret|Обход блокировок|стратегии, тесты, Discord, игры
-zapret2|Zapret2|Обход блокировок|установка и управление
-steer|Steer|Обход блокировок|сервисы через WARP или VPN
-forkozz|Forkozz|Обход блокировок|сервисы через свой VPN
-bytetube|ByeTube|Обход блокировок|YouTube через ByeDPI
-tgproxy|TG WS Proxy|Обход блокировок|прокси для Telegram
-mixomo|Mixomo|Обход блокировок|Mihomo, MagiTrickle, WARP
-hosts|Hosts|Сеть|домены в hosts, GeoHide
-adblock|Блокировка рекламы|Сеть|для всей сети
-doh|DNS over HTTPS|Сеть|шифрованный DNS
-awg|AmneziaWG|Сеть|туннели и WARP
-tailscale|Удалённый доступ|Сеть|роутер из любой сети
-terminal|Терминал|Сеть|SSH в браузере
-monitor|Монитор ресурсов|Сервис|процессор, память
-openwrt|Настройка OpenWrt|Сервис|время, Wi-Fi, зеркало'
+IDS="forkop nfqws2 tgproxy awg tailscale hosts adblock terminal monitor openwrt"
+LIST='forkop|Forkop|Обход блокировок|Маршруты и подключения
+nfqws2|NFQWS2|Обход блокировок|Обход блокировок без VPN
+tgproxy|TG WS Proxy|VPN и прокси|Прокси для Telegram
+hosts|Hosts|DNS и сеть|Домены и списки hosts
+adblock|Блокировка рекламы|DNS и сеть|Реклама, трекеры и фишинг
+awg|AmneziaWG|VPN и прокси|Туннели AmneziaWG и WARP
+tailscale|Удалённый доступ|VPN и прокси|Роутер и домашняя сеть из любой сети
+terminal|Терминал|Инструменты|Командная строка роутера в браузере
+monitor|Монитор ресурсов|Инструменты|Нагрузка и память роутера
+openwrt|Настройка OpenWrt|Инструменты|Сеть и настройки роутера'
 
 say() { echo -e "${CYAN}==>${NC} $*"; }
 ok() { echo -e "   ${GREEN}✓${NC} $*"; }
@@ -29,8 +25,6 @@ die() { echo -e "${YELLOW}$*${NC}"; rm -f "$ZMS_SRC"; exit 1; }
 f() { printf '%s\n' "$LIST" | awk -F'|' -v id="$1" -v n="$2" '$1 == id { print $n; exit }'; }
 files() {
 	case "$1" in
-		forkozz) echo "$V/forkozz.js /opt/zapret-manager-luci/netshift.uc" ;;
-		bytetube) echo "$V/bytetube.js /www/luci-static/resources/bytetube/common.js /www/luci-static/resources/bytetube/presets.js /www/luci-static/resources/view/bytetube/style.css" ;;
 		*) echo "$V/$1.js" ;;
 	esac
 }
@@ -38,23 +32,22 @@ num() { echo "$1" | sed -e ':a' -e 's/\([0-9]\)\([0-9]\{3\}\)\($\| \)/\1 \2\3/' 
 kfree() { df -kP "$1" 2>/dev/null | awk 'NR == 2 { print $4 + 0; f = 1 } END { if (!f) print 0 }'; }
 
 get() {
+	local local_source
+	local_source="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/ZapretManager_LuCI.sh"
+	if [ -s "$local_source" ]; then cp "$local_source" "$ZMS_SRC"; return $?; fi
+	[ -n "${1:-}" ] || return 1
 	rm -f "$ZMS_SRC"
 	if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 10 --max-time 180 -o "$ZMS_SRC" "$1"
 	else wget -q -T 30 -O "$ZMS_SRC" "$1"; fi || return 1
-	[ -s "$ZMS_SRC" ] && head -n1 "$ZMS_SRC" | grep -qx '#!/bin/sh' && grep -q '^# Version:' "$ZMS_SRC" && tail -n 5 "$ZMS_SRC" | grep -q 'Web UI:' && sh -n "$ZMS_SRC" 2>/dev/null
+	[ -s "$ZMS_SRC" ] && head -n1 "$ZMS_SRC" | grep -qx '#!/bin/sh' && grep -q '^# Version:' "$ZMS_SRC" && grep -qF 'for Forkop/NFQWS2.' "$ZMS_SRC" && tail -n 5 "$ZMS_SRC" | grep -q 'Web UI:' && sh -n "$ZMS_SRC" 2>/dev/null
 }
 
 used() {
 	case "$1" in
-		strategy) [ -f /etc/init.d/zapret ] ;;
-		zapret2) [ -f /etc/init.d/zapret2 ] ;;
-		steer) command -v steer >/dev/null 2>&1 || [ -s /etc/zm-steer/owned ] ;;
-		forkozz) [ -x /usr/bin/netshift ] ;;
-		bytetube) [ -x /usr/bin/bytetube ] ;;
+		forkop) [ -x /usr/bin/forkop ] ;;
+		nfqws2) [ -x /etc/init.d/nfqws2-keenetic ] || [ -x /usr/sbin/nfqws-ui-setup ] ;;
 		tgproxy) [ -x /etc/init.d/tg-ws-proxy ] || [ -x /etc/init.d/tg-ws-proxy-go ] || [ -x /etc/init.d/tg-ws-proxy-rs ] || [ -x /etc/init.d/tgws ] ;;
-		mixomo) [ -x /usr/bin/mihomo ] || [ -x /etc/init.d/mihomo ] || [ -x /etc/init.d/magitrickle ] ;;
 		adblock) grep -qx 'on=1' "$ZMS_STATE/adblock/settings" 2>/dev/null ;;
-		doh) [ -x /etc/init.d/https-dns-proxy ] ;;
 		awg) command -v awg >/dev/null 2>&1 ;;
 		tailscale) [ -x /usr/sbin/tailscaled ] ;;
 		terminal) [ -x /usr/bin/ttyd ] ;;

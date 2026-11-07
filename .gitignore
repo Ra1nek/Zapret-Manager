@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+login.txt
+*.conf.local
+.DS_Store
+Thumbs.db
