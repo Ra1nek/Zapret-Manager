@@ -6,8 +6,8 @@
 
 | Раздел | Правка |
 |---|---|
-| Forkop | Вместо Zapret. Forkop и sing-box-forkop, штатное управление службой и отдельные версии компонентов |
-| NFQWS2 | Вместо Zapret2. nfqws2-keenetic и nfqws2-ui |
+| [Forkop](../readme.md#forkop) | Вместо Zapret. Forkop и sing-box-forkop, штатное управление службой и отдельные версии компонентов |
+| [NFQWS2](../readme.md#nfqws2) | Вместо Zapret2. nfqws2-keenetic и nfqws2-ui |
 | Steer, Forkozz, Mixomo, ByeTube, DoH | Исключены из страниц, выбора установки и доступных действий |
 | AmneziaWG | Сохранены интерфейсы, WARP и необходимые общие функции |
 | Дашборд и версии | Актуальные компоненты и раздельная проверка версий |
