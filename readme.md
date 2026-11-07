@@ -261,7 +261,7 @@
 
 ### 🟢 Способ 1. Для Windows
 
-Скачайте [ZapretManager_LuCI.sh](ZapretManager_LuCI.sh) и установите панель через SSH по шагам ниже. Потребуются встроенный терминал Windows и пароль роутера.
+Скачайте [ZapretManager_Install.bat](https://github.com/Ra1nek/Zapret-Manager/releases/download/ZapretManager_LuCI%2BWEB/ZapretManager_Install.bat) и запустите его. Укажите адрес роутера и пароль. Установщик скачает панель из этого проекта.
 
 ### ⌨️ Способ 2. Через SSH (Windows, macOS, Linux, телефон)
 
