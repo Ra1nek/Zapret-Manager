@@ -1,6 +1,6 @@
 # Правки редакции с Forkop и NFQWS2
 
-Основа — [Zapret Manager от StressOzz](https://github.com/StressOzz/Zapret-Manager), версия 5.041, commit `8825952bcf372c53ba2e63708848a236d14e9b36`.
+Основа — [Zapret Manager от StressOzz](https://github.com/StressOzz/Zapret-Manager), версия 5.046, commit `b175abd6709d7d21105e7bf75c9e01c139437842`.
 
 Сохранены исходная структура репозитория, оформление README, изображения, документация, история изменений, `LICENSE`, `NOTICE`, благодарности и ссылки автора. Изменения панели интегрируются в существующий `ZapretManager_LuCI.sh`.
 
