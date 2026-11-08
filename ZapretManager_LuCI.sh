@@ -22735,7 +22735,7 @@ chmod 0644 /www/luci-static/resources/view/zapret-manager/nfqws2.js
 
 mkdir -p /www/luci-static/resources/zapret-manager
 cat > /www/luci-static/resources/zapret-manager/build.txt << 'ZM_INSTALLER_EOF'
-3924415628335252
+2831987345784290
 view/zapret-manager/adblock.js
 view/zapret-manager/awg.js
 view/zapret-manager/dashboard.js
@@ -23834,7 +23834,7 @@ function detectMissingThemeVar() {
 	} catch (e) {  }
 }
 
-var ZM_BUILD = '3924415628335252';
+var ZM_BUILD = '2831987345784290';
 
 function cssUrl(path) {
 	return L.resource(path) + (/^[0-9]{6,}$/.test(ZM_BUILD) ? '?v=' + ZM_BUILD : '');
@@ -23913,7 +23913,7 @@ function flagFont() {
 	document.head.appendChild(s);
 }
 
-var CL_HISTORY = 'https://github.com/StressOzz/Zapret-Manager/blob/main/CHANGELOG.md';
+var CL_HISTORY = 'https://github.com/Ra1nek/Zapret-Manager/blob/main/CHANGELOG.md';
 var CL_KINDS = { '➕': [ 'new', 'Новое' ], '⚡': [ 'imp', 'Улучшено' ], '🐞': [ 'fix', 'Исправлено' ], '🗑': [ 'del', 'Убрано' ] };
 function clParse(text) {
 	var secs = [], cur = null;
@@ -35966,7 +35966,7 @@ cat > '/www/zm/app.js' << 'ZM_INSTALLER_EOF'
 (function () {
 'use strict';
 
-var BUILD = '3924415628335252';
+var BUILD = '2831987345784290';
 var RES = '/luci-static/resources/';
 var NULL_SID = '00000000000000000000000000000000';
 var K_SID = 'zmw.sid', K_THEME = 'zmw.theme', K_USER = 'zmw.user', K_NOTE = 'zmw.note', K_ANIM = 'zmw.anim', K_ANIMFOR = 'zmw.animfor', K_NAV = 'zmw.nav', K_LOOK = 'zmw.look';
@@ -42598,7 +42598,7 @@ cat > '/www/zm-webui.html' << 'ZM_INSTALLER_EOF'
 <title>Zapret Manager</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%201250%201250%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27z%27%20x1=%270%27%20y1=%270%27%20x2=%270%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%2300b6ff%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%230090ff%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg%20fill=%27url%28%23z%29%27%20stroke=%27%230a0a0a%27%20stroke-width=%2722%27%20stroke-linejoin=%27miter%27%3E%3Cpolygon%20points=%27455,170%201072,118%201215,25%20688,615%2025,1235%20735,338%20262,383%27/%3E%3Cpolygon%20points=%271025,462%20722,860%201215,800%201005,1022%20315,1095%27/%3E%3C/g%3E%3C/svg%3E">
 <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%201250%201250%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27z%27%20x1=%270%27%20y1=%270%27%20x2=%270%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%2300b6ff%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%230090ff%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg%20fill=%27url%28%23z%29%27%20stroke=%27%230a0a0a%27%20stroke-width=%2722%27%20stroke-linejoin=%27miter%27%3E%3Cpolygon%20points=%27455,170%201072,118%201215,25%20688,615%2025,1235%20735,338%20262,383%27/%3E%3Cpolygon%20points=%271025,462%20722,860%201215,800%201005,1022%20315,1095%27/%3E%3C/g%3E%3C/svg%3E">
-<link rel="stylesheet" href="/zm/app.css?v=3924415628335252">
+<link rel="stylesheet" href="/zm/app.css?v=2831987345784290">
 <script>
 (function(){try{var h=document.documentElement,t=null,b=null,re=/^(micro|light|dark|ink|bento|retro|depth|graphite|oled|matrix|neon|synth|noir|contrast|metro|custom)$/,bre=/^(micro|light|dark|ink|bento|retro|depth|graphite|oled|matrix|neon|synth|noir|contrast|metro)$/;function fix(v){v=String(v||'').trim();return v==='blocks'?'contrast':v==='minimal'?'micro':v;}function get(u){try{var x=new XMLHttpRequest();x.open('GET',u+'?t='+Date.now(),false);x.send(null);return x.status===200?String(x.responseText||''):'';}catch(e){return '';}}var v=fix(get('/zm/theme.txt'));if(re.test(v)){t=v;try{localStorage.setItem('zmw.theme',v);}catch(e){}}if(!t){try{t=fix(localStorage.getItem('zmw.theme')||sessionStorage.getItem('zmw.theme'));}catch(e){}}if(!re.test(t||''))t='micro';if(t==='custom'){var j=null;try{j=JSON.parse(get('/zm/look.json')||'null');}catch(e){}if(!j||!j.my){try{j=JSON.parse(localStorage.getItem('zmw.look')||'null');}catch(e){}}b=j&&j.my&&bre.test(j.my.b||'')?j.my.b:'micro';}else b=t;h.setAttribute('data-theme',b);if(/^(dark|depth|graphite|oled|matrix|neon|synth|noir|contrast)$/.test(b))h.classList.add('zm-theme-dark');}catch(e){}})();
 </script>
@@ -42606,7 +42606,7 @@ cat > '/www/zm-webui.html' << 'ZM_INSTALLER_EOF'
 <body class="zmw-body">
 <div id="zmw-root"></div>
 <noscript><p style="padding:24px;font-family:sans-serif">Для работы панели Zapret Manager нужен JavaScript.</p></noscript>
-<script src="/zm/app.js?v=3924415628335252"></script>
+<script src="/zm/app.js?v=2831987345784290"></script>
 </body>
 </html>
 ZM_INSTALLER_EOF
