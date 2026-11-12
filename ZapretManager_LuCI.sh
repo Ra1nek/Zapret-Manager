@@ -1,8 +1,8 @@
 #!/bin/sh
-# Modified from StressOzz/Zapret-Manager 5.050 for Forkop/NFQWS2.
+# Modified from StressOzz/Zapret-Manager 5.064 for Forkop/NFQWS2.
 # Original project: https://github.com/StressOzz/Zapret-Manager
 read -r _ _ ZM_NEW_VER <<'ZM_VERSION_EOF'
-# Version: 5.050
+# Version: 5.064
 ZM_VERSION_EOF
 set -e
 
@@ -164,17 +164,20 @@ if [ "$1" = zm_watch ]; then
 				nft list table inet zm_adblock_free >/dev/null 2>&1 || return 1
 				for v in /var/etc/dnsmasq.conf.*; do [ "$v" -nt /var/etc/zm-adblock-free.conf ] && return 1; done
 			fi
+			if grep -q '^tch=.*\(et_spamhaus_block\|hagezi_tif_ip_block\|botnet_attackers_ip_block\)' "$s/adblock/settings" 2>/dev/null; then
+				nft list table inet zm_adblock_ip >/dev/null 2>&1 || return 1
+			fi
 		elif [ -e /var/run/zm-adblock-free.pid ]; then return 1
 		fi
 		rm -f /tmp/zm-rpcd-slow /tmp/zm-rpcd-plugin.stamp "$s/fk.watch" "$d/steer.vpnwatch"
 		return 0
 	}
 	/usr/bin/ucode /usr/libexec/manager-watch.uc tick >/dev/null 2>&1
-	_zw_idle && exit 0
+	[ ! -s /opt/zapret-manager-luci/state/parental ] && { _zw_idle && exit 0; }
 fi
 
 CONF="/etc/config/zapret"
-ZM_VERSION="5.050"
+ZM_VERSION="5.064"
 ZM_SCRIPT_URL="https://raw.githubusercontent.com/Ra1nek/Zapret-Manager/refs/heads/main/ZapretManager_LuCI.sh"
 ZM_STATS_URL="http://89.191.225.101:8787"
 ZM_STATS_OFF="/etc/zapret-manager.nostats"
@@ -295,7 +298,11 @@ _zm_gml_patch() {
 ZM_GHP_FILE="$ZM_STATE_DIR/ghproxy"
 ZM_GHP_FAIL="$JOBS_DIR/ghproxy.fail"
 ZM_GHP_LOG="$JOBS_DIR/ghproxy.log"
+ZM_GHP_NET="$JOBS_DIR/ghnet"
+ZM_GHP_GOOD="$JOBS_DIR/ghproxy.good"
 ZM_GHP_LIST="gh-proxy.org ghfast.top gh.llkk.cc ghproxy.net"
+ZM_GHP_HOSTS="github.com raw.githubusercontent.com"
+ZM_GHP_TRY=3
 _zm_ghp_load() {
 	[ -n "$ZM_GHP_MODE" ] && return 0
 	ZM_GHP_MODE=off
@@ -308,6 +315,7 @@ _zm_gh_host() {
 	esac
 	return 1
 }
+_zm_ghp_hn() { local h="${1#https://}"; printf '%s' "${h%%/*}"; }
 _zm_ghp_say() {
 	[ -n "$ZM_JOB_LOG" ] && printf '%s\n' "$1" >> "$ZM_JOB_LOG" 2>/dev/null
 	mkdir -p "$JOBS_DIR" 2>/dev/null
@@ -320,11 +328,16 @@ _zm_ghp_why() {
 		curl:7) echo "не удалось подключиться" ;;
 		curl:28) echo "не ответил вовремя" ;;
 		curl:35|wget:5) echo "ошибка защищённого соединения" ;;
-		curl:52|curl:56|curl:18) echo "соединение оборвалось" ;;
+		curl:60) echo "чужой сертификат — похоже, адрес подменён" ;;
+		curl:52|curl:56|curl:18|curl:55|curl:16|curl:92|curl:8) echo "соединение оборвалось" ;;
 		wget:4) echo "ошибка сети" ;;
+		wget:1) echo "не скачалось" ;;
+		*:211) echo "вместо файла пришла веб-страница" ;;
+		*:212) echo "файл пришёл повреждённым" ;;
 		*) return 1 ;;
 	esac
 }
+_zm_ghp_clean() { case "$1:$2" in curl:5|curl:6|curl:7|curl:22|curl:35|curl:60) return 0 ;; esac; return 1; }
 _zm_ghp_out() {
 	local t="$1" a nx=""
 	shift
@@ -339,52 +352,128 @@ _zm_ghp_out() {
 	done
 	return 0
 }
+_zm_ghp_half() {
+	local n="$1"
+	case "$n" in ''|*[!0-9]*) printf '%s' "$n"; return 0 ;; esac
+	n=$(( (n + 1) / 2 ))
+	[ "$n" -lt "$2" ] && n="$2"
+	[ "$n" -gt "$1" ] && n="$1"
+	printf '%s' "$n"
+}
 _zm_ghp_exec() {
-	local t="$1" pre="$2" a x=0
-	shift 2
+	local t="$1" pre="$2" d="$3" a x=0 hv="" sp=""
+	shift 3
 	for a; do
 		[ "$x" = 0 ] && { set --; x=1; }
+		if [ -n "$hv" ]; then set -- "$@" "$(_zm_ghp_half "$a" "$hv")"; hv=""; continue; fi
+		case "$t:$a" in
+			curl:--connect-timeout) hv=3 ;;
+			curl:-m|curl:--max-time|wget:-T) hv=5 ;;
+			curl:-y|curl:--speed-time) sp=1 ;;
+		esac
 		if _zm_gh_host "$a"; then set -- "$@" "$pre$a"; else set -- "$@" "$a"; fi
 	done
-	command "$t" "$@"
+	if [ "$t" = curl ] && [ -n "$d" ] && [ -z "$sp" ]; then command curl --speed-limit 512 --speed-time 20 "$@"
+	else command "$t" "$@"; fi
+}
+_zm_ghp_try() {
+	local t="$1" pre="$2" d="$3" o="$4" rc
+	shift 4
+	_zm_ghp_exec "$t" "$pre" "$d" "$@"; rc=$?
+	[ "$rc" = 0 ] || return "$rc"
+	[ -n "$o" ] && [ "$o" != /dev/null ] && [ -s "$o" ] || return 0
+	[ -n "$ZM_FETCH_ANY" ] || ! head -c 1024 "$o" 2>/dev/null | grep -qiE '<(!doctype|html|head|body)' || return 211
+	[ -z "$ZM_GHP_CHECK" ] || "$ZM_GHP_CHECK" "$o" || return 212
+	return 0
+}
+_zm_ghp_mark() {
+	mkdir -p "$JOBS_DIR" 2>/dev/null
+	printf '%s %s\n' "$2" "$(date +%s)" > "$ZM_GHP_NET.$1.$$" 2>/dev/null && mv -f "$ZM_GHP_NET.$1.$$" "$ZM_GHP_NET.$1" 2>/dev/null
+	return 0
+}
+_zm_ghp_probe() {
+	if _zm_has curl; then command curl -s -o /dev/null -I --connect-timeout 3 --max-time 5 "https://$1/" 2>/dev/null; return; fi
+	_zm_has wget && command wget -q -T 5 --spider "https://$1/" >/dev/null 2>&1
+}
+_zm_ghp_st() {
+	local s="" t="" now
+	now="$(date +%s)"
+	if [ -z "$2" ] && [ -f "$ZM_GHP_NET.$1" ] && read -r s t < "$ZM_GHP_NET.$1"; then
+		case "$t" in ''|*[!0-9]*) ;; *)
+			case "$s" in
+				up) [ $((now - t)) -lt 300 ] && { echo up; return 0; } ;;
+				down) [ $((now - t)) -lt 600 ] && { echo down; return 0; } ;;
+			esac ;;
+		esac
+	fi
+	if _zm_ghp_probe "$1"; then s=up; else s=down; fi
+	_zm_ghp_mark "$1" "$s"
+	echo "$s"
+}
+_zm_ghp_order() {
+	local g="" m
+	[ -f "$ZM_GHP_GOOD" ] && read -r g < "$ZM_GHP_GOOD"
+	case " $ZM_GHP_LIST " in *" $g "*) [ -n "$g" ] && printf '%s' "$g" ;; *) g="" ;; esac
+	for m in $ZM_GHP_LIST; do [ "$m" = "$g" ] || printf ' %s' "$m"; done
 }
 _zm_ghp_run() {
-	local t="$1" a gh="" rc why out nm m
+	local t="$1" a gh="" h rc why out nm m n=0
 	shift
 	for a; do _zm_gh_host "$a" && { gh="$a"; break; }; done
 	[ -n "$gh" ] || { command "$t" "$@"; return; }
 	_zm_ghp_load
-	command "$t" "$@"; rc=$?
-	if [ "$rc" = 0 ]; then [ "$ZM_GHP_MODE" = off ] && rm -f "$ZM_GHP_FAIL" 2>/dev/null; return 0; fi
-	why="$(_zm_ghp_why "$t" "$rc")" || return $rc
-	if [ "$ZM_GHP_MODE" != auto ] || [ -n "$ZM_GHP_NOMIR" ]; then
-		[ "$ZM_GHP_MODE" = off ] && { mkdir -p "$JOBS_DIR" 2>/dev/null; date +%s > "$ZM_GHP_FAIL" 2>/dev/null; }
-		return $rc
-	fi
-	nm="${gh%%\?*}"; nm="${nm##*/}"; [ -n "$nm" ] || nm="$gh"
 	out="$(_zm_ghp_out "$t" "$@")"
-	if [ -z "$out" ] && [ "$t:$rc" != curl:6 ] && [ "$t:$rc" != curl:7 ]; then
-		_zm_ghp_say "   · GitHub: $nm — $why. Через зеркало не повторяем: часть ответа уже получена"
-		return $rc
+	if [ -n "$ZM_GHP_NOMIR" ]; then _zm_ghp_try "$t" "" 1 "$out" "$@"; return; fi
+	h="$(_zm_ghp_hn "$gh")"
+	nm="${gh%%\?*}"; nm="${nm##*/}"; [ -n "$nm" ] || nm="$gh"
+	if [ "$ZM_GHP_MODE" != auto ]; then
+		while :; do
+			n=$((n + 1))
+			[ "$n" -gt 1 ] && [ -n "$out" ] && [ "$out" != /dev/null ] && rm -f "$out" 2>/dev/null
+			_zm_ghp_try "$t" "" 1 "$out" "$@"; rc=$?
+			[ "$rc" = 0 ] && { rm -f "$ZM_GHP_FAIL" 2>/dev/null; return 0; }
+			_zm_ghp_why "$t" "$rc" >/dev/null || return "$rc"
+			[ "$n" -lt "$ZM_GHP_TRY" ] || break
+			[ -n "$out" ] || _zm_ghp_clean "$t" "$rc" || break
+			[ "$rc" = 211 ] && break
+		done
+		mkdir -p "$JOBS_DIR" 2>/dev/null; date +%s > "$ZM_GHP_FAIL" 2>/dev/null
+		return "$rc"
 	fi
-	_zm_ghp_say "   · GitHub: $nm не скачался напрямую — $why. Пробуем через зеркала"
-	for m in $ZM_GHP_LIST; do
+	if [ "$(_zm_ghp_st "$h")" = down ]; then
+		_zm_ghp_say "   · $h сейчас недоступен — $nm качаем сразу через зеркало"
+	else
+		n=1
+		_zm_ghp_try "$t" "" 1 "$out" "$@"; rc=$?
+		[ "$rc" = 0 ] && { _zm_ghp_mark "$h" up; return 0; }
+		why="$(_zm_ghp_why "$t" "$rc")" || return "$rc"
+		if [ -z "$out" ] && ! _zm_ghp_clean "$t" "$rc"; then
+			_zm_ghp_say "   · GitHub: $nm — $why. Через зеркало не повторяем: часть ответа уже получена"
+			return "$rc"
+		fi
+		_zm_ghp_mark "$h" down
+		_zm_ghp_say "   · GitHub: $nm не скачался напрямую — $why. Следующие 10 минут $h качаем сразу через зеркала"
+	fi
+	rc=1
+	for m in $(_zm_ghp_order); do
+		[ "$n" -lt "$ZM_GHP_TRY" ] || break
+		n=$((n + 1))
 		[ -n "$out" ] && [ "$out" != /dev/null ] && rm -f "$out" 2>/dev/null
-		_zm_ghp_exec "$t" "https://$m/" "$@"; rc=$?
+		_zm_ghp_try "$t" "https://$m/" "" "$out" "$@"; rc=$?
 		if [ "$rc" = 0 ]; then
-			if [ -n "$out" ] && [ "$out" != /dev/null ] && ! _zm_dl_sane "$out"; then
-				_zm_ghp_say "   · $m: вместо файла пришла страница ошибки"
-				rc=1; continue
-			fi
-			_zm_ghp_say "   ✓ $nm скачан через зеркало $m. Следующие загрузки — снова напрямую"
+			printf '%s\n' "$m" > "$ZM_GHP_GOOD" 2>/dev/null
+			_zm_ghp_say "   ✓ $nm скачан через зеркало $m"
 			return 0
 		fi
 		why="$(_zm_ghp_why "$t" "$rc")" || why="ошибка $rc"
+		[ "$rc" = 22 ] && why="зеркало ответило ошибкой"
 		_zm_ghp_say "   · $m: не скачалось — $why"
+		[ -n "$out" ] || _zm_ghp_clean "$t" "$rc" || break
 	done
-	_zm_ghp_say "   !! $nm не скачался ни напрямую, ни через зеркала ($(echo $ZM_GHP_LIST | sed 's/ /, /g'))"
+	rm -f "$ZM_GHP_GOOD" 2>/dev/null
+	_zm_ghp_say "   !! $nm не скачался ни напрямую, ни через зеркала (попыток: $n)"
 	[ "$rc" = 0 ] && rc=1
-	return $rc
+	return "$rc"
 }
 _zm_has() { local d IFS=:; for d in ${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}; do [ -n "$d" ] && [ -x "$d/$1" ] && [ ! -d "$d/$1" ] && return 0; done; return 1; }
 curl() { _zm_ghp_run curl "$@"; }
@@ -392,7 +481,7 @@ wget() { _zm_ghp_run wget "$@"; }
 _zm_fetch_ok() {
 	[ -s "$1" ] || return 1
 	[ -n "$ZM_FETCH_ANY" ] || ! head -c 1024 "$1" | grep -qiE '<(!doctype|html|head|body)' || return 1
-	ZM_FETCH_SIZE="$(wc -c < "$1" 2>/dev/null | tr -d ' ')"
+	ZM_FETCH_SIZE="$(wc -c 2>/dev/null < "$1" | tr -d ' ')"
 	return 0
 }
 _zm_fetch() {
@@ -416,12 +505,12 @@ _zm_fetch() {
 	return 1
 }
 _zm_fetch_one() {
-	local u="$1" o="$2" tm="${3:-120}" rg="$4" ef code rc e i
+	local u="$1" o="$2" tm="${3:-120}" rg="$4" ef code rc e i cr=""
 	ZM_FETCH_ERR=""; ZM_FETCH_SIZE=0
 	ef="$o.zmerr"
 	rm -f "$o"
 	if _zm_has curl; then
-		code="$(curl -fsSL --connect-timeout 10 --max-time "$tm" ${rg:+-r "$rg"} -A "Mozilla/5.0" -o "$o" -w '%{http_code}' "$u" 2>"$ef")"; rc=$?
+		code="$(curl -fsSL --connect-timeout 10 --max-time "$tm" ${rg:+-r "$rg"} -A "Mozilla/5.0" -o "$o" -w '%{http_code}' "$u" 2>"$ef")"; rc=$?; cr="$rc"
 		code="$(printf '%s' "$code" | tail -c 3)"
 		e="$(tail -n 1 "$ef" 2>/dev/null | sed 's/^curl: ([0-9]*) //')"; rm -f "$ef"
 		if [ "$rc" = 0 ] && _zm_fetch_ok "$o"; then return 0; fi
@@ -437,12 +526,13 @@ _zm_fetch_one() {
 		elif [ "$rc" = 0 ]; then ZM_FETCH_ERR="вместо файла пришла веб-страница"
 		else ZM_FETCH_ERR="$(_zm_ghp_why curl "$rc" || echo "${e:-curl: ошибка $rc}")"; fi
 	fi
-	if [ -z "$rg" ] && _zm_has wget; then
-		e="$(ZM_GHP_NOMIR=1; wget -T 20 -U "Mozilla/5.0" -O "$o" "$u" 2>&1)"; rc=$?
+	if [ -n "$cr" ] && _zm_gh_host "$u" && { [ "$cr" = 0 ] || [ "$cr" = 22 ] || _zm_ghp_why curl "$cr" >/dev/null; }; then :
+	elif [ -z "$rg" ] && _zm_has wget; then
+		e="$(ZM_GHP_NOMIR="${cr:+1}"; wget -T 20 -U "Mozilla/5.0" -O "$o" "$u" 2>&1)"; rc=$?
 		if [ "$rc" = 0 ] && _zm_fetch_ok "$o"; then ZM_FETCH_ERR=""; return 0; fi
 		rm -f "$o"
 		if [ "$rc" = 0 ]; then e="вместо файла пришла веб-страница"
-		else e="$(_zm_ghp_why wget "$rc" || printf '%s\n' "$e" | grep -v '^Downloading\|^Connecting\|^Writing\|^Download completed\|^$' | tail -n 1)"; fi
+		else e="$( { [ "$rc" != 1 ] && _zm_ghp_why wget "$rc"; } || printf '%s\n' "$e" | grep -v '^Downloading\|^Connecting\|^Writing\|^Download completed\|^$' | tail -n 1)"; fi
 		ZM_FETCH_ERR="${ZM_FETCH_ERR:+$ZM_FETCH_ERR; }wget: ${e:-не скачалось}"
 	fi
 	[ -n "$ZM_FETCH_ERR" ] || ZM_FETCH_ERR="на роутере нет ни curl, ни wget"
@@ -466,7 +556,19 @@ _zm_get() {
 	echo "   !! $nm — не скачался: $ZM_FETCH_ERR"
 	return 1
 }
-gh_mirrors() { _zm_ghp_load; [ "$ZM_GHP_MODE" = auto ] && echo $ZM_GHP_LIST; return 0; }
+gh_mirrors() { _zm_ghp_load; [ "$ZM_GHP_MODE" = auto ] && echo $(_zm_ghp_order); return 0; }
+gh_net() {
+	_zm_ghp_load
+	[ "$ZM_GHP_MODE" = auto ] || { echo up; return 0; }
+	case " $ZM_GHP_HOSTS codeload.github.com objects.githubusercontent.com release-assets.githubusercontent.com " in *" $1 "*) ;; *) echo up; return 0 ;; esac
+	if [ "$2" = down ]; then _zm_ghp_mark "$1" down; echo down; else _zm_ghp_st "$1"; fi
+}
+gh_get() {
+	_zm_gh_host "$1" && [ -n "$2" ] || return 1
+	_zm_fetch "$1" "$2" "${3:-120}" && return 0
+	echo "$ZM_FETCH_ERR" >&2
+	return 1
+}
 MIHOMO_DIR="/etc/mihomo"
 MIHOMO_BIN="/usr/bin/mihomo"
 MIHOMO_CONF="/etc/mihomo/config.yaml"
@@ -503,6 +605,7 @@ _job_running() {
 
 job_status() {
 	local name="$1"
+	case "$name" in ''|*[!A-Za-z0-9_.-]*) echo '{"running":false,"done":false,"rc":""}'; return ;; esac
 	local pid="$JOBS_DIR/$name.pid"
 	local log="$JOBS_DIR/$name.log"
 	local running="false" done="false" rc=""
@@ -516,6 +619,7 @@ job_status() {
 
 log_tail() {
 	local name="$1"
+	case "$name" in ''|*[!A-Za-z0-9_.-]*) echo '{"lines":""}'; return ;; esac
 	local log="$JOBS_DIR/$name.log"
 	[ -f "$log" ] || { echo '{"lines":""}'; return; }
 	printf '{"lines":"%s"}\n' "$(esc_ml "$(tail -n 300 "$log" | grep -v '^__DONE__')")"
@@ -667,9 +771,9 @@ _si_static() {
 system_info() {
 	local df_j inet inet_ms
 	df_j=$(df -h /tmp / 2>/dev/null | awk 'function c(x) { gsub(/["\\]/, "", x); return x }
-		NR == 2 { a = $3; b = $4 } NR == 3 { u = $3; v = $4 }
-		END { printf "\"tmp_used\":\"%s\",\"tmp_free\":\"%s\",\"root_used\":\"%s\",\"root_free\":\"%s\"", c(a), c(b), c(u), c(v) }')
-	[ -n "$df_j" ] || df_j='"tmp_used":"","tmp_free":"","root_used":"","root_free":""'
+		NR == 2 { a = $3; b = $4; t = $2 } NR == 3 { u = $3; v = $4; r = $2 }
+		END { printf "\"tmp_used\":\"%s\",\"tmp_free\":\"%s\",\"tmp_total\":\"%s\",\"root_used\":\"%s\",\"root_free\":\"%s\",\"root_total\":\"%s\"", c(a), c(b), c(t), c(u), c(v), c(r) }')
+	[ -n "$df_j" ] || df_j='"tmp_used":"","tmp_free":"","tmp_total":"","root_used":"","root_free":"","root_total":""'
 	set -- $(_inet_state)
 	inet="$1"; inet_ms="$2"
 	printf '{%s,%s,"cpu_temp":"%s","cpu_load":"%s","inet":"%s","inet_ms":"%s"}\n' "$(_si_static)" "$df_j" "$(_cpu_temp)" "$(_cpu_load)" "$inet" "$inet_ms"
@@ -736,9 +840,16 @@ _mon_fan() {
 	printf '{"rpm":%s,"pwm":%s,"st":%s,"mx":%s}' "$rpm" "$pwm" "$st" "$mx"
 }
 
+_zm_ncore() {
+	local c
+	c="$(sed -n 's/^core[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' /proc/cpuinfo 2>/dev/null | sort -u | wc -l | tr -d ' ')"
+	[ "${c:-0}" -gt 0 ] 2>/dev/null || c="$(cat /sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list 2>/dev/null | sort -u | wc -l | tr -d ' ')"
+	{ [ "${c:-0}" -gt 0 ] && [ "$c" -le "$1" ]; } 2>/dev/null || c="$1"
+	echo "$c"
+}
 _mon_static() {
 	local f="$JOBS_DIR/mon.static" soc="" v c n part cpu="" mx="" line
-	if [ -s "$f" ] && [ -z "$(find "$f" -mmin +10 2>/dev/null)" ]; then cat "$f"; return 0; fi
+	if [ -s "$f" ] && [ -z "$(find "$f" -mmin +10 2>/dev/null)" ] && grep -q '"ncore":' "$f"; then cat "$f"; return 0; fi
 	soc="$( { tr '\000' '\n' < /proc/device-tree/compatible; } 2>/dev/null | tail -n1)"
 	case "$soc" in
 		*,*)
@@ -759,7 +870,7 @@ _mon_static() {
 	[ -n "$cpu" ] || cpu="$(sed -En 's/^(cpu model|model name)[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n1)"
 	read -r mx 2>/dev/null < /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
 	case "$mx" in ''|*[!0-9]*) mx=0 ;; esac
-	line="$(printf '"soc":"%s","cpu_model":"%s","ncpu":%s,"fmax":%s,"model":"%s","kernel":"%s","openwrt":"%s"' "$(esc "$soc")" "$(esc "$cpu")" "${n:-1}" "$((mx / 1000))" \
+	line="$(printf '"soc":"%s","cpu_model":"%s","ncpu":%s,"ncore":%s,"fmax":%s,"model":"%s","kernel":"%s","openwrt":"%s"' "$(esc "$soc")" "$(esc "$cpu")" "${n:-1}" "$(_zm_ncore "${n:-1}")" "$((mx / 1000))" \
 		"$(esc "$(cat /tmp/sysinfo/model 2>/dev/null)")" "$(esc "$(uname -r 2>/dev/null)")" \
 		"$(esc "$(sed -n "s/^DISTRIB_RELEASE='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null)")")"
 	printf '%s\n' "$line" > "$f.$$" 2>/dev/null && mv -f "$f.$$" "$f" 2>/dev/null
@@ -945,6 +1056,7 @@ _discord_str_add() { _zmL zapret && _discord_str_add "$@"; }
 ts_check() { _zmL remote && ts_check "$@"; }
 strategy_list_v() { _zmL zapret && strategy_list_v "$@"; }
 strategy_set_v() { _zmL zapret && strategy_set_v "$@"; }
+strategy_main_off() { _zmL zapret && strategy_main_off "$@"; }
 do_flowseal_download() { _zmL zapret && do_flowseal_download "$@"; }
 strategy_list_flowseal() { _zmL zapret && strategy_list_flowseal "$@"; }
 strategy_list_youtube() { _zmL zapret && strategy_list_youtube "$@"; }
@@ -992,6 +1104,7 @@ do_zpg_restore() { _zmL system && do_zpg_restore "$@"; }
 zm_pages() { _zmL zapret && zm_pages "$@"; }
 zm_cleanup() { _zmL system && zm_cleanup "$@"; }
 gh_proxy() { _zmL system && gh_proxy "$@"; }
+webui() { _zmL system && webui "$@"; }
 zm_autoclean() { _zmL system && zm_autoclean "$@"; }
 system_uninstall_panel() { _zmL system && system_uninstall_panel "$@"; }
 _pg_trace() { _zmL system && _pg_trace "$@"; }
@@ -1163,7 +1276,10 @@ _st_warp_up() { _zmL steer1 && _st_warp_up "$@"; }
 _st_via_ok() { _zmL steer1 && _st_via_ok "$@"; }
 _st_via_pick() { _zmL steer1 && _st_via_pick "$@"; }
 _st_fetch() { _zmL steer1 && _st_fetch "$@"; }
+_st_cdn_url() { _zmL steer1 && _st_cdn_url "$@"; }
 _st_cat_build() { _zmL steer1 && _st_cat_build "$@"; }
+_st_owncat_build() { _zmL steer1 && _st_owncat_build "$@"; }
+_st_tch_build() { _zmL steer1 && _st_tch_build "$@"; }
 _st_cat_dl() { _zmL steer1 && _st_cat_dl "$@"; }
 _st_set_have() { _zmL steer1 && _st_set_have "$@"; }
 _st_srs_get() { _zmL steer1 && _st_srs_get "$@"; }
@@ -1364,6 +1480,7 @@ do_ab_apply() { _zmL adblock && do_ab_apply "$@"; }
 owrt_reboot_run() { _zmL openwrt && owrt_reboot_run "$@"; }
 owrt_status() { _zmL openwrt && owrt_status "$@"; }
 owrt_set() { _zmL openwrt && owrt_set "$@"; }
+_pc_sync() { _zmL openwrt && _pc_sync "$@"; }
 
 INSTALL="_zm_pkg_add"; DELETE="_zm_pkg_del"; UPDATE="_zm_pkg_update"
 TG_ARCH=""
@@ -1509,6 +1626,13 @@ _zm_lan_devs() {
 	[ -n "$out" ] || out="br-lan"
 	echo $out
 }
+ZMW_STATE="$ZM_STATE_DIR/webui"
+_zmw_port() {
+	local p
+	p="$(uci -q get uhttpd.zmweb.listen_http 2>/dev/null | tr ' ' '\n' | sed -n '1s/.*://p')"
+	case "$p" in ''|*[!0-9]*) return 1 ;; esac
+	echo "$p"
+}
 _zm_lan_ip() {
 	local n ip d
 	ip="$(ifstatus lan 2>/dev/null | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)"
@@ -1542,8 +1666,8 @@ _zm_px_foreign() {
 }
 _apk_ver() {
 	local v=""
-	[ -f /lib/apk/db/installed ] && v="$(awk -v p="$1" '/^P:/ { x = (substr($0, 3) == p) } x && /^V:/ { print substr($0, 3); exit }' /lib/apk/db/installed)"
-	[ -n "$v" ] || v="$(apk info -v 2>/dev/null | sed -n "s/^$1-\([0-9][^ ]*\)\$/\1/p" | head -n1)"
+	if [ -s /lib/apk/db/installed ]; then v="$(awk -v p="$1" '/^P:/ { x = (substr($0, 3) == p) } x && /^V:/ { print substr($0, 3); exit }' /lib/apk/db/installed)"
+	else v="$(apk info -v 2>/dev/null | sed -n "s/^$1-\([0-9][^ ]*\)\$/\1/p" | head -n1)"; fi
 	[ -n "$v" ] && printf '%s\n' "$v"
 }
 _kv_last() {
@@ -2066,7 +2190,7 @@ _ui_icy_dl() {
 		command curl -sSL --max-redirs 3 --connect-timeout 5 --max-time 8 -A 'Mozilla/5.0' -H 'Icy-MetaData: 1' -D "$b.h" \
 			"$u" 2>/dev/null | head -c 40000 > "$b.bin"
 		n="$(grep -i '^icy-metaint:' "$b.h" 2>/dev/null | head -n 1 | tr -dc '0-9' | head -c 6)"
-		sz="$(wc -c < "$b.bin" 2>/dev/null | tr -d ' ')"
+		sz="$(wc -c 2>/dev/null < "$b.bin" | tr -d ' ')"
 		if [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null; then
 			off=0
 			for k in 1 2; do
@@ -2105,7 +2229,7 @@ ZM_PEND_DIR="$JOBS_DIR/pend"
 ZM_PEND_RKN="/opt/zapret/ipset/.zm-pend-rkn"
 _pend_list() {
 	printf '%s\n' "$CONF" "$ZO_RKN_FLAG" "$ZO_USER_FLAG" "$ZO_IPID_FLAG" "$ZO_DOH_FLAG" "$ZO_GV_FLAG" "$ZC_FILE" "$ZC_BAK" "$ZC_AFTER" \
-		"$YV_OFF_FLAG" "$DV_OFF_FLAG" "$ZP_OWN" "$ZP_MANUAL" "$ZO_SCRIPT"
+		"$YV_OFF_FLAG" "$DV_OFF_FLAG" "$ZP_OWN" "$ZP_MANUAL" "$ZO_SCRIPT" "$MAIN_OFF_FLAG" "$ZG_FAKE_FILE"
 }
 _pend_on() { [ -f "$ZM_PEND_DIR/on" ]; }
 _pend_clear() { rm -rf "$ZM_PEND_DIR"; rm -f "$ZM_PEND_RKN"; }
@@ -2211,6 +2335,11 @@ status() {
 
 	local zs_yv=false zs_qy=false zs_ex=false zs_rk=false zs_rko=false zs_rkf=false zs_ws=false zs_ul=false zs_ulo=false zs_ip=false zs_yt=false zs_zd=false zs_zdon=false zs_s2=false zs_pd=false zs_pw="" zs_hz=false zs_hzu=false zs_gv=""
 	[ -f /opt/zapret-manager-luci/yv_off ] && zs_yv=true
+	local zs_mo=false zs_mf=""
+	if [ -f "$MAIN_OFF_FLAG" ]; then
+		if [ -f "$CONF" ] && [ ! -s "$TEST_BACKUP" ] && _nfq_opt_body | grep -qxF -e "$ZO_EXCL_HL" -e "--hostlist=$ZO_RKN_FILE" -e "$ZO_USER_HL"; then rm -f "$MAIN_OFF_FLAG"
+		else zs_mo=true; read -r zs_mf < "$MAIN_OFF_FLAG"; case "$zs_mf" in fs) ;; *) zs_mf=v ;; esac; fi
+	fi
 	[ -f "$EXPERT_MODE_FILE" ] && zs_ex=true
 	[ -f "$ZO_RKN_FLAG" ] && zs_rk=true
 	[ -f "$ZO_USER_FLAG" ] && zs_ul=true
@@ -2230,13 +2359,13 @@ status() {
 		_zl_used exclude && zs_hzu=true
 		zs_gv="$(_zo_gv_cur)"
 	fi
-	printf '{"pkg":"%s","zapret":"%s","zapret_running":%s,"zapret_version":"%s","zapret2":"%s","zapret2_running":%s,"strategy":"%s","flowseal":"%s","yv_off":%s,"quic_yt":%s,"expert":%s,"rkn":%s,"rkn_on":%s,"rkn_fits":%s,"rkn_count":%s,"wssize":%s,"ulist":%s,"ulist_on":%s,"ulist_count":%s,"testing":%s,"test_now":"%s","ipid":%s,"ipid_want":"%s","gv":"%s","gv_want":"%s","gv_list":"%s","yt_tcp":%s,"z2_luci":"%s","zdoh":%s,"zdoh_on":%s,"zdoh_doms":"%s","zdoh_own":%s,"s2":%s,"pending":%s,"pending_was":"%s","hdrezka":%s,"hdrezka_used":%s}\n' \
+	printf '{"pkg":"%s","zapret":"%s","zapret_running":%s,"zapret_version":"%s","zapret2":"%s","zapret2_running":%s,"strategy":"%s","flowseal":"%s","yv_off":%s,"quic_yt":%s,"expert":%s,"rkn":%s,"rkn_on":%s,"rkn_fits":%s,"rkn_count":%s,"rkn_src":"%s","wssize":%s,"ulist":%s,"ulist_on":%s,"ulist_count":%s,"testing":%s,"test_now":"%s","ipid":%s,"ipid_want":"%s","gv":"%s","gv_want":"%s","gv_list":"%s","yt_tcp":%s,"z2_luci":"%s","zdoh":%s,"zdoh_on":%s,"zdoh_doms":"%s","zdoh_own":%s,"s2":%s,"pending":%s,"pending_was":"%s","hdrezka":%s,"hdrezka_used":%s,"main_off":%s,"main_fam":"%s"}\n' \
 		"$PKG" "$zr" "$zr_running" "$(esc "$zr_ver")" "$zr2" "$zr2_running" "$(esc "$strat")" "$(esc "$fs_marker")" \
 		"$zs_yv" "$zs_qy" "$zs_ex" "$zs_rk" "$zs_rko" "$zs_rkf" \
-		"$(awk 'NF { n++ } END { print n + 0 }' "$ZO_RKN_FILE" 2>/dev/null | grep . || echo 0)" \
+		"$(awk 'NF { n++ } END { print n + 0 }' "$ZO_RKN_FILE" 2>/dev/null | grep . || echo 0)" "$(_zo_rkn_src)" \
 		"$zs_ws" "$zs_ul" "$zs_ulo" "$(_zo_user_count)" "$testing" "$(esc "$test_now")" \
 		"$zs_ip" "$(_yv_ipid_want)" "$zs_gv" "$(_zo_gv_want)" "$(_gv_ids | tr '\n' ' ' | sed 's/ $//')" \
-		"$zs_yt" "$(esc "$zr2_luci")" "$zs_zd" "$zs_zdon" "$(esc "$zdd")" "$zdo" "$zs_s2" "$zs_pd" "$zs_pw" "$zs_hz" "$zs_hzu"
+		"$zs_yt" "$(esc "$zr2_luci")" "$zs_zd" "$zs_zdon" "$(esc "$zdd")" "$zdo" "$zs_s2" "$zs_pd" "$zs_pw" "$zs_hz" "$zs_hzu" "$zs_mo" "$zs_mf"
 }
 _z2_luci_path() {
 	grep -ho '"admin/[A-Za-z0-9_/-]*zapret2[A-Za-z0-9_/-]*"' /usr/share/luci/menu.d/*.json 2>/dev/null | tr -d '"' | grep -v 'zapret-manager' |
@@ -2293,6 +2422,8 @@ _nochange_guard() {
 }
 
 _zm_dl_sane() { [ -s "$1" ] && ! head -c 1024 "$1" | grep -qiE '<(!doctype|html|head|body)'; }
+_zm_zip_ok() { command -v unzip >/dev/null 2>&1 || return 0; unzip -tq "$1" >/dev/null 2>&1; }
+_zm_tgz_ok() { tar -tzf "$1" >/dev/null 2>&1; }
 
 _nochange_restore() {
 	local keep="$ZM_STATE_DIR/nochange.$1" f dst
@@ -2325,6 +2456,11 @@ _add_gp_domains() {
 
 YV_OFF_FLAG="/opt/zapret-manager-luci/yv_off"
 DV_OFF_FLAG="/opt/zapret-manager-luci/dv_off"
+MAIN_OFF_FLAG="/opt/zapret-manager-luci/main_off"
+ZM_MAIN_RX='^--hostlist-exclude=/opt/zapret/ipset/zapret-hosts-user-exclude[.]txt$|^--hostlist=/opt/zapret/ipset/zapret-hosts-rkn[.]txt$|^--hostlist=/opt/zapret/ipset/zapret-hosts-user[.]txt$'
+ZM_MAIN_KEEP='^[ \t]*#|^--hostlist=/opt/zapret/ipset/zapret-hosts-google[.]txt$'
+ZM_MAIN_LAST="без неё в стратегии не останется ни одного блока и Zapret ничего не будет делать. Если обход не нужен, остановите Zapret кнопкой «Остановить»"
+_nfq_has_prof() { [ -s "$ZC_FILE" ] || _nfq_opt_body | sed '1d;$d' | grep -q '^--'; }
 DISCORD_RX='^--filter-l7=discord,stun$|^--filter-udp=19294-19344,50000-50100$|^--filter-tcp=2053,2083,2087,2096,8443$|^--hostlist-domains=discord[.]media$|^#[ \t]*Dv[0-9]+$'
 
 YV_RX='^#[ \t]*Yv[0-9]+$|^--hostlist=/opt/zapret/ipset/zapret-hosts-google[.]txt$'
@@ -2586,7 +2722,7 @@ _fake_get_many() {
 		[ $((n % 4)) = 0 ] || [ "$n" = "$tot" ] || continue
 		wait $pids 2>/dev/null
 		for f in $batch; do
-			IFS='|' read -r st src sz < "$r/$f" 2>/dev/null
+			IFS='|' read -r st src sz 2>/dev/null < "$r/$f"
 			if [ "$st" = ok ]; then
 				ZM_FAKE_OK=$((ZM_FAKE_OK + 1))
 				echo "   ✓ $f — $(_zm_size_txt "$sz")$([ "$src" != Flowseal ] && echo " · из $src")"
@@ -2629,6 +2765,7 @@ _fake_ensure() {
 
 strategy_set_flowseal() {
 	local name="$1" f block q w
+	[ "$name" = off ] && { strategy_main_off fs; return; }
 	f="$(_flowseal_file)"
 	[ -s "$f" ] || { echo '{"error":"список не загружен — сначала обновите"}'; return 1; }
 	[ -f "$CONF" ] || { echo '{"error":"Zapret не установлен"}'; return 1; }
@@ -2637,7 +2774,7 @@ strategy_set_flowseal() {
 	[ -z "$block" ] && { echo '{"error":"стратегия не найдена"}'; return 1; }
 	_udp443_on && q=1
 	_zo_wss_on && w=1
-	rm -f "$YV_OFF_FLAG" "$DV_OFF_FLAG"
+	rm -f "$YV_OFF_FLAG" "$DV_OFF_FLAG" "$MAIN_OFF_FLAG"
 	_game_xtreme_undo_opts
 	_remove_ports_if_present NFQWS_PORTS_UDP "$PORTS_UDP"
 	_remove_ports_if_present NFQWS_PORTS_TCP "$PORTS_TCP"
@@ -2906,6 +3043,7 @@ _hosts_src() {
 }
 HOSTS_AUTO="$ZM_STATE_DIR/hosts.auto"
 HOSTS_BASE="$ZM_STATE_DIR/hosts.base.gz"
+HOSTS_ON="$ZM_STATE_DIR/hosts.on"
 HOSTS_AUTO_TAG="# zm-hosts-auto"
 _hosts_auto_get() { [ -s "$HOSTS_AUTO" ] && sed -n "s/^$1=//p" "$HOSTS_AUTO" | head -n 1; }
 hosts_status() {
@@ -3097,13 +3235,43 @@ strategy_TCP_common() {
 
 strategy_Gv1() {
 	printf '%s\n' "#Gv1" "--new" "--filter-udp=$PORTS_UDP" "--dpi-desync=fake" "--dpi-desync-cutoff=d2" \
-		"--dpi-desync-any-protocol=1" "--dpi-desync-fake-unknown-udp=/opt/zapret/files/fake/stun.bin"
+		"--dpi-desync-any-protocol=1" "--dpi-desync-fake-unknown-udp=/opt/zapret/files/fake/${1:-stun.bin}"
 }
 
 strategy_Gv() {
 	local n="$1"
 	printf '%s\n' "#Gv$n" "--new" "--filter-udp=$PORTS_UDP" "--dpi-desync=fake" "--dpi-desync-repeats=10" \
-		"--dpi-desync-any-protocol=1" "--dpi-desync-fake-unknown-udp=/opt/zapret/files/fake/stun.bin" "--dpi-desync-cutoff=n$n"
+		"--dpi-desync-any-protocol=1" "--dpi-desync-fake-unknown-udp=/opt/zapret/files/fake/${2:-stun.bin}" "--dpi-desync-cutoff=n$n"
+}
+
+ZG_FAKE_FILE="$ZM_STATE_DIR/zapret_gfake"
+_gv_fake_of() {
+	awk '{ l = $0; gsub(/^[ \t]+|[ \t\r]+$/, "", l) }
+		l ~ /^#Gv[1-4](Xtreme)?$/ { g = 1; next }
+		g && l ~ /^#/ { exit }
+		g && l ~ /^--dpi-desync-fake-unknown-udp=/ { sub(/.*\//, "", l); print l; exit }'
+}
+_gv_fake_put() {
+	awk -v n="$1" '{ l = $0; gsub(/^[ \t]+|[ \t\r]+$/, "", l) }
+		l ~ /^#Gv[1-4](Xtreme)?$/ { g = 1 }
+		g && !d && l ~ /^--dpi-desync-fake-unknown-udp=/ { sub(/--dpi-desync-fake-unknown-udp=[^ \t\r]*/, "--dpi-desync-fake-unknown-udp=/opt/zapret/files/fake/" n); d = 1 }
+		{ print }'
+}
+_game_fake_ok() { [ -n "$1" ] || return 1; case " $ZS2_FAKES " in *" $1 "*) return 0 ;; esac; return 1; }
+_game_fake_safe() { _game_fake_ok "$1" && return 0; _zm_re "$1" '^[A-Za-z0-9_][A-Za-z0-9_.-]*[.]bin$' && [ -f "/opt/zapret/files/fake/$1" ]; }
+_game_fake_cur() { [ -f "$CONF" ] && sed -n "/^[[:space:]]*option NFQWS_OPT '/,\$p" "$CONF" | _gv_fake_of; }
+_game_fake() {
+	local f
+	f="$(_game_fake_cur)"
+	_game_fake_safe "$f" && { echo "$f"; return 0; }
+	f=""
+	[ -s "$ZG_FAKE_FILE" ] && read -r f < "$ZG_FAKE_FILE"
+	_game_fake_safe "$f" || f=stun.bin
+	echo "$f"
+}
+_game_fake_save() {
+	if [ "$1" = stun.bin ]; then rm -f "$ZG_FAKE_FILE"
+	else mkdir -p "$ZM_STATE_DIR" && printf '%s\n' "$1" > "$ZG_FAKE_FILE"; fi
 }
 
 _game_rx() {
@@ -3111,7 +3279,7 @@ _game_rx() {
 }
 
 game_set() {
-	local choice="$1" current="" rc
+	local choice="$1" current="" rc gf="$2"
 	_zm_re "$choice" '^([1-4]|off)$' || { echo '{"error":"некорректный номер Gv"}'; return 1; }
 	[ -f "$CONF" ] || { echo '{"error":"Zapret не установлен"}'; return 1; }
 	current=$(grep -oE '^#Gv[1-4](Xtreme)?$' "$CONF" | head -n1 | sed 's/^#//; s/Xtreme$//')
@@ -3122,6 +3290,11 @@ game_set() {
 		_game_xtreme_undo_opts
 		_nfq_drop_profiles "$(_game_rx)"
 		rc=$?
+		if [ "$rc" = 0 ] && [ -f "$MAIN_OFF_FLAG" ] && ! _nfq_has_prof; then
+			mv -f "$CONF.gvbak" "$CONF"
+			printf '{"error":"%s"}\n' "$(esc "Основная стратегия выключена, а игровой блок — последний: $ZM_MAIN_LAST")"
+			return 1
+		fi
 		case $rc in
 			0|3)
 				rm -f "$CONF.gvbak"
@@ -3137,6 +3310,7 @@ game_set() {
 	fi
 
 	[ "$current" = "Gv$choice" ] && { printf '{"ok":true,"game":"Gv%s"}\n' "$choice"; return 0; }
+	_game_fake_safe "$gf" || gf="$(_game_fake)"
 
 	cp "$CONF" "$CONF.gvbak"
 	_game_xtreme_undo_opts
@@ -3150,9 +3324,10 @@ game_set() {
 	local last_quote strat
 	last_quote=$(grep -n "^[[:space:]]*'[[:space:]]*\$" "$CONF" | tail -n1 | cut -d: -f1)
 	[ -n "$last_quote" ] && sed -i "${last_quote},\$d" "$CONF"
-	if [ "$choice" = "1" ]; then strat="$(strategy_Gv1; strategy_TCP_common)"; else strat="$(strategy_Gv "$choice"; strategy_TCP_common)"; fi
+	if [ "$choice" = "1" ]; then strat="$(strategy_Gv1 "$gf"; strategy_TCP_common)"; else strat="$(strategy_Gv "$choice" "$gf"; strategy_TCP_common)"; fi
 	echo "$strat" | sed '/^$/d' >> "$CONF"
 	echo "'" >> "$CONF"
+	_game_fake_save "$gf"
 	_add_ports_if_missing NFQWS_PORTS_UDP "$PORTS_UDP"
 	_add_ports_if_missing NFQWS_PORTS_TCP "$PORTS_TCP"
 	zapret_restart
@@ -3161,13 +3336,16 @@ game_set() {
 
 game_set_fake() {
 	local file="$1"
-	case "$file" in
-		stun.bin|stun2.bin|quic_initial_4pda_to.bin|quic_initial_tencent_com.bin|tls_clienthello_sochi_park.bin|quic_initial_www_google_com.bin|quic_initial_steamcommunity_com.bin|quic_initial_5ka_ru.bin|quic_initial_rutube_ru.bin) ;;
-		*) echo '{"error":"неизвестный fake-файл"}'; return 1 ;;
-	esac
+	_game_fake_ok "$file" || { echo '{"error":"неизвестный fake-файл"}'; return 1; }
 	[ -f "$CONF" ] || { echo '{"error":"Zapret не установлен"}'; return 1; }
-	grep -q -- '--dpi-desync-fake-unknown-udp=' "$CONF" || { echo '{"error":"игровая стратегия не установлена"}'; return 1; }
-	awk -v new="$file" 'BEGIN{done=0} !done && /--dpi-desync-fake-unknown-udp=/{sub(/\/opt\/zapret\/files\/fake\/[^ ]+/, "/opt/zapret/files/fake/" new); done=1} {print}' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+	if [ -z "$(_game_fake_cur)" ]; then
+		_game_fake_save "$file"
+		printf '{"ok":true,"fake":"%s","saved":true}\n' "$(esc "$file")"
+		return 0
+	fi
+	_gv_fake_put "$file" < "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF" || { rm -f "$CONF.tmp"; echo '{"error":"не удалось записать конфиг Zapret"}'; return 1; }
+	[ "$(_game_fake_cur)" = "$file" ] || { echo '{"error":"не удалось поменять fake-файл в игровой стратегии"}'; return 1; }
+	_game_fake_save "$file"
 	zapret_restart
 	printf '{"ok":true,"fake":"%s"}\n' "$(esc "$file")"
 }
@@ -3369,7 +3547,7 @@ _zpg_bytes() {
 	for f in $(_zpg_files "$1"); do
 		[ -s "$f" ] || continue
 		grep -q 'zmPageOff' "$f" 2>/dev/null && continue
-		s="$(wc -c < "$f" 2>/dev/null)"; n=$((n + ${s:-0}))
+		s="$(wc -c 2>/dev/null < "$f")"; n=$((n + ${s:-0}))
 	done
 	echo "$n"
 }
@@ -3385,9 +3563,9 @@ _zpg_core_bytes() {
 		/usr/share/rpcd/acl.d/luci-app-zapret-manager.json "$ZPG_MENU" /www/luci-static/resources/zapret-manager/common.js \
 		"$ZPG_V/style.css" "$ZPG_V/dashboard.js" "$ZPG_V/system.js" "$ZPG_V/thanks.js" /www/zm/app.js /www/zm/app.css /www/zm-webui.html; do
 		[ -f "$f" ] || continue
-		s="$(wc -c < "$f" 2>/dev/null)"; n=$((n + ${s:-0}))
+		s="$(wc -c 2>/dev/null < "$f")"; n=$((n + ${s:-0}))
 	done
-	for f in $(find /usr/share/zm-redbtn -type f 2>/dev/null); do s="$(wc -c < "$f" 2>/dev/null)"; n=$((n + ${s:-0})); done
+	for f in $(find /usr/share/zm-redbtn -type f 2>/dev/null); do s="$(wc -c 2>/dev/null < "$f")"; n=$((n + ${s:-0})); done
 	echo "$n"
 }
 _zpg_prune() {
@@ -3676,11 +3854,12 @@ _zs2_build() {
 	fi
 	_zs2_drop '^#ZM_NEVER_MATCHES$' < "$D/w" > "$D/w2" || return 1
 	awk -v df="$(_zs2_kv "$D" df)" -v gf="$(_zs2_kv "$D" gf)" -v F=/opt/zapret/files/fake/ '
+		/^#Gv[1-4](Xtreme)?$/ { gb = 1 }
 		$0 == "--new" { ds = 0 }
 		$0 == "--filter-l7=discord,stun" { ds = 1 }
 		df != "" && ds && /^--dpi-desync-fake-discord=/ { $0 = "--dpi-desync-fake-discord=" F df }
 		df != "" && ds && /^--dpi-desync-fake-stun=/ { $0 = "--dpi-desync-fake-stun=" F df }
-		gf != "" && !gd && /^--dpi-desync-fake-unknown-udp=/ { $0 = "--dpi-desync-fake-unknown-udp=" F gf; gd = 1 }
+		gf != "" && gb && !gd && /^--dpi-desync-fake-unknown-udp=/ { $0 = "--dpi-desync-fake-unknown-udp=" F gf; gd = 1 }
 		{ print }' "$D/w2" > "$D/w3" || return 1
 	_zs2_x "$D" "$D/w3" || return 1
 	cat "$D/w3"
@@ -3775,9 +3954,6 @@ _zs2_refresh() {
 	rm -rf "$t"
 	return 0
 }
-# Несколько изменений секции за один раз: шаги стратегии, устройства, включение/выключение — и один перезапуск Zapret.
-# Строки: "step<TAB>действие<TAB>значение", "devs<TAB>ip|имя<TAB>ip|имя…", "on", "off".
-# preview — только собрать и вернуть, что получится; batch — записать и применить.
 
 _zl_path() {
 	case "$1" in
@@ -4176,7 +4352,6 @@ _zm_port_owner() {
 
 TG_ARGS_DEF_GO="--cf-proxy --cf-proxy-first --cf-balance"
 TG_ARGS_DEF_RS="--default-domains --cf-balance --cf-priority"
-# Параметры строки запуска после самой программы — без тех, что задаёт «Порт и ключ» (--host, --port, --secret, --listen-faketls-domain)
 _tg_args_of() {
 	local init
 	init="$(_tg_auto_init "$1")" || return 0
@@ -4327,6 +4502,8 @@ TEST_PARALLEL=8
 ZO_RKN_URL="${GH_RAW}/IndeecFOX/zapret4rocket/refs/heads/master/extra_strats/TCP/RKN/List.txt"
 ZO_RKN_FILE="/opt/zapret/ipset/zapret-hosts-rkn.txt"
 ZO_RKN_FLAG="$ZM_STATE_DIR/zapret_rkn"
+ZO_RKN_SRC_FILE="$ZM_STATE_DIR/zapret_rkn_src"
+_zo_rkn_src() { [ "$(cat "$ZO_RKN_SRC_FILE" 2>/dev/null)" = tachyon ] && echo tachyon || echo z4r; }
 ZO_USER_HL="--hostlist=/opt/zapret/ipset/zapret-hosts-user.txt"
 ZO_EXCL_HL="--hostlist-exclude=/opt/zapret/ipset/zapret-hosts-user-exclude.txt"
 ZO_WSS="--wssize 1:6"
@@ -5036,7 +5213,6 @@ _fk_dash_info() {
 		*) echo "свои серверы" ;;
 	esac
 }
-# Секции Forkozz для дашборда: «состояние<TAB>имя» по включённым секциям, кэш 20 с.
 _fk_dash_secs() {
 	local f="$JOBS_DIR/fk.dash" now t=""
 	now="$(date +%s)"
@@ -5048,7 +5224,6 @@ _fk_dash_secs() {
 	fi
 	tail -n +2 "$f" 2>/dev/null
 }
-# Итог для дашборда: «код<TAB>подпись». 1 — все секции работают, 3 — часть, 2 — ни одна.
 _fk_dash_sum() {
 	_fk_dash_secs | awk -F'\t' '$2 != "" { n++; nm = nm (n > 1 ? ", " : "") $2; if ($1 == "bad" || $1 == "stopped" || $1 == "direct") { b++; bn = bn (b > 1 ? ", " : "") $2 } }
 		END {
@@ -5150,10 +5325,10 @@ health() {
 	fi
 	printf '{"dots":{"zapret":%s,"zapret2":%s,"bytetube":%s,"tg":%s,"mixomo":%s,"doh":%s,"hosts":%s,"adblock":%s,"steer":%s,"forkop":%s,"awg":%s,"term":%s,"ts":%s},' \
 		"$d_zr" "$d_zr2" "$d_bt" "$d_tg" "$d_mx" "$d_doh" "$hs" "$d_ab" "$d_sr" "${d_fk:-0}" "${d_awg:-0}" "$d_term" "$(_tsc_dot)"
-	printf '"zapret":%s,"zapret2":%s,"bytetube":%s,"tg":%s,"mixomo":%s,"doh":%s,"hosts":%s,"steer":%s,"steer_off":%s,"steer_fail":%s,"steer_exit":"%s","awg":%s,"forkop":%s,"flow_warn":%s,"steer_flow_warn":%s,"ipv6_warn":%s,"gh_warn":%s,"reboot_hint":"%s","nav_hidden":"%s","pages_off":"%s","tsc":%s,"htop":%s,"fk_info":"%s","tg_info":"%s","oom":%s}\n' \
+	printf '"zapret":%s,"zapret2":%s,"bytetube":%s,"tg":%s,"mixomo":%s,"doh":%s,"hosts":%s,"steer":%s,"steer_off":%s,"steer_fail":%s,"steer_exit":"%s","awg":%s,"forkop":%s,"flow_warn":%s,"steer_flow_warn":%s,"ipv6_warn":%s,"gh_warn":%s,"reboot_hint":"%s","nav_hidden":"%s","pages_off":"%s","tsc":%s,"htop":%s,"fk_info":"%s","tg_info":"%s","oom":%s,"zmw":%s}\n' \
 		"$zr" "$zr2" "$bt" "$tg" "$mx" "$doh" "$hs" "$sr" \
 		"$([ -f /etc/zm-steer/stopped ] && echo true || echo false)" "$sf" "$sx" "$awgj" "$fkh" "$fw" "$fws" "$v6" "$(_zm_ghp_warn && echo true || echo false)" "$(esc "$(_zm_reboot_hint_get)")" "$(esc "$(ui_nav_get)")" "$(esc "$(_zpg_offlist)")" "$tss" "$([ -x /usr/bin/htop ] && echo true || echo false)" \
-		"$(esc "$fki")" "$([ "$tg" != 0 ] && esc "$(_tg_dash_info)")" "$(_zm_oom_json)"
+		"$(esc "$fki")" "$([ "$tg" != 0 ] && esc "$(_tg_dash_info)")" "$(_zm_oom_json)" "$(_zmw_port || echo 0)"
 }
 
 VERSIONS_CACHE="$ZM_STATE_DIR/versions.json"
@@ -5303,10 +5478,8 @@ _doh_main_text() {
 	echo "	option group 'nogroup'"
 	echo "	option listen_addr '127.0.0.1'"
 	echo "	option force_ip_family 'auto'"
-	if [ "$1" = 1 ]; then
-		echo "	option canary_domains_icloud '1'"
-		echo "	option canary_domains_mozilla '1'"
-	fi
+	echo "	option canary_domains_icloud '$1'"
+	echo "	option canary_domains_mozilla '$1'"
 }
 _doh_other_sections() {
 	awk '/^config[ \t]/ { skip = ($2 == "main") } !skip' "$_doh_file" 2>/dev/null | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' | sed '/./,$!d'
@@ -5385,7 +5558,8 @@ doh_status() {
 			[ "$i" -gt 16 ] && break
 		done
 		[ "$n" = 1 ] && current="$provs"
-		[ "$(uci -q get https-dns-proxy.config.force_dns)" != "0" ] && force=true
+		if [ "$(uci -q get https-dns-proxy.config.force_dns)" != "0" ]; then force=true
+		elif [ "$(uci -q get https-dns-proxy.config.canary_domains_mozilla)" != "0" ] && ! _dnsm_present; then _doh_force_apply; fi
 	fi
 	/etc/init.d/https-dns-proxy running >/dev/null 2>&1 && running=true
 	[ -f "$DOH_STOP" ] && ! _doh_pkg && rm -f "$DOH_STOP"
@@ -5618,7 +5792,7 @@ _rb_list_get() {
 	if [ -s "$p" ] && [ -n "$(find "$ZM_LISTS_DIR/.$f.fail" -mmin -60 2>/dev/null)" ]; then return 0; fi
 	mkdir -p "$ZM_LISTS_DIR" 2>/dev/null
 	tmp="$ZM_LISTS_DIR/.$f.$$"
-	if _st_fetch "$u" "$tmp"; then
+	if _st_fetch "$u" "$tmp" || { _st_cdn_url "$u" >/dev/null 2>&1 && _st_fetch "$(_st_cdn_url "$u")" "$tmp"; }; then
 		_rb_list_norm "$f" "$tmp" > "$tmp.ok"
 		if [ -s "$tmp.ok" ]; then
 			mv -f "$tmp.ok" "$p"
@@ -5639,10 +5813,19 @@ _rb_list_get() {
 
 _rb_say() { echo "==> $*"; }
 _rb_warn() { echo "!! $*"; }
-_rb_svc_src() { grep -hv '^#' "$RB_SHARE/services.conf" 2>/dev/null; [ -f "$ST_CAT_OFF" ] || awk -F'|' -v skip="$ST_CAT_SKIP" -v conf="$RB_SHARE/services.conf" 'BEGIN { while ((getline l < conf) > 0) { if (l ~ /^#/) continue; split(l, a, "|"); if (a[1] == "") continue; b[a[1]] = 1; m = split(a[8], c, ","); for (i = 1; i <= m; i++) if (c[i] != "") b[c[i]] = 1 } } $9 != "" && $9 != "Свои списки каталога" { k = $1; sub(/^c_/, "", k); if (index(skip, " " k " ")) next; if (k ~ /^itdoginfo_/ && (substr(k, 11) in b)) next; print }' "$ST_CAT_SVC" 2>/dev/null; }
-_rb_svc_field() { _rb_svc_src | grep "^$1|" | head -n1 | cut -d'|' -f"$2"; }
+_rb_conf_plus() {
+	if [ -f "$ST_TCH_OFF" ] || [ ! -s "$ST_TCH_PLUS" ]; then grep -hv '^#' "$RB_SHARE/services.conf" 2>/dev/null; return 0; fi
+	awk -F'|' -v OFS='|' -v pf="$ST_TCH_PLUS" '
+		BEGIN { while ((getline l < pf) > 0) { i = index(l, "|"); if (i > 1) P[substr(l, 1, i - 1)] = substr(l, i + 1) } close(pf) }
+		/^#/ { next }
+		($1 in P) && P[$1] != "" && $8 != "" { n = split($8, c, ","); for (i = 1; i <= n; i++) h[c[i]] = 1; m = split(P[$1], a, ","); for (i = 1; i <= m; i++) if (a[i] != "" && !(a[i] in h)) $8 = $8 ($8 != "" ? "," : "") a[i]; delete h }
+		{ print }' "$RB_SHARE/services.conf" 2>/dev/null
+}
+_rb_svc_src() { _rb_conf_plus; cat "$ST_OWN_SVC" "$ST_OWN_CSVC" 2>/dev/null; [ -f "$ST_CAT_OFF" ] || awk -F'|' -v skip="$ST_CAT_SKIP" -v conf="$RB_SHARE/services.conf" 'BEGIN { while ((getline l < conf) > 0) { if (l ~ /^#/) continue; split(l, a, "|"); if (a[1] == "") continue; b[a[1]] = 1; m = split(a[8], c, ","); for (i = 1; i <= m; i++) if (c[i] != "") b[c[i]] = 1 } } $9 != "" && $9 != "Свои списки каталога" { k = $1; sub(/^c_/, "", k); if (index(skip, " " k " ")) next; if (k ~ /^itdoginfo_/ && (substr(k, 11) in b)) next; print }' "$ST_CAT_SVC" 2>/dev/null; [ -f "$ST_TCH_OFF" ] || cat "$ST_TCH_SVC" 2>/dev/null; }
+_rb_svc_field() { _rb_svc_src | awk -F'|' -v k="$1" -v n="$2" '$1 == k { print $n; exit }'; }
+_rb_svc_row() { _rb_svc_src | awk -F'|' -v k="$1" '$1 == k { print; exit }'; }
 _rb_svc_names() { local id; for id in $1; do printf '%s, ' "$(_rb_svc_field "$id" 2)"; done | sed 's/, $//'; }
-_rb_routable() { [ "$1" = custom ] && [ -n "$(_rb_svc_field custom 1)" ] && return 0; [ -n "$(_rb_svc_field "$1" 3)$(_rb_svc_field "$1" 4)$(_rb_svc_field "$1" 8)" ]; }
+_rb_routable() { _rb_svc_src | awk -F'|' -v k="$1" '$1 == k { r = k == "custom" || $3 $4 $8 != ""; exit } END { exit !r }'; }
 _job_alive() { _job_running "$1"; }
 
 _rb_rpcd_ensure() {
@@ -5664,6 +5847,25 @@ ST_CAT_IDX="$ST_DIR/catalog.idx"
 ST_CAT_META="$ST_DIR/catalog.meta"
 ST_CAT_URL="$ST_DIR/catalog.url"
 ST_CAT_OFF="$ST_DIR/catalog.off"
+ST_TCH_SVC="$ST_DIR/tachyon.svc"
+ST_TCH_DIRECT="$ST_DIR/tachyon.direct"
+ST_TCH_PLUS="$ST_DIR/tachyon.plus"
+ST_TCH_IDX="$ST_DIR/tachyon.idx"
+ST_TCH_META="$ST_DIR/tachyon.meta"
+ST_TCH_OFF="$ST_DIR/tachyon.off"
+ST_TCH_ERR="$ST_DIR/tachyon.err"
+ST_TCH_XSETS="$ST_DIR/user/exclude.sets"
+ST_TCH_REPO="https://github.com/Dushnilin/tachyon-lists"
+ST_OWN_SVC="$ST_DIR/own.svc"
+ST_OWN_IDX="$ST_DIR/own.idx"
+ST_OWN_GRP="Мои списки (добавлены вами)"
+ST_OWN_MAX=30
+ST_OWN_CATS="$ST_DIR/own.cats"
+ST_OWN_CSVC="$ST_DIR/own.cat.svc"
+ST_OWN_CIDX="$ST_DIR/own.cat.idx"
+ST_OWN_CMAX=5
+ST_TCH_RAW="https://raw.githubusercontent.com/Dushnilin/tachyon-lists/main"
+ST_TCH_CDN="https://cdn.jsdelivr.net/gh/Dushnilin/tachyon-lists@main"
 ST_SKIP="$ST_DIR/skip"
 ST_OFF="$ST_DIR/stopped"
 ST_WARP_CONF="$ST_DIR/warp.conf"
@@ -5709,6 +5911,8 @@ STL_SOCK="$STL_ETC/steer.sock"
 STL_INIT="${STL_INIT:-/etc/init.d/steer}"
 STL_SBIN="${STL_SBIN:-/usr/sbin}"
 STL_STATE="${STL_STATE:-/var/lib/steer}"
+STL_PLUG="${STL_PLUG:-/usr/lib/steer/plugins}"
+STL_SEED_SPEC='{"version":2,"outputs":{"direct":{"kind":"direct"}}}'
 STL_MIN="2.0.0"
 STL_MODS="vless xsteer obfs tgws hysteria2 proxy"
 STL_REL_URLS="${STL_REL_URLS:-https://raw.githubusercontent.com/splify2/releases/main/version.json https://cdn.jsdelivr.net/gh/splify2/releases@main/version.json https://splify2.github.io/releases/version.json}"
@@ -5722,6 +5926,14 @@ ST_SEC=""
 _st_onfail() { [ "$(cat /etc/zm-steer/onfail 2>/dev/null)" = drop ] && echo drop || echo direct; }
 _st_dnsmode() { [ "$(cat /etc/zm-steer/dns.mode 2>/dev/null)" = router ] && echo router || echo tun; }
 _st_realip() { [ "$(cat /etc/zm-steer/realip.mode 2>/dev/null)" = off ] && echo off || echo on; }
+_st_torrent() { case "$(cat /etc/zm-steer/torrent.mode 2>/dev/null)" in direct) echo direct ;; block) echo block ;; *) echo allow ;; esac; }
+_st_quic() { [ "$(cat /etc/zm-steer/quic.mode 2>/dev/null)" = block ] && echo block || echo allow; }
+_stl_tq() {
+	[ -n "$ZM_STL_NOTQ" ] && return 0
+	[ "$(_st_torrent)" = allow ] || printf ',"torrent":"%s"' "$(_st_torrent)"
+	[ "$(_st_quic)" = block ] && printf ',"quic":"block"'
+	return 0
+}
 _st_cttl() { local v; v="$(cat /etc/zm-steer/dns.ttlmin 2>/dev/null)"; case "$v" in 300|900|3600) echo "$v" ;; *) echo 0 ;; esac; }
 _stl_t() { _zm_tmo "$@"; }
 _stl_out() { case "$1" in vpn) echo "$STL_VPN_OUT" ;; iface) echo "zm_if${ST_SEC#s}" ;; *) echo "$STL_WARP_OUT" ;; esac; }
@@ -5730,12 +5942,13 @@ _stl_ver_ok() { _zm_re "$1" '^[0-9]+\.[0-9]+\.[0-9]+$' && [ "${1%%.*}" -ge 2 ]; 
 stl_present() { command -v steer >/dev/null 2>&1; }
 stl_version() { steer --version 2>/dev/null | awk 'NR == 1 { print $2 }'; }
 stl_v2() { _stl_ver_ok "$(stl_version)"; }
+_stl_mod_x() { [ -x "$STL_SBIN/steer-$1" ] || [ -s "$STL_PLUG/$1/plugin.json" ]; }
 stl_has() {
 	stl_v2 || return 1
 	case "$1" in
-		vpn|vless) [ -x "$STL_SBIN/steer-vless" ] ;;
-		hy2|hysteria2) [ -x "$STL_SBIN/steer-hysteria2" ] ;;
-		proxy) [ -x "$STL_SBIN/steer-proxy" ] ;;
+		vpn|vless) _stl_mod_x vless ;;
+		hy2|hysteria2) _stl_mod_x hysteria2 ;;
+		proxy) _stl_mod_x proxy ;;
 		*) return 1 ;;
 	esac
 }
@@ -5745,7 +5958,7 @@ stl_busy_by() {
 	for b in podkop; do [ -e "${i%/*}/$b" ] && by="${by:+$by, }$b"; done
 	echo "${by:-steer-box-connector}"
 }
-_stl_mods_present() { local m; for m in $STL_MODS; do [ -x "$STL_SBIN/steer-$m" ] && printf '%s ' "$m"; done; }
+_stl_mods_present() { local m; for m in $STL_MODS; do _stl_mod_x "$m" && printf '%s ' "$m"; done; }
 
 _stl_rel() {
 	local f="$STL_TMP/version.json" u
@@ -5781,6 +5994,7 @@ stl_latest() {
 
 stl_pkgs_installed() {
 	local p m
+	_st_ver_lt "$(stl_version)" 2.1.0 || { _pkg_is_installed steer-core && printf 'steer-core '; return 0; }
 	for p in $(for m in $STL_MODS; do echo "steer-$m"; done) steer-extended steer-core steer libsteer libsteer-wolfssl; do
 		_pkg_is_installed "$p" && printf '%s ' "$p"
 	done
@@ -5798,6 +6012,12 @@ stl_leftovers() {
 	killall steerd >/dev/null 2>&1
 	rm -rf "$STL_STATE"
 	rm -f "$STL_SOCK"
+	if [ -d "$STL_PLUG" ] || [ -d "$STL_ETC/plugins" ]; then
+		rm -rf "$STL_PLUG" "$STL_ETC/plugins"
+		rm -f /lib/upgrade/keep.d/steer-plugins
+		rmdir "${STL_PLUG%/*}" 2>/dev/null
+		echo "   ✓ Плагины ядра steer убраны"
+	fi
 	rmdir "$STL_ETC" 2>/dev/null
 	[ "$n" -gt 0 ] && echo "   ✓ Убраны оставшиеся правила ядра steer: $n"
 	return 0
@@ -5917,7 +6137,9 @@ BEGIN {
 			k = (o ~ /^zm_if/) ? "туннель" (IF[s] != "" ? " " IF[s] : "") : "VPN"
 			lab = (LB[s] != "" ? LB[s] " · " : "") k
 		} else if (o ~ /^zm_warp/) lab = "WARP"
+		else if (o ~ /^zmwarp[0-9]*$/) lab = (o == "zmwarp" ? "WARP" : "WARP " substr(o, 7))
 		else if (o == "zm_direct") lab = "Мимо Steer"
+		else if (o ~ /^zm_fo[0-9]+$/) lab = "Запасной путь секций"
 		if (lab != "") {
 			sub("^устройство " T " в зоне, NAT есть$", "туннель подключён, NAT есть", rest)
 			sub("^устройство " T " в зоне$", "туннель подключён", rest)
@@ -5985,7 +6207,9 @@ stl_explain() {
 		STL_X_OUT="$(printf '%s' "$line" | sed -n 's/.*-> output "\([^"]*\)".*/\1/p')"
 		STL_X_SET="$(printf '%s' "$line" | sed -n 's/.*"\([^"]*\)" -> output ".*/\1/p')"
 		STL_X_DEV="$(printf '%s' "$line" | sed -n 's/.*-> dev \([^ ]*\).*/\1/p')"
-		case "$STL_X_OUT" in "$STL_WARP_OUT") STL_X_VERDICT=warp ;; zm_vpn|zm_vpn[2-9]|zmv_*|zmv[2-9]_*) STL_X_VERDICT=vpn ;; zm_if|zm_if[2-9]) STL_X_VERDICT=iface ;; "$ST_DIRECT_OUT") STL_X_VERDICT=direct ;; *) STL_X_VERDICT=other ;; esac
+		case "$STL_X_OUT" in "$STL_WARP_OUT") STL_X_VERDICT=warp ;; zm_vpn|zm_vpn[2-9]|zmv_*|zmv[2-9]_*) STL_X_VERDICT=vpn ;; zm_if|zm_if[2-9]) STL_X_VERDICT=iface ;; "$ST_DIRECT_OUT") STL_X_VERDICT=direct ;;
+			zm_fo[0-9]*) case "$STL_X_DEV" in zmwarp*) STL_X_VERDICT=warp ;; zm_vpn*|zmv*) STL_X_VERDICT=vpn ;; '') STL_X_VERDICT=other ;; *) STL_X_VERDICT=iface ;; esac ;;
+			*) STL_X_VERDICT=other ;; esac
 		[ -z "$STL_X_DEV" ] && printf '%s' "$line" | grep -q -- '-> direct' && STL_X_VERDICT=direct
 	elif printf '%s' "$t" | grep -q 'no channel matches'; then STL_X_VERDICT=direct
 	elif printf '%s' "$t" | grep -q 'резолвер ответил, но адреса не дал'; then STL_X_VERDICT=noaddr
@@ -6019,6 +6243,9 @@ stl_sub_mods() {
 	if head -c 256 "$1" 2>/dev/null | tr -d ' \t\r\n' | grep -q '^[[{]'; then
 		grep -qiE '"(protocol|type)"[[:space:]]*:[[:space:]]*"(hysteria2?|hy2)"' "$1" && m="$m hy2"
 		grep -qiE '"(protocol|type)"[[:space:]]*:[[:space:]]*"(trojan|shadowsocks|socks|http|vmess)"' "$1" && m="$m proxy"
+	elif grep -qE '^proxies:[[:space:]]*(\[|$)' "$1"; then
+		grep -qiE '(^|[{,[:space:]-])type:[[:space:]]*["'"'"']?(hysteria2?|hy2)["'"'"']?([,}[:space:]]|$)' "$1" && m="$m hy2"
+		grep -qiE '(^|[{,[:space:]-])type:[[:space:]]*["'"'"']?(trojan|ss|shadowsocks|socks5?|http|vmess)["'"'"']?([,}[:space:]]|$)' "$1" && m="$m proxy"
 	else
 		grep -qiE '^(hysteria2|hy2)://' "$1" && m="$m hy2"
 		grep -qiE '^(trojan|ss|socks4a?|socks5?|https?|vmess)://' "$1" && m="$m proxy"
@@ -6026,9 +6253,12 @@ stl_sub_mods() {
 	echo "$m"
 }
 
+_stl_insec() { [ -f "${1%/*}/sub.insecure" ]; }
+_stl_insec_arg() { _stl_insec "$1" && echo --insecure; }
+
 stl_probe() {
 	local j
-	j="$(_stl_t 40 steer "$2-probe" "$1" --node "$3" --timeout 8 2>/dev/null | tr '\n' ' ')"
+	j="$(_stl_t 40 steer "$2-probe" "$1" --node "$3" --timeout 8 $(_stl_insec_arg "$1") 2>/dev/null | tr '\n' ' ')"
 	case "$j" in '{'*) printf '%s' "$j" ;; *) return 1 ;; esac
 }
 
@@ -6073,7 +6303,7 @@ do_steer_devs() {
 	_st_phase rules
 	rm -f "$ST_STOP_FLAG"
 	if [ -n "$ST_SEC" ]; then _rb_say "Секция «$(_st_sec_name "$ST_SEC")», устройства: весь трафик через секцию — $(_st_devs_n all), правила секции только для — $(_st_devs_n only)"
-	else _rb_say "Устройства: весь трафик через туннель — $(_st_devs_n all), мимо Steer — $(_st_devs_n byp)"; fi
+	else _rb_say "Устройства: весь трафик через туннель — $(_st_devs_n all), сервисы только для — $(_st_devs_n only), мимо Steer — $(_st_devs_n byp)"; fi
 	if _st_owns "steer-spec" && _st_work; then
 		if _st_use_vpn; then _st_spec_quick; else _st_spec_quick_warp; fi
 		rc=$?
@@ -6393,7 +6623,66 @@ _st_cat_refresh() {
 	return $rc
 }
 
+_st_tch_on() { [ ! -f "$ST_TCH_OFF" ]; }
+
+_st_age() { echo $(( $(date +%s) - $(date -r "$1" +%s 2>/dev/null || echo 0) )); }
+
+_st_tch_idx_merge() {
+	mkdir -p "$ST_DIR"
+	{ grep -vE '^(t|zmu|zmc[0-9]+)_' "$ST_CAT_IDX" 2>/dev/null; _st_tch_on && cat "$ST_TCH_IDX" 2>/dev/null; cat "$ST_OWN_IDX" "$ST_OWN_CIDX" 2>/dev/null; } > "$ST_CAT_IDX.t$$"
+	if [ -s "$ST_CAT_IDX.t$$" ] || [ -f "$ST_CAT_IDX" ]; then mv -f "$ST_CAT_IDX.t$$" "$ST_CAT_IDX"; else rm -f "$ST_CAT_IDX.t$$"; fi
+}
+
+_st_tch_refresh() {
+	local m="$ST_RUN/tachyon.json" lk="$ST_RUN/tch.lock" rc=0 t
+	_st_tch_on || return 0
+	mkdir -p "$ST_DIR" "$ST_RUN"
+	[ "$1" != force ] && [ -s "$ST_TCH_META" ] && [ "$(_st_age "$ST_TCH_META")" -lt 21600 ] && return 0
+	if ! mkdir "$lk" 2>/dev/null; then
+		t=0
+		while [ "$1" = force ] && [ "$t" -lt 10 ] && [ -d "$lk" ]; do sleep 1; t=$((t + 1)); done
+		if ! mkdir "$lk" 2>/dev/null; then
+			[ -n "$(find "$lk" -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
+			rmdir "$lk" 2>/dev/null; mkdir "$lk" 2>/dev/null || return 0
+		fi
+	fi
+	if { _st_fetch "$ST_TCH_RAW/release/catalog.json" "$m" || _st_fetch "$ST_TCH_CDN/release/catalog.json" "$m"; } && _st_tch_build "$m"; then
+		rm -f "$ST_TCH_ERR"
+		_st_tch_idx_merge
+	else
+		date +%s > "$ST_TCH_ERR"
+		rc=1
+	fi
+	rm -f "$m"
+	rmdir "$lk" 2>/dev/null
+	return $rc
+}
+
+_st_tch_bg() {
+	_st_tch_on || return 0
+	[ -d "$ST_RUN/tch.lock" ] && [ -z "$(find "$ST_RUN/tch.lock" -maxdepth 0 -mmin +5 2>/dev/null)" ] && return 0
+	[ -f "$ST_TCH_ERR" ] && [ "$(_st_age "$ST_TCH_ERR")" -lt 1800 ] && return 0
+	[ -s "$ST_TCH_META" ] && [ "$(_st_age "$ST_TCH_META")" -lt 21600 ] && [ "$RB_SHARE/services.conf" -ot "$ST_TCH_META" ] && return 0
+	( _st_tch_refresh force >/dev/null 2>&1 & )
+}
+
+_st_tch_busy() {
+	[ -d "$ST_RUN/tch.lock" ] && [ -z "$(find "$ST_RUN/tch.lock" -maxdepth 0 -mmin +5 2>/dev/null)" ] && return 0
+	[ -f "$ST_RUN/tch.pending" ] && [ -z "$(find "$ST_RUN/tch.pending" -maxdepth 0 -mmin +5 2>/dev/null)" ]
+}
+
+_st_tch_json() {
+	local d="" n=0 x=0 p=0 k=0 t=0 g=0
+	[ -s "$ST_TCH_META" ] && { d="$(sed -n 's/^version=//p' "$ST_TCH_META")"; n="$(sed -n 's/^lists=//p' "$ST_TCH_META")"; x="$(sed -n 's/^direct=//p' "$ST_TCH_META")"; p="$(sed -n 's/^plus=//p' "$ST_TCH_META")"
+		k="$(sed -n 's/^block=//p' "$ST_TCH_META")"; t="$(sed -n 's/^total=//p' "$ST_TCH_META")"; g="$(sed -n 's/^big=//p' "$ST_TCH_META")"; }
+	printf '{"on":%s,"version":"%s","lists":%s,"direct":%s,"plus":%s,"block":%s,"big":%s,"total":%s,"age":%s,"error":%s,"busy":%s,"url":"%s"}' \
+		"$(_st_tch_on && echo true || echo false)" "$(esc "$d")" "${n:-0}" "${x:-0}" "${p:-0}" "${k:-0}" "${g:-0}" "${t:-0}" "$([ -s "$ST_TCH_META" ] && _st_age "$ST_TCH_META" || echo -1)" \
+		"$([ -f "$ST_TCH_ERR" ] && echo true || echo false)" "$(_st_tch_busy && echo true || echo false)" "$ST_TCH_REPO"
+}
+
 _st_cat_bg() {
+	_st_tch_bg
+	_st_owncat_bg
 	[ -f "$ST_CAT_OFF" ] && return 0
 	[ -d "$ST_RUN/cat.lock" ] && [ -z "$(find "$ST_RUN/cat.lock" -maxdepth 0 -mmin +5 2>/dev/null)" ] && return 0
 	if grep -q '|Свои списки каталога$' "$ST_CAT_SVC" 2>/dev/null; then ( _st_cat_refresh force >/dev/null 2>&1 & ); return 0; fi
@@ -6417,9 +6706,243 @@ _st_cat_json() {
 	[ -f "$ST_DIR/catalog.err" ] && err=true
 	[ -f "$ST_CAT_OFF" ] && off=true
 	src="$(_st_cat_src)"
-	printf '{"url":"%s","custom":%s,"version":"%s","sets":%s,"services":%s,"error":%s,"off":%s,"busy":%s}' \
+	printf '{"url":"%s","custom":%s,"version":"%s","sets":%s,"services":%s,"error":%s,"off":%s,"busy":%s,"tachyon":%s,"own":%s,"own_max":%s}' \
 		"$(esc "$src")" "$([ -s "$ST_CAT_URL" ] && echo true || echo false)" "$(esc "$ver")" "${sets:-0}" "${svcs:-0}" "$err" "$off" \
-		"$([ -d "$ST_RUN/cat.lock" ] && echo true || echo false)"
+		"$([ -d "$ST_RUN/cat.lock" ] && echo true || echo false)" "$(_st_tch_json)" "$(_st_own_json)" "$ST_OWN_MAX"
+}
+
+_st_own_used() {
+	local id="$1" u w=""
+	case "$id" in
+		zmc[0-9]*)
+			grep -qs "^${id}_" "$ST_DIR/services" "$ST_SEC_DIR"/*/services && w="Steer"
+			for u in $(awk -F'|' -v k="${id}_" 'index($1, k) == 1 { print $3 }' "$ST_OWN_CIDX" 2>/dev/null); do
+				grep -qsF "$u" /etc/config/netshift && { w="${w:+$w, }Forkozz"; break; }
+			done ;;
+		*)
+			grep -qsx "$id" "$ST_DIR/services" "$ST_SEC_DIR"/*/services && w="Steer"
+			u="$(awk -F'|' -v k="$id" '$1 == k { print $3; exit }' "$ST_OWN_IDX" 2>/dev/null)"
+			[ -n "$u" ] && grep -qsF "$u" /etc/config/netshift && w="${w:+$w, }Forkozz" ;;
+	esac
+	printf '%s' "$w"
+}
+
+_st_own_json() {
+	local id fmt url kind n dom pfx name sep="" w
+	printf '['
+	while IFS='|' read -r id fmt url kind n dom pfx; do
+		[ -n "$id" ] || continue
+		name="$(awk -F'|' -v k="$id" '$1 == k { print $2; exit }' "$ST_OWN_SVC" 2>/dev/null)"
+		w="$(_st_own_used "$id")"
+		printf '%s{"id":"%s","kind":"list","name":"%s","url":"%s","fmt":"%s","dom":%s,"pfx":%s,"used":"%s"}' "$sep" "$id" "$(esc "${name:-$id}")" "$(esc "$url")" "$fmt" "${dom:-0}" "${pfx:-0}" "$(esc "$w")"
+		sep=","
+	done 2>/dev/null < "$ST_OWN_IDX"
+	local sets svcs ver ts
+	while IFS='|' read -r id name url sets svcs ver ts; do
+		[ -n "$id" ] || continue
+		w="$(_st_own_used "$id")"
+		printf '%s{"id":"%s","kind":"catalog","name":"%s","url":"%s","sets":%s,"svcs":%s,"version":"%s","age":%s,"used":"%s"}' "$sep" "$id" "$(esc "$name")" "$(esc "$url")" "${sets:-0}" "${svcs:-0}" "$(esc "$ver")" "$(( $(date +%s) - ${ts:-0} ))" "$(esc "$w")"
+		sep=","
+	done 2>/dev/null < "$ST_OWN_CATS"
+	printf ']'
+}
+
+_st_own_desc() {
+	local d="$1" p="$2" o=""
+	[ "$d" -gt 0 ] && o="$d $(_zm_plural "$d" домен домена доменов)"
+	[ "$p" -gt 0 ] && o="${o:+$o · }$p $(_zm_plural "$p" подсеть подсети подсетей)"
+	[ -n "$o" ] || o="набор правил sing-box (.srs)"
+	printf '%s' "$o"
+}
+
+_st_own_url() {
+	printf '%s' "$1" | sed 's#^https://github\.com/\([^/]*\)/\([^/]*\)/\(blob\|raw\)/#https://raw.githubusercontent.com/\1/\2/#'
+}
+
+_st_own_probe() {
+	local u="$1" f="$ST_RUN/own.probe.$$" d p h
+	mkdir -p "$ST_RUN"
+	rm -f "$f" "$f.n"
+	if ! _st_fetch "$u" "$f" && ! { _st_cdn_url "$u" >/dev/null && _st_fetch "$(_st_cdn_url "$u")" "$f"; }; then
+		rm -f "$f"; echo "ERR:список по этой ссылке не скачался — проверьте ссылку и доступ к сайту"; return 1
+	fi
+	if [ "$(wc -c < "$f")" -gt 16777216 ]; then rm -f "$f"; echo "ERR:файл больше 16 МБ — для роутера это слишком много"; return 1; fi
+	h="$(head -c 3 "$f")"
+	case "${u%%[?#]*}" in
+		*.srs)
+			rm -f "$f"
+			[ "$h" = SRS ] || { echo "ERR:по ссылке не набор правил sing-box (.srs)"; return 1; }
+			echo "srs 0 0"; return 0 ;;
+	esac
+	[ "$h" = SRS ] && { rm -f "$f"; echo "srs 0 0"; return 0; }
+	tr -d '\r' < "$f" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'A-Z' 'a-z' > "$f.n"
+	p="$(grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$' "$f.n" | awk '!s[$0]++' | wc -l | tr -d ' ')"
+	d="$(sed 's/^domain://; s/^full://; s/^suffix://; s/^\*\.//; s/^\.//' "$f.n" |
+		grep -E '^[a-z0-9]([a-z0-9_-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9_-]*[a-z0-9])?)+$' | grep -vE '^[0-9.]+$' | awk '!s[$0]++' | wc -l | tr -d ' ')"
+	if [ "$d" = 0 ] && [ "$p" = 0 ]; then
+		if grep -qiE '<html|<!doctype' "$f"; then echo "ERR:по ссылке открылась веб-страница, а не список — нужна прямая ссылка на файл (на GitHub — кнопка «Raw»)"
+		elif grep -qE '^[[:space:]]*[{[]' "$f"; then
+			if grep -q '"domain_lists"\|"categories"' "$f" && cp -f "$f" "$ST_RUN/own.cat.new" && _st_owncat_build "$ST_RUN/own.cat.new" zmc0 x; then
+				rm -f "$f" "$f.n" "$ST_RUN"/owncat.*
+				echo "cat 0 0"; return 0
+			fi
+			rm -f "$ST_RUN/own.cat.new" "$ST_RUN"/owncat.*
+			echo "ERR:это файл JSON, но не каталог списков — нужен каталог в формате splify2-lists (lists.json) или текстовый список: один домен или подсеть на строке"
+		elif grep -qE '^(0\.0\.0\.0|127\.0\.0\.1)[[:space:]]+[a-z0-9]' "$f.n"; then echo "ERR:это файл hosts — нужен список, где на строке только домен или подсеть"
+		elif grep -qE '^\|\|' "$f.n"; then echo "ERR:это фильтр блокировщика рекламы — нужен список, где на строке только домен или подсеть"
+		else echo "ERR:в файле не нашлось ни доменов, ни подсетей IPv4 — на строке должен быть один домен или подсеть"; fi
+		rm -f "$f" "$f.n"; return 1
+	fi
+	rm -f "$f" "$f.n"
+	[ $((d + p)) -gt 150000 ] && { echo "ERR:в списке $((d + p)) записей — больше 150 тыс. роутеру не по силам"; return 1; }
+	echo "lst $d $p"
+}
+
+_st_own_taken() {
+	awk -F'|' -v nm="$1" -v k="$2" '
+		function lc(x,    i) { x = tolower(x); for (i = 1; i <= 33; i++) gsub(U[i], L[i], x); return x }
+		BEGIN { n = split("А Б В Г Д Е Ё Ж З И Й К Л М Н О П Р С Т У Ф Х Ц Ч Ш Щ Ъ Ы Ь Э Ю Я", U, " "); split("а б в г д е ё ж з и й к л м н о п р с т у ф х ц ч ш щ ъ ы ь э ю я", L, " "); nm = lc(nm) }
+		$1 != k && lc($2) == nm { f = 1 } END { exit !f }' $(for f in "$ST_OWN_SVC" "$ST_OWN_CATS"; do [ -f "$f" ] && echo "$f"; done) /dev/null 2>/dev/null
+}
+
+_st_own_dname() {
+	local n
+	n="$(printf '%s' "$1" | sed -n 's#^https://raw\.githubusercontent\.com/\([^/]*\)/\([^/]*\)/.*#\1/\2#p; s#^https://github\.com/\([^/]*\)/\([^/]*\)/.*#\1/\2#p' | head -n1)"
+	[ -n "$n" ] && [ "$2" = cat ] && { printf '%s' "$n"; return; }
+	n="${1%%[?#]*}"; n="${n##*/}"; n="${n%.*}"
+	printf '%s' "${n:-Мой список}"
+}
+
+_st_owncat_put() {
+	local id="$1" name="$2" url="$3" svcs sets ver
+	_st_owncat_build "$ST_RUN/own.cat.new" "$id" "$name" || return 1
+	svcs="$(grep -c . "$ST_RUN/owncat.svc")"; sets="$(grep -c . "$ST_RUN/owncat.idx")"
+	ver="$(sed -n 's/^version=//p' "$ST_RUN/owncat.meta" | tr -d '|')"
+	mkdir -p "$ST_DIR"
+	{ grep -v "^${id}_" "$ST_OWN_CSVC" 2>/dev/null; cat "$ST_RUN/owncat.svc"; } > "$ST_OWN_CSVC.t" && mv -f "$ST_OWN_CSVC.t" "$ST_OWN_CSVC"
+	{ grep -v "^${id}_" "$ST_OWN_CIDX" 2>/dev/null; cat "$ST_RUN/owncat.idx"; } > "$ST_OWN_CIDX.t" && mv -f "$ST_OWN_CIDX.t" "$ST_OWN_CIDX"
+	{ grep -v "^$id|" "$ST_OWN_CATS" 2>/dev/null; printf '%s|%s|%s|%s|%s|%s|%s\n' "$id" "$name" "$url" "$sets" "$svcs" "$ver" "$(date +%s)"; } > "$ST_OWN_CATS.t" && mv -f "$ST_OWN_CATS.t" "$ST_OWN_CATS"
+	rm -f "$ST_RUN"/owncat.* "$ST_RUN/own.cat.new"
+	_st_tch_idx_merge
+	OWNCAT_SVCS="$svcs"
+	return 0
+}
+
+_st_owncat_refresh() {
+	local id name url rest r rc=0
+	[ -s "$ST_OWN_CATS" ] || return 0
+	while IFS='|' read -r id name url rest; do
+		[ -n "$id" ] || continue
+		[ -n "$1" ] && [ "$1" != "$id" ] && continue
+		r="$ST_RUN/own.cat.new"
+		if _st_fetch "$url" "$r" || { _st_cdn_url "$url" >/dev/null && _st_fetch "$(_st_cdn_url "$url")" "$r"; }; then
+			_st_owncat_put "$id" "$name" "$url" || { rm -f "$r"; rc=1; }
+		else rm -f "$r"; rc=1; fi
+	done < "$ST_OWN_CATS"
+	return $rc
+}
+
+_st_owncat_bg() {
+	[ -s "$ST_OWN_CATS" ] || return 0
+	[ -d "$ST_RUN/owncat.lock" ] && [ -z "$(find "$ST_RUN/owncat.lock" -maxdepth 0 -mmin +5 2>/dev/null)" ] && return 0
+	[ "$(_st_age "$ST_OWN_CATS")" -lt 86400 ] && return 0
+	mkdir -p "$ST_RUN"; rmdir "$ST_RUN/owncat.lock" 2>/dev/null; mkdir "$ST_RUN/owncat.lock" 2>/dev/null || return 0
+	( _st_owncat_refresh; touch "$ST_OWN_CATS"; rmdir "$ST_RUN/owncat.lock" ) >/dev/null 2>&1 &
+}
+
+_st_own_add() {
+	local in="$1" u name r fmt d p n id kind x
+	u="$(printf '%s' "$in" | jsonfilter -e '@.url' 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+	name="$(printf '%s' "$in" | jsonfilter -e '@.name' 2>/dev/null | tr -d '\000-\037|"\\' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+	case "$u" in https://?*) ;; http://*) echo '{"error":"нужна ссылка https:// — по http список могут подменить по дороге"}'; return 1 ;; *) echo '{"error":"нужна ссылка вида https://…/список.txt"}'; return 1 ;; esac
+	case "$u" in *[[:space:]\"\'\\\`\$\;\|\<\>]*) echo '{"error":"недопустимые символы в ссылке"}'; return 1 ;; esac
+	[ "${#u}" -le 500 ] || { echo '{"error":"слишком длинная ссылка"}'; return 1; }
+	u="$(_st_own_url "$u")"
+	[ "${#name}" -le 120 ] || { echo '{"error":"слишком длинное название"}'; return 1; }
+	case "${u%%[?#]*}" in *.json) [ -n "$name" ] || name="$(_st_own_dname "$u" cat)" ;; *) [ -n "$name" ] || name="$(_st_own_dname "$u")" ;; esac
+	x="$(awk -F'|' -v u="$u" '$3 == u { print $1; exit }' "$ST_OWN_IDX" 2>/dev/null)"
+	[ -n "$x" ] && { printf '{"error":"этот список уже добавлен — «%s»"}\n' "$(esc "$(awk -F'|' -v k="$x" '$1 == k { print $2; exit }' "$ST_OWN_SVC")")"; return 1; }
+	x="$(awk -F'|' -v u="$u" '$3 == u { print $2; exit }' "$ST_OWN_CATS" 2>/dev/null)"
+	[ -n "$x" ] && { printf '{"error":"этот каталог уже добавлен — «%s»"}\n' "$(esc "$x")"; return 1; }
+	_st_own_taken "$name" "" && { echo '{"error":"список с таким названием уже есть — назовите его иначе"}'; return 1; }
+	r="$(_zm_run 17 _st_own_probe "$u")"
+	case $? in
+		0) ;;
+		137|143) rm -f "$ST_RUN"/own.probe.*; echo '{"error":"список не успел скачаться за 17 секунд — проверьте ссылку или попробуйте позже"}'; return 1 ;;
+		*) r="$(printf '%s\n' "$r" | sed -n 's/^ERR://p' | head -n1)"; printf '{"error":"%s"}\n' "$(esc "${r:-список не скачался}")"; return 1 ;;
+	esac
+	set -- $(printf '%s\n' "$r" | tail -n1); fmt="$1"; d="${2:-0}"; p="${3:-0}"
+	[ "$fmt" = cat ] || [ "$(grep -c . "$ST_OWN_IDX" 2>/dev/null || echo 0)" -lt "$ST_OWN_MAX" ] || { echo "{\"error\":\"своих списков уже $ST_OWN_MAX — удалите ненужный\"}"; return 1; }
+	if [ "$fmt" = cat ]; then
+		[ "$(grep -c . "$ST_OWN_CATS" 2>/dev/null || echo 0)" -lt "$ST_OWN_CMAX" ] || { rm -f "$ST_RUN/own.cat.new"; echo "{\"error\":\"своих каталогов уже $ST_OWN_CMAX — удалите ненужный\"}"; return 1; }
+		name="$(printf '%s' "$name" | tr -d '()')"
+		n="$(awk -F'|' '{ sub(/^zmc/, "", $1); if ($1 + 0 > m) m = $1 + 0 } END { print m + 1 }' "$ST_OWN_CATS" 2>/dev/null)"
+		id="zmc${n:-1}"
+		_st_owncat_put "$id" "$name" "$u" || { rm -f "$ST_RUN/own.cat.new"; echo '{"error":"в каталоге не нашлось ни одного списка"}'; return 1; }
+		printf '{"ok":true,"id":"%s","kind":"catalog","name":"%s","svcs":%s}\n' "$id" "$(esc "$name")" "${OWNCAT_SVCS:-0}"
+		return 0
+	fi
+	case "$fmt" in lst|srs) ;; *) echo '{"error":"список не скачался"}'; return 1 ;; esac
+	n="$(awk -F'|' '{ sub(/^zmu_/, "", $1); if ($1 + 0 > m) m = $1 + 0 } END { print m + 1 }' "$ST_OWN_IDX" 2>/dev/null)"
+	id="zmu_${n:-1}"
+	kind=d; [ "$d" = 0 ] && kind=s
+	[ "$fmt" = srs ] && kind=s
+	mkdir -p "$ST_DIR"
+	printf '%s|%s|%s|%s|%s|%s|%s\n' "$id" "$fmt" "$u" "$kind" "$((d + p))" "$d" "$p" >> "$ST_OWN_IDX"
+	printf '%s|%s||||||%s|%s|%s\n' "$id" "$name" "$id" "$ST_OWN_GRP" "$(_st_own_desc "$d" "$p")" >> "$ST_OWN_SVC"
+	rm -f "$ST_DIR/lists/$id".*
+	_st_tch_idx_merge
+	printf '{"ok":true,"id":"%s","name":"%s","dom":%s,"pfx":%s,"fmt":"%s"}\n' "$id" "$(esc "$name")" "$d" "$p" "$fmt"
+}
+
+_st_own_del() {
+	local id="$1" w
+	case "$id" in
+		zmc[0-9]*)
+			grep -q "^$id|" "$ST_OWN_CATS" 2>/dev/null || { echo '{"error":"нет такого каталога — обновите страницу"}'; return 1; }
+			w="$(_st_own_used "$id")"
+			[ -n "$w" ] && { printf '{"error":"списки этого каталога включены в %s — снимите с них отметки, сохраните и удалите снова"}\n' "$w"; return 1; }
+			grep -v "^$id|" "$ST_OWN_CATS" > "$ST_OWN_CATS.t"; mv -f "$ST_OWN_CATS.t" "$ST_OWN_CATS"
+			grep -v "^${id}_" "$ST_OWN_CSVC" > "$ST_OWN_CSVC.t" 2>/dev/null; mv -f "$ST_OWN_CSVC.t" "$ST_OWN_CSVC"
+			grep -v "^${id}_" "$ST_OWN_CIDX" > "$ST_OWN_CIDX.t" 2>/dev/null; mv -f "$ST_OWN_CIDX.t" "$ST_OWN_CIDX"
+			[ -s "$ST_OWN_CATS" ] || rm -f "$ST_OWN_CATS" "$ST_OWN_CSVC" "$ST_OWN_CIDX"
+			rm -f "$ST_DIR/lists/${id}_"* "$ST_RUN/dom/${id}_"*
+			grep -v "^${id}_" "$ST_DOMCNT" > "$ST_DOMCNT.t" 2>/dev/null && mv -f "$ST_DOMCNT.t" "$ST_DOMCNT"
+			_st_tch_idx_merge
+			printf '{"ok":true}\n'; return 0 ;;
+		zmu_[0-9]*) ;;
+		*) echo '{"error":"нет такого списка"}'; return 1 ;;
+	esac
+	grep -q "^$id|" "$ST_OWN_IDX" 2>/dev/null || { echo '{"error":"нет такого списка — обновите страницу"}'; return 1; }
+	w="$(_st_own_used "$id")"
+	[ -n "$w" ] && { printf '{"error":"список включён в %s — снимите с него отметку, сохраните и удалите снова"}\n' "$w"; return 1; }
+	grep -v "^$id|" "$ST_OWN_IDX" > "$ST_OWN_IDX.t" ; mv -f "$ST_OWN_IDX.t" "$ST_OWN_IDX"
+	grep -v "^$id|" "$ST_OWN_SVC" > "$ST_OWN_SVC.t" 2>/dev/null; mv -f "$ST_OWN_SVC.t" "$ST_OWN_SVC"
+	[ -s "$ST_OWN_IDX" ] || rm -f "$ST_OWN_IDX" "$ST_OWN_SVC"
+	rm -f "$ST_DIR/lists/$id".* "$ST_RUN/dom/$id".*
+	grep -v "^$id " "$ST_DOMCNT" > "$ST_DOMCNT.t" 2>/dev/null && mv -f "$ST_DOMCNT.t" "$ST_DOMCNT"
+	_st_tch_idx_merge
+	printf '{"ok":true}\n'
+}
+
+_st_own_ren() {
+	local id name
+	id="$(printf '%s' "$1" | jsonfilter -e '@.id' 2>/dev/null)"
+	name="$(printf '%s' "$1" | jsonfilter -e '@.name' 2>/dev/null | tr -d '\000-\037|"\\' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+	case "$id" in zmu_[0-9]*|zmc[0-9]*) ;; *) echo '{"error":"нет такого списка"}'; return 1 ;; esac
+	case "$id" in zmc*) name="$(printf '%s' "$name" | tr -d '()')"; grep -q "^$id|" "$ST_OWN_CATS" 2>/dev/null ;; *) grep -q "^$id|" "$ST_OWN_SVC" 2>/dev/null ;; esac || { echo '{"error":"нет такого списка — обновите страницу"}'; return 1; }
+	[ -n "$name" ] || { echo '{"error":"название не может быть пустым"}'; return 1; }
+	[ "${#name}" -le 120 ] || { echo '{"error":"слишком длинное название"}'; return 1; }
+	_st_own_taken "$name" "$id" && { echo '{"error":"список с таким названием уже есть"}'; return 1; }
+	case "$id" in
+		zmc*)
+			local old
+			old="$(awk -F'|' -v k="$id" '$1 == k { print $2; exit }' "$ST_OWN_CATS")"
+			awk -F'|' -v OFS='|' -v nm="$name" -v k="$id" '$1 == k { $2 = nm } { print }' "$ST_OWN_CATS" > "$ST_OWN_CATS.t" && mv -f "$ST_OWN_CATS.t" "$ST_OWN_CATS"
+			awk -F'|' -v OFS='|' -v nm="$name" -v o="$old (" -v k="${id}_" 'index($1, k) == 1 && index($9, o) == 1 { $9 = nm " (" substr($9, length(o) + 1) } { print }' "$ST_OWN_CSVC" > "$ST_OWN_CSVC.t" && mv -f "$ST_OWN_CSVC.t" "$ST_OWN_CSVC" ;;
+		*) awk -F'|' -v OFS='|' -v nm="$name" -v k="$id" '$1 == k { $2 = nm } { print }' "$ST_OWN_SVC" > "$ST_OWN_SVC.t" && mv -f "$ST_OWN_SVC.t" "$ST_OWN_SVC" ;;
+	esac
+	printf '{"ok":true}\n'
 }
 
 ST_LISTS_TAG="# zm-stlists"
@@ -6438,7 +6961,8 @@ _st_lists_used() {
 		ids="$ids $(_st_sec_with "$s" _st_sel | tr '\n' ' ')"
 	done
 	[ -n "$(echo $ids)" ] || return 0
-	_rb_svc_src | awk -F'|' -v ids=" $(echo $ids) " 'index(ids, " " $1 " ") && !seen[$1]++ { print $8 }' |
+	{ _rb_svc_src | awk -F'|' -v ids=" $(echo $ids) " 'index(ids, " " $1 " ") && !seen[$1]++ { print $8 }'
+	  [ -f "$ST_TCH_OFF" ] || awk -F'|' -v ids=" $(echo $ids) " 'index(ids, " " $1 " ") { print $2 }' "$ST_TCH_PLUS" 2>/dev/null; } |
 		tr ',' '\n' | grep -E '^[A-Za-z0-9_-]+$' | awk '!s[$0]++'
 }
 
@@ -6552,6 +7076,7 @@ ST_SUB_GRP="$ST_DIR/sub.group"
 ST_SUB_GRPS="$ST_DIR/sub.autogrp"
 ST_SUB_EXCL="$ST_DIR/sub.exclude"
 ST_SUB_HIDE="$ST_DIR/sub.hidden"
+ST_SUB_NOAUTO="$ST_DIR/sub.noauto"; ST_SUB_NOAUTO_MK="$ST_DIR/sub.noauto.mk"
 ST_EXIT="$ST_DIR/exit"
 
 _st_exit() {
@@ -6580,7 +7105,7 @@ _st_vpn_probe() {
 	if dev="$(_st_vpn_dev)"; then
 		trace="$(_st_vpn_trace "$dev")"
 		ip="$(echo "$trace" | sed -n 's/^ip=//p')"; loc="$(echo "$trace" | sed -n 's/^loc=//p')"
-		[ -n "$ip" ] && r=ok
+		{ [ -n "$ip" ] || [ "$trace" = alive=1 ] || [ "${trace#probe=}" != "$trace" ]; } && r=ok
 		if [ "$r" = ok ] && stl_running && stl_state vpn >/dev/null 2>&1 && [ -n "$STL_KIND" ] && [ "$STL_UP" != true ]; then
 			r=stuck; ST_VPN_STUCK=1
 		fi
@@ -6653,13 +7178,43 @@ _st_vpn_dev() {
 	for d in $STL_VPN_DEVS; do [ -d "/sys/class/net/$d" ] && { echo "$d"; return 0; }; done
 	return 1
 }
+_stl_redir_dev() {
+	case "$1" in zm_vpn|zm_vpn[2-9]|zmv_*|zmv[2-9]_*) ;; *) return 1 ;; esac
+	[ -n "$STL_VER_C" ] || STL_VER_C="$(stl_version)"
+	_stl_ver_ok "$STL_VER_C" && ! _st_ver_lt "$STL_VER_C" 2.1.0
+}
+
+_st_vpn_node_probe() {
+	local o="$1" p m j idx ok ms
+	p="$(sed -n "s/.*\"$o\":{\([^}]*\)}.*/\1/p" "$STL_SPEC" 2>/dev/null | head -n 1 | sed -n 's/.*"protocol":"\([a-z0-9]*\)".*/\1/p')"
+	[ -n "$p" ] || return 1
+	m="$(_stl_mod_of "$p")"
+	_stl_mod_x "$m" || return 1
+	j="$(_stl_t 10 steer status 2>/dev/null)"
+	idx="$(printf '%s' "$j" | jsonfilter -e "@.outputs.$o.$m.active[0].index" 2>/dev/null)"
+	case "$idx" in ''|*[!0-9]*) idx=-1 ;; esac
+	j="$(_stl_t 60 steer "$m-probe" "$o" --node "$idx" --timeout 8 2>/dev/null | tr '\n' ' ')"
+	ok="$(printf '%s' "$j" | jsonfilter -e '@.working' 2>/dev/null)"
+	case "$ok" in ''|-*|*[!0-9]*) return 1 ;; esac
+	ms=0
+	if [ "$idx" != -1 ]; then
+		ms="$(printf '%s' "$j" | jsonfilter -e '@.results[0].ttfb_ms' 2>/dev/null)"
+		case "$ms" in ''|*[!0-9]*|0) ms="$(printf '%s' "$j" | jsonfilter -e '@.results[0].handshake_ms' 2>/dev/null)" ;; esac
+		case "$ms" in ''|*[!0-9]*) ms=0 ;; esac
+	fi
+	echo "probe=$ms"
+}
+
 _st_vpn_trace() {
 	local u t
+	if _stl_redir_dev "$1"; then _st_vpn_node_probe "$1"; return; fi
 	[ -w "/proc/sys/net/ipv4/conf/$1/rp_filter" ] && echo 2 > "/proc/sys/net/ipv4/conf/$1/rp_filter" 2>/dev/null
 	for u in https://1.1.1.1/cdn-cgi/trace https://www.cloudflare.com/cdn-cgi/trace; do
 		t="$(curl -4 -s --interface "$1" --connect-timeout 5 --max-time 10 "$u" 2>/dev/null)"
 		case "$t" in *ip=*) printf '%s\n' "$t"; return 0 ;; esac
 	done
+	t="$(curl -4 -s -o /dev/null -w '%{http_code}' --interface "$1" --connect-timeout 12 --max-time 18 http://cp.cloudflare.com/generate_204 2>/dev/null)"
+	case "$t" in 204|200) echo alive=1; return 0 ;; esac
 	return 1
 }
 
@@ -6680,6 +7235,15 @@ _st_vpn_check() {
 				echo "[ OK ] VPN: трафик идёт через узел${STL_NODE:+ «$STL_NODE»} (выход $ip${loc:+, $loc})"
 				return 0
 			fi
+			if [ "$tr" = alive=1 ]; then
+				echo "[ OK ] VPN: трафик идёт через узел${STL_NODE:+ «$STL_NODE»} — туннель медленный, адрес выхода не узнали"
+				return 0
+			fi
+			case "$tr" in probe=*)
+				tr="${tr#probe=}"
+				echo "[ OK ] VPN: туннель поднят, узел${STL_NODE:+ «$STL_NODE»} отвечает$([ "${tr:-0}" -gt 0 ] && echo " (задержка $tr мс)")"
+				return 0 ;;
+			esac
 			w=$((w + 1)); [ "$w" -lt 3 ] && { sleep 5; stl_state vpn >/dev/null 2>&1; }
 		done
 	fi
@@ -6690,6 +7254,8 @@ _st_vpn_check() {
 		echo "[FAIL] VPN: выбранного узла больше нет в подписке — выберите «Авто» или другой узел"
 	elif [ "$STL_PSTATE" = failed ] || [ "$STL_UP" != true ]; then
 		echo "[FAIL] VPN: ни один выбранный узел не ответил за $max с — проверьте задержку узлов на вкладке «Подписка»"
+	elif _stl_redir_dev "$STL_DEV"; then
+		echo "[FAIL] VPN: туннель поднят${STL_NODE:+ (узел «$STL_NODE»)}, но узел не ответил на проверку — запрос через него не прошёл"
 	else
 		echo "[FAIL] VPN: туннель поднят${STL_NODE:+ (узел «$STL_NODE»)}, но трафик через него не идёт"
 	fi
@@ -6858,14 +7424,14 @@ steer_action() {
 			w="${mode#?}"; w="${w%%\~*}"; mode="${mode#?$w?}"
 			_st_sec_ok "$w" || { echo '{"error":"нет такой секции — обновите страницу"}'; return 1; }
 			case "$action" in
-				lists|devs_set|list_set|list_get|list_reset|svc_find|svc_dom|sub_status|sub_probe|sub_tcp|lat_mode|node_pol|sub_home|sub_links_get|sub_set|sub_links|sub_update|sub_remove|sub_node|sub_group|sub_filter|sub_hide|sub_pick|sub_ping) ;;
+				lists|devs_set|list_set|list_get|list_reset|svc_find|svc_dom|sub_status|sub_probe|sub_tcp|lat_mode|node_pol|sub_home|sub_links_get|sub_set|sub_links|sub_update|sub_remove|sub_node|sub_group|sub_filter|sub_hide|sub_noauto|sub_pick|sub_ping|sub_insecure) ;;
 				*) echo '{"error":"это действие общее для всех секций"}'; return 1 ;;
 			esac
 			( _st_bind "$w"; steer_action "$action" "$mode" ); return $? ;;
 	esac
 	case "$action" in diag|wfix_tick|explain|lists_bg|lists_cron) ;; *) rm -f "$ST_VPN_PROBE" ;; esac
 	case "$action" in
-		install|apply|start|stop|remove|warp_restart|warp_endpoint|warp_recreate|lists|engine|warp_setup|warp_fix|warp_fixkeys|warp_own|warp_mode|warp_iface|ext_pick|warp_pick|warp_remove|onfail|dnsmode|realip|cttl|lan_set)
+		install|apply|start|stop|remove|warp_restart|warp_endpoint|warp_recreate|lists|engine|warp_setup|warp_fix|warp_fixkeys|warp_own|warp_mode|warp_iface|ext_pick|warp_pick|warp_remove|onfail|dnsmode|realip|cttl|torrent|quic|lan_set)
 			_st_running && { echo '{"error":"дождитесь окончания текущей операции"}'; return 1; }
 			case "$action" in warp_iface|ext_pick|warp_restart|warp_mode|warp_own) _job_alive awg && { echo '{"error":"на вкладке AmneziaWG идёт операция — дождитесь её окончания"}'; return 1; } ;; esac
 			[ "$action" = remove ] || [ -z "$(_st_blocker)" ] || { echo '{"error":"ядро steer сейчас настраивает не Zapret Manager — панель его не трогает"}'; return 1; }
@@ -6910,11 +7476,15 @@ steer_action() {
 					_st_warp_ext || { echo '{"error":"Steer сейчас работает не через интерфейс AmneziaWG"}'; return 1; }
 					[ "$(uci -q get "network.$(_awg_peer_sec "$(_st_ext_if)").public_key")" = "$AWG_WARP_PEER" ] || { echo '{"error":"подбор точки входа есть только для туннелей WARP"}'; return 1; }
 					job_start steer do_steer_ext_pick ;;
-				dnsmode|realip|cttl)
+				dnsmode|realip|cttl|torrent|quic)
 					if [ "$action" = dnsmode ]; then
 						case "$mode" in tun|router) ;; *) echo '{"error":"неизвестный режим"}'; return 1 ;; esac
 					elif [ "$action" = cttl ]; then
 						case "$mode" in 0|300|900|3600) ;; *) echo '{"error":"неизвестный срок"}'; return 1 ;; esac
+					elif [ "$action" = torrent ]; then
+						case "$mode" in allow|direct|block) ;; *) echo '{"error":"неизвестный режим"}'; return 1 ;; esac
+					elif [ "$action" = quic ]; then
+						case "$mode" in allow|block) ;; *) echo '{"error":"неизвестный режим"}'; return 1 ;; esac
 					else
 						case "$mode" in on|off) ;; *) echo '{"error":"неизвестный режим"}'; return 1 ;; esac
 					fi
@@ -7011,7 +7581,7 @@ steer_action() {
 			printf '{"links":"%s"}\n' "$(esc_ml "$(grep -iE "$STL_LINK_RE" "$ST_SUB")")"
 			;;
 		sub_ping_tick) steer_ping_tick; _st_secs_ping_tick; printf '{"ok":true}\n' ;;
-		sub_set|sub_links|sub_update|sub_remove|sub_exit|sub_node|sub_group|sub_filter|sub_hide|sub_pick|sub_ping|iface_forget)
+		sub_set|sub_links|sub_update|sub_remove|sub_exit|sub_node|sub_group|sub_filter|sub_hide|sub_noauto|sub_pick|sub_ping|sub_insecure|iface_forget)
 			_st_running && { echo '{"error":"дождитесь окончания текущей операции"}'; return 1; }
 			[ -z "$(_st_blocker)" ] || { echo '{"error":"ядро steer сейчас настраивает не Zapret Manager — панель его не трогает"}'; return 1; }
 			steer_sub_action "$action" "$mode"
@@ -7033,6 +7603,52 @@ steer_action() {
 			rm -f "$ST_DIR/catalog.err"
 			( _st_cat_refresh force >/dev/null 2>&1 & )
 			printf '{"ok":true}\n'
+			;;
+		tachyon)
+			mkdir -p "$ST_DIR"
+			case "$mode" in
+				off) touch "$ST_TCH_OFF"; _st_tch_idx_merge; printf '{"ok":true}\n' ;;
+				state) _st_tch_json; echo ;;
+				on|refresh)
+					[ "$mode" = refresh ] && ! _st_tch_on && { echo '{"error":"Tachyon Lists выключен"}'; return 1; }
+					rm -f "$ST_TCH_OFF" "$ST_TCH_ERR"
+					_st_tch_idx_merge
+					mkdir -p "$ST_RUN"; : > "$ST_RUN/tch.pending"
+					if [ "$mode" = on ] && [ -s "$ST_TCH_SVC" ]; then ( _st_tch_refresh; rm -f "$ST_RUN/tch.pending" ) >/dev/null 2>&1 &
+					else ( _st_tch_refresh force; rm -f "$ST_RUN/tch.pending" ) >/dev/null 2>&1 &
+					fi
+					printf '{"ok":true,"started":true}\n' ;;
+				*) echo '{"error":"неизвестное действие"}'; return 1 ;;
+			esac
+			;;
+		own_add|own_del|own_ren|own_refresh)
+			_st_running && { echo '{"error":"дождитесь окончания текущей операции"}'; return 1; }
+			mkdir -p "$ST_DIR" "$ST_RUN"
+			case "$action" in
+				own_add) _st_own_add "$mode" ;;
+				own_del) _st_own_del "$mode" ;;
+				own_ren) _st_own_ren "$mode" ;;
+				own_refresh)
+					case "$mode" in zmc[0-9]*) grep -q "^$mode|" "$ST_OWN_CATS" 2>/dev/null ;; *) false ;; esac || { echo '{"error":"нет такого каталога — обновите страницу"}'; return 1; }
+					_zm_run 17 _st_owncat_refresh "$mode" >/dev/null 2>&1
+					case $? in
+						0) printf '{"ok":true,%s}\n' "$(awk -F'|' -v k="$mode" '$1 == k { printf "\"svcs\":%d,\"version\":\"%s\"", $5, $6; exit }' "$ST_OWN_CATS")" ;;
+						137|143) rm -f "$ST_RUN/own.cat.new" "$ST_RUN"/owncat.*; echo '{"error":"каталог не успел скачаться за 17 секунд — прежний оставлен, попробуйте позже"}'; return 1 ;;
+						*) echo '{"error":"каталог не скачался или в нём нет списков — прежний оставлен"}'; return 1 ;;
+					esac ;;
+			esac
+			;;
+		xsets)
+			_st_running && { echo '{"error":"дождитесь окончания текущей операции"}'; return 1; }
+			mkdir -p "$ST_USER_DIR"
+			printf '%s\n' $(printf '%s' "$mode" | tr ',' ' ') | grep -E '^t_[a-z0-9_]+$' | while IFS= read -r x; do
+				grep -q "^$x|" "$ST_TCH_DIRECT" 2>/dev/null && echo "$x"
+			done | awk '!s[$0]++' > "$ST_TCH_XSETS.t"
+			if cmp -s "$ST_TCH_XSETS.t" "$ST_TCH_XSETS" 2>/dev/null || { [ ! -s "$ST_TCH_XSETS.t" ] && [ ! -s "$ST_TCH_XSETS" ]; }; then rm -f "$ST_TCH_XSETS.t"; printf '{"ok":true,"saved":true}\n'; return 0; fi
+			mv -f "$ST_TCH_XSETS.t" "$ST_TCH_XSETS"
+			[ -s "$ST_TCH_XSETS" ] || rm -f "$ST_TCH_XSETS"
+			if _st_installed && [ ! -f "$ST_OFF" ] && [ "$(_st_exit)" != none ] && { _st_work || _st_owns "steer-spec"; }; then job_start steer do_steer_excl
+			else printf '{"ok":true,"saved":true}\n'; fi
 			;;
 		catalog_src)
 			_st_running && { echo '{"error":"дождитесь окончания текущей операции"}'; return 1; }
@@ -7425,7 +8041,7 @@ _st_out_tun_devs() {
 
 ST_LAN_EXTRA="$ST_DIR/lan.extra"
 ST_LAN_MAX=8
-_st_lan_extra() { [ -s "$ST_LAN_EXTRA" ] || return 0; tr -s ' \t\r' '\n\n\n' < "$ST_LAN_EXTRA" 2>/dev/null | grep -E '^([A-Za-z0-9._-]{1,15}|ppp\+)$' | awk '!x[$0]++'; }
+_st_lan_extra() { [ -s "$ST_LAN_EXTRA" ] || return 0; tr -s ' \t\r' '\n\n\n' 2>/dev/null < "$ST_LAN_EXTRA" | grep -E '^([A-Za-z0-9._-]{1,15}|ppp\+)$' | awk '!x[$0]++'; }
 _st_lan_fw_drop() {
 	local r ch=0
 	for r in $(sed -n 's/^fw \(zmlan_[A-Za-z0-9_]*\)$/\1/p' "$ST_OWNED" 2>/dev/null); do
@@ -7877,8 +8493,7 @@ _fk_service0() {
 		_fk_dlc_note
 		_fk_lists_report
 		_fk_lists_errors
-		_fk_sb_settle 60
-		_fk_rs_check; b=$?
+		if _fk_sb_settle 60; then b=1; else _fk_rs_check; b=$?; fi
 		if [ "$b" = 0 ]; then
 			_fk_say "Перезапускаем Forkozz с новой настройкой"
 			_fk_log_mark
@@ -7888,8 +8503,7 @@ _fk_service0() {
 			_fk_svc_report
 			rm -f "$JOBS_DIR/forkop-svc.out"
 			_fk_ready || _fk_wait_up 90
-			_fk_sb_settle 90
-			_fk_rs_check; b=$?
+			if _fk_sb_settle 90; then b=1; else _fk_rs_check; b=$?; fi
 			if [ "$b" = 1 ] && _fk_up; then
 				echo "   ✓ sing-box запустился — наборы правил скачались через VPN"
 				_fk_lists_wait 240 || _rb_warn "Списки ещё скачиваются — они догрузятся сами"
@@ -8030,6 +8644,10 @@ _ab_applied() {
 
 AB_TG_LIST="$AB_DIR/tg.domains"
 AB_TG_URL="${GH_RAW}/Flowseal/tg-ws-proxy/refs/heads/main/.github/cfproxy-domains.txt"
+AB_TCH_DOM="android_ads_block telemetry_mobile_block win_spy xiaomi_smarttv_ads gambling_block"
+AB_TCH_IP="et_spamhaus_block hagezi_tif_ip_block botnet_attackers_ip_block"
+AB_IP_NFT="zm_adblock_ip"
+AB_IP_DIR="$AB_DIR/ip"
 AB_DNS_STAMP="$AB_DIR/dns.hosts"
 _ab_dns_bg() { ( sleep "${1:-20}"; _ab_dns_sync ) >/dev/null 2>&1 </dev/null & }
 
@@ -8096,7 +8714,11 @@ OW_NAMES="$ZM_STATE_DIR/ow.names"
 _zm_dname() { [ -n "$1" ] && [ -s "$OW_NAMES" ] && awk -F'\t' -v m="$(printf '%s' "$1" | tr 'A-F' 'a-f')" 'tolower($1) == m && $2 != "" { print $2; f = 1; exit } END { exit !f }' "$OW_NAMES"; }
 OW_V6_BAK="$ZM_STATE_DIR/ipv6.off"
 OW_RB_TAG="# zm-sched-reboot"
-OW_V6_KEYS="network.wan6.disabled network.wan.ipv6 dhcp.lan.ra dhcp.lan.dhcpv6 dhcp.lan.ndp"
+PC_FILE="$ZM_STATE_DIR/parental"
+PC_NFT="zm_parental"
+PC_TAG="# zm-parental"
+PC_MAX=32
+OW_V6_KEYS="network.wan6.disabled network.wan.ipv6 dhcp.lan.ra dhcp.lan.dhcpv6 dhcp.lan.ndp dhcp.lan.ra_default network.lan.ip6assign"
 
 OW_WCONF="${ZM_OW_WCONF:-/etc/config/wireless}"
 OW_WGUARD="$ZM_STATE_DIR/wifi.guard"
@@ -8177,7 +8799,10 @@ case "$cmd" in
 	zm_cleanup)                                    zm_cleanup "$1" ;;
 	zm_autoclean)                                  zm_autoclean "$1" ;;
 	gh_proxy)                                      gh_proxy "$1" "$2" ;;
+	webui)                                         webui "$1" "$2" ;;
 	gh_mirrors)                                    gh_mirrors ;;
+	gh_net)                                        gh_net "$1" "$2" ;;
+	gh_get)                                        gh_get "$1" "$2" "$3" ;;
 	zm_refs_heal)                                  zm_refs_heal "$1" ;;
 	sysinfo_run)                                   sysinfo_run ;;
 	sysinfo_get)                                   sysinfo_get ;;
@@ -8284,6 +8909,7 @@ case "$cmd" in
 	steer_action)                         steer_action "$1" "$2" ;;
 	bytetube_action)                      bytetube_action "$1" ;;
 	bytetube_sync)                        bytetube_sync ;;
+	pc_tick)                              _pc_sync ;;
 	forkop_status)                        forkop_status ;;
 	forkop_config_get)                    forkop_config_get ;;
 	forkop_config_set)                    forkop_config_set "$1" ;;
@@ -8371,6 +8997,7 @@ _zm_pkg_fmt() {
 		/(write error|[Ww]rite error): [Bb]roken pipe|^[^ ]*: [Bb]roken pipe$/ { next }
 		/linuxfw: clear ip6?tables: exec: "ip6?tables": executable file not found/ { next }
 		/router: enumerating tailscale0 addresses for cleanup failed/ { next }
+		/^steer: / && /apk database|Resource temporarily unavailable/ { if (!stlk++) print "     · плагины ядра steer поставим сразу после пакета"; next }
 		/[Ee]rror|ERROR|Collected errors|^ \* |[Uu]nknown package|not found|No such|unable|cannot|failed|Failed|unsatisfiable|breaks:/ { l = $0; sub(/^[ *]+/, "", l); if (l != "" && !seen[l]++) print "     ! " l; next }
 	'
 }
@@ -9064,7 +9691,7 @@ _tg_tls_live() {
 	local p c
 	p="$(pidof "$(_tg_bin_of "$1")" 2>/dev/null | awk '{ print $1 }')"
 	[ -n "$p" ] || return 1
-	c=" $(tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null) "
+	c=" $(tr '\000' ' ' 2>/dev/null < "/proc/$p/cmdline") "
 	if [ -n "$2" ]; then
 		case "$c" in *"-domain $2 "*|*"-domain=$2 "*) return 0 ;; esac
 		return 1
@@ -9438,7 +10065,8 @@ tg_action() {
 		*:ext=*) tg_ext_set "$variant" "${action#ext=}"; return ;;
 		*:chk=*) tg_ext_check "$variant" "${action#chk=}"; return ;;
 		*:site=*) tg_site_check "${action#site=}"; return ;;
-		rust:install|rust:update|rust:reinstall|rust:remove)
+		mtproto:restart|socks5:restart|rust:restart) _tg_restart_one "$variant"; return ;;
+		rust:install|rust:update|rust:reinstall|rust:reinstall_clean|rust:remove)
 			_tg_rs_uci && { echo '{"error":"TG WS Proxy (Rust) установлен пакетом luci-app-tg-ws-proxy-rs — обновляйте и удаляйте его через менеджер пакетов, настройки — в Службы → Telegram WS Proxy (Rust)"}'; return 1; } ;;
 	esac
 	case "$variant:$action" in
@@ -9446,9 +10074,12 @@ tg_action() {
 	esac
 	case "$variant:$action" in
 		mtproto:install|mtproto:update) job_start tg_install_mtproto do_tg_install_mtproto ;;
-		mtproto:reinstall)              job_start tg_install_mtproto _zm_reinstall do_tg_remove_mtproto do_tg_install_mtproto ;;
-		socks5:reinstall)               job_start tg_install_socks5 _zm_reinstall do_tg_remove_socks5 do_tg_install_socks5 ;;
-		rust:reinstall)                 job_start tg_install_rust _zm_reinstall do_tg_remove_rust do_tg_install_rust ;;
+		mtproto:reinstall)              job_start tg_install_mtproto _tg_reinstall_keep mtproto do_tg_remove_mtproto do_tg_install_mtproto ;;
+		socks5:reinstall)               job_start tg_install_socks5 _tg_reinstall_keep socks5 do_tg_remove_socks5 do_tg_install_socks5 ;;
+		rust:reinstall)                 job_start tg_install_rust _tg_reinstall_keep rust do_tg_remove_rust do_tg_install_rust ;;
+		mtproto:reinstall_clean)        job_start tg_install_mtproto _zm_reinstall do_tg_remove_mtproto do_tg_install_mtproto ;;
+		socks5:reinstall_clean)         job_start tg_install_socks5 _zm_reinstall do_tg_remove_socks5 do_tg_install_socks5 ;;
+		rust:reinstall_clean)           job_start tg_install_rust _zm_reinstall do_tg_remove_rust do_tg_install_rust ;;
 		mtproto:remove)                 job_start tg_remove_mtproto do_tg_remove_mtproto ;;
 		socks5:install|socks5:update)   job_start tg_install_socks5 do_tg_install_socks5 ;;
 		socks5:remove)                  job_start tg_remove_socks5 do_tg_remove_socks5 ;;
@@ -9456,6 +10087,53 @@ tg_action() {
 		rust:remove)                    job_start tg_remove_rust do_tg_remove_rust ;;
 		*) echo '{"error":"неизвестный вариант/действие"}' ;;
 	esac
+}
+
+_tg_keep_files() {
+	case "$1" in
+		mtproto) echo "$TG_CONF_MT $TG_SECRET_MT_FILE" ;;
+		socks5) echo "$TG_INIT_GO" ;;
+		rust) echo "$TG_INIT_RS $TG_SECRET_RS_FILE" ;;
+	esac
+}
+_tg_key_files() { case "$1" in mtproto) echo "$TG_SECRET_MT_FILE" ;; rust) echo "$TG_SECRET_RS_FILE" ;; esac; }
+
+_tg_reinstall_keep() {
+	local v="$1" k="$JOBS_DIR/tg_keep.$1" f b n=0 rc=0 fw host hmode init
+	rm -rf "$k"; mkdir -p "$k" || return 1
+	for f in $(_tg_keep_files "$v"); do
+		[ -f "$f" ] || continue
+		cp -p "$f" "$k/$(printf '%s' "$f" | tr '/' '_')" && n=$((n + 1))
+	done
+	fw="$(_tg_fw_port "$v")"; host="$(_tg_ext_get "$v" host)"; hmode="$(_tg_ext_get "$v" hmode)"
+	[ "$n" -gt 0 ] && echo "==> Запоминаем порт, ключ и параметры — после переустановки они вернутся"
+	_zm_reinstall "$2" "$3" || rc=1
+	for f in $(if [ "$rc" = 0 ]; then _tg_keep_files "$v"; else _tg_key_files "$v"; fi); do
+		b="$k/$(printf '%s' "$f" | tr '/' '_')"
+		[ -f "$b" ] || continue
+		mkdir -p "$(dirname "$f")" && cp -p "$b" "$f"
+	done
+	if [ "$rc" = 0 ]; then
+		[ -n "$host" ] && _tg_ext_put "$v" host "$host"
+		[ -n "$hmode" ] && _tg_ext_put "$v" hmode "$hmode"
+		[ -n "$fw" ] && _tg_fw_set "$v" "$(_tg_port_of "$v")" && echo "   ✓ Порт прокси снова открыт для интернета"
+		init="$(_tg_auto_init "$v")"
+		[ -x "$init" ] && "$init" restart >/dev/null 2>&1
+		[ "$n" -gt 0 ] && echo "   ✓ Порт, ключ и параметры прежние — ссылку для Telegram менять не нужно"
+	elif [ -n "$(_tg_key_files "$v")" ]; then
+		echo "   · Ключ сохранён — при следующей установке он вернётся"
+	fi
+	rm -rf "$k"
+	return "$rc"
+}
+
+_tg_restart_one() {
+	local init i=0
+	init="$(_tg_auto_init "$1")"
+	[ -x "$init" ] || { echo '{"error":"Прокси не установлен"}'; return 1; }
+	"$init" restart >/dev/null 2>&1
+	while [ "$i" -lt 5 ] && ! _tg_auto_alive "$1"; do i=$((i + 1)); sleep 1; done
+	tg_status
 }
 
 tg_restart_all() {
@@ -9484,7 +10162,7 @@ do_tgws_install() {
 	tmp="$JOBS_DIR/tgws_install.$RAZ"
 	echo "==> Роутер: $arch, формат пакетов: $PKG"
 	echo "==> Скачиваем $file"
-	local attempt=1 max_attempts=5
+	local attempt=1 max_attempts=3
 	while [ "$attempt" -le "$max_attempts" ]; do
 		rm -f "$tmp"
 		_zm_fetch "$TGWS_BASE_URL/$file" "$tmp" 180 || echo "!! Попытка $attempt из $max_attempts: не скачалось — $ZM_FETCH_ERR"
@@ -9852,8 +10530,8 @@ zm_refs_heal() {
 
 _zm_bin_put() {
 	local need have old=0 min keep=""
-	need=$(( ($(wc -c < "$1" 2>/dev/null || echo 0) + 1023) / 1024 ))
-	[ -f "$2" ] && old=$(( ($(wc -c < "$2" 2>/dev/null || echo 0) + 1023) / 1024 ))
+	need=$(( ($(wc -c 2>/dev/null < "$1" || echo 0) + 1023) / 1024 ))
+	[ -f "$2" ] && old=$(( ($(wc -c 2>/dev/null < "$2" || echo 0) + 1023) / 1024 ))
 	have="$(_zm_df_kb "${2%/*}")"
 	min=$((need + 128))
 	_zm_fs_packs && min=$((need / 3 + 64))
@@ -10053,23 +10731,123 @@ _zm_ac_cron() {
 	return 0
 }
 
-gh_proxy() {
-	local mo f=0 sep=""
+_zmw_saved() {
+	local p
+	p="$(sed -n 's/^port=\([0-9][0-9]*\)$/\1/p' "$ZMW_STATE" 2>/dev/null | head -n 1)"
+	[ -n "$p" ] && [ "$p" -ge 1 ] 2>/dev/null && [ "$p" -le 65535 ] && echo "$p"
+}
+_zmw_save() {
+	mkdir -p "$ZM_STATE_DIR"
+	printf 'on=%s\nport=%s\n' "$1" "$2" > "$ZMW_STATE.$$" && mv -f "$ZMW_STATE.$$" "$ZMW_STATE"
+}
+_zmw_used() {
+	local h
+	h="$(printf '%04X' "$1")"
+	uci -q show uhttpd 2>/dev/null | grep -v '^uhttpd\.zmweb\.' | grep -E "\.listen_https?=" | tr ' ' '\n' | sed "s/'//g" | grep -q ":$1\$" && { echo "его уже слушает веб-сервер LuCI"; return 0; }
+	cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v h=":$h" '$4 == "0A" && substr($2, length($2) - 4) == h { f = 1 } END { exit !f }' && { echo "его уже занимает другая программа на роутере"; return 0; }
+	return 1
+}
+webui() {
+	local cur want np e l a sv ch=1
+	cur="$(_zmw_port)"
 	case "$1" in
 		get|'') ;;
+		set)
+			[ -f /etc/config/uhttpd ] || { echo '{"error":"на роутере нет веб-сервера uhttpd"}'; return 1; }
+			want="${2%%|*}"; np=""
+			case "$2" in *"|"*) np="${2#*|}" ;; esac
+			case "$want" in on|off) ;; *) echo '{"error":"неизвестное действие"}'; return 1 ;; esac
+			case "$np" in '') ;; *[!0-9]*) echo '{"error":"порт — это число от 1 до 65535"}'; return 1 ;; esac
+			[ -n "$np" ] && np="$(echo "$np" | sed 's/^0*//')" && { [ -n "$np" ] && [ "${#np}" -le 5 ] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ] || { echo '{"error":"порт — это число от 1 до 65535"}'; return 1; }; }
+			if [ -n "$np" ] && [ "$np" != "$cur" ] && e="$(_zmw_used "$np")"; then
+				printf '{"error":"Порт %s не подходит: %s. Выберите другой, например 7788 или 8088"}\n' "$np" "$(esc "$e")"
+				return 1
+			fi
+			if [ "$want" = off ]; then
+				sv="${np:-${cur:-$(_zmw_saved)}}"
+				if uci -q get uhttpd.zmweb >/dev/null; then
+					uci -q delete uhttpd.zmweb
+					uci -q commit uhttpd
+				else ch=""; fi
+				_zmw_save 0 "${sv:-7788}"
+				if [ -f /www/zm-webui.html ]; then mv -f /www/zm-webui.html "$ZM_STATE_DIR/webui.html" 2>/dev/null; fi
+			else
+				[ -n "$np" ] || np="${cur:-$(_zmw_saved)}"
+				[ -n "$np" ] || np=7788
+				if [ "$np" != "$cur" ] && e="$(_zmw_used "$np")"; then
+					printf '{"error":"Порт %s не подходит: %s. Выберите другой, например 7788 или 8088"}\n' "$np" "$(esc "$e")"
+					return 1
+				fi
+				[ -e /usr/lib/uhttpd_ubus.so ] || { echo '{"error":"нет модуля uhttpd-mod-ubus — без него Web UI не откроется. Переустановите панель командой zmw"}'; return 1; }
+				if [ ! -f /www/zm-webui.html ]; then
+					[ -s "$ZM_STATE_DIR/webui.html" ] && [ -f /www/zm/app.js ] || { echo '{"error":"файлов Web UI нет на роутере — переустановите панель командой zmw"}'; return 1; }
+					cp -f "$ZM_STATE_DIR/webui.html" /www/zm-webui.html && chmod 0644 /www/zm-webui.html || { echo '{"error":"не удалось вернуть файлы Web UI в /www"}'; return 1; }
+				fi
+				rm -f "$ZM_STATE_DIR/webui.html"
+				if [ "$np" = "$cur" ]; then ch=""
+				elif [ -n "$cur" ]; then
+					l="$(uci -q get uhttpd.zmweb.listen_http)"
+					uci -q delete uhttpd.zmweb.listen_http
+					for a in $l; do uci add_list uhttpd.zmweb.listen_http="${a%:*}:$np"; done
+				else
+					uci -q delete uhttpd.zmweb
+					uci set uhttpd.zmweb=uhttpd
+					uci add_list uhttpd.zmweb.listen_http="0.0.0.0:$np"
+					uci add_list uhttpd.zmweb.listen_http="[::]:$np"
+					uci set uhttpd.zmweb.home='/www'
+					uci set uhttpd.zmweb.index_page='zm-webui.html'
+					uci set uhttpd.zmweb.ubus_prefix='/ubus'
+					uci set uhttpd.zmweb.no_dirlists='1'
+					uci set uhttpd.zmweb.rfc1918_filter='1'
+					uci set uhttpd.zmweb.max_requests='12'
+					uci set uhttpd.zmweb.max_connections='100'
+					uci set uhttpd.zmweb.script_timeout='120'
+					uci set uhttpd.zmweb.network_timeout='30'
+					uci set uhttpd.zmweb.http_keepalive='20'
+					uci set uhttpd.zmweb.tcp_keepalive='1'
+				fi
+				[ -n "$ch" ] && uci commit uhttpd
+				_zmw_save 1 "$np"
+			fi
+			[ -n "$ch" ] && ( ( sleep 1; /etc/init.d/uhttpd reload ) </dev/null >/dev/null 2>&1 & )
+			cur="$(_zmw_port)" ;;
+		*) echo '{"error":"неизвестное действие"}'; return 1 ;;
+	esac
+	sv="$(_zmw_saved)"
+	printf '{"ok":true,"avail":%s,"on":%s,"port":%s,"saved":%s,"ubus":%s}\n' \
+		"$([ -f /etc/config/uhttpd ] && echo true || echo false)" "$([ -n "$cur" ] && echo true || echo false)" \
+		"${cur:-0}" "${sv:-${cur:-7788}}" "$([ -e /usr/lib/uhttpd_ubus.so ] && echo true || echo false)"
+}
+
+gh_proxy() {
+	local mo f=0 sep="" h s t
+	case "$1" in
+		get|'') ;;
+		check) for h in $ZM_GHP_HOSTS; do _zm_ghp_st "$h" force >/dev/null; done ;;
 		set)
 			mo="${2%%|*}"
 			case "$mo" in off|auto) ;; *) echo '{"error":"неизвестный режим"}'; return 1 ;; esac
 			mkdir -p "$ZM_STATE_DIR"
 			if [ "$mo" = auto ]; then echo 'mode=auto' > "$ZM_GHP_FILE"; else rm -f "$ZM_GHP_FILE"; fi
-			rm -f "$ZM_GHP_FAIL"
+			rm -f "$ZM_GHP_FAIL" "$ZM_GHP_GOOD"
+			for h in $ZM_GHP_HOSTS; do rm -f "$ZM_GHP_NET.$h"; done
 			ZM_GHP_MODE="" ;;
 		*) echo '{"error":"неизвестное действие"}'; return 1 ;;
 	esac
 	_zm_ghp_load
 	[ -s "$ZM_GHP_FAIL" ] && read -r f < "$ZM_GHP_FAIL"
 	case "$f" in ''|*[!0-9]*) f=0 ;; esac
-	printf '{"ok":true,"mode":"%s","list":"%s","fail_at":%s,"now":%s,"log":[' "$ZM_GHP_MODE" "$ZM_GHP_LIST" "$f" "$(date +%s)"
+	printf '{"ok":true,"mode":"%s","list":"%s","fail_at":%s,"now":%s,"net":[' "$ZM_GHP_MODE" "$(_zm_ghp_order | sed 's/^ //')" "$f" "$(date +%s)"
+	for h in $ZM_GHP_HOSTS; do
+		s=""; t=0
+		[ -f "$ZM_GHP_NET.$h" ] && read -r s t < "$ZM_GHP_NET.$h"
+		case "$s" in up|down) ;; *) s="" ;; esac
+		case "$t" in ''|*[!0-9]*) t=0 ;; esac
+		printf '%s{"h":"%s","s":"%s","t":%s}' "$sep" "$h" "$s" "$t"; sep=","
+	done
+	sep=""
+	printf '],"log":['
+
 	[ -s "$ZM_GHP_LOG" ] && tail -n 15 "$ZM_GHP_LOG" | while IFS='|' read -r t m; do
 		case "$t" in ''|*[!0-9]*) continue ;; esac
 		printf '%s{"t":%s,"m":"%s"}' "$sep" "$t" "$(esc "$m")"; sep=","
@@ -10125,9 +10903,9 @@ _pg_trace_upstream() {
 		tailscale) echo "cron:zm-tailscale $ZM_STATE_DIR/latest.tsc pkg:luci-i18n-tailscale-community-ru pkg:luci-app-tailscale-community /etc/init.d/tailscale-settings /etc/rc.d/*tailscale-settings /www/luci-static/resources/view/tailscale.js /usr/share/luci/menu.d/luci-app-tailscale-community.json /usr/share/rpcd/acl.d/luci-app-tailscale-community.json /usr/share/rpcd/ucode/tailscale.uc pkg:tailscale /usr/sbin/tailscale /usr/sbin/tailscaled /etc/init.d/tailscale /etc/rc.d/*tailscale /etc/config/tailscale /etc/config/tailscale-opkg /etc/config/tailscale.apk-new /etc/tailscale /var/lib/tailscale $TSC_NFT $TSC_HOOK $TSC_SYSCTL $TSC_DIR $TSC_UPLOG uci:network.$TSC_NET uci:firewall.$TSC_FW_RULE" ;;
 		terminal) echo "pkg:luci-i18n-ttyd-ru pkg:luci-app-ttyd pkg:ttyd /usr/bin/ttyd /etc/config/ttyd /etc/config/ttyd-opkg /etc/config/ttyd.apk-new /etc/init.d/ttyd /etc/rc.d/*ttyd $(_zm_luci_files ttyd)" ;;
 		htop) echo "pkg:htop /usr/bin/htop /etc/htoprc /root/.config/htop $MON_TTYD_OWN" ;;
-		adblock) echo "$AB_DIR $AB_STATS_DIR $AB_STATS_LOG dnsconf:zm-adblock.conf dnsconf:zm-adblock-stats.conf nft:zm_adblock_free /var/run/zm-adblock-free.pid /var/etc/zm-adblock-free.conf /var/etc/zm-adblock-free.conf.macs cron:zm-adblock cron:zm-abstats" ;;
+		adblock) echo "$AB_DIR $AB_STATS_DIR $AB_STATS_LOG dnsconf:zm-adblock.conf dnsconf:zm-adblock-stats.conf nft:zm_adblock_free nft:zm_adblock_ip /var/run/zm-adblock-free.pid /var/etc/zm-adblock-free.conf /var/etc/zm-adblock-free.conf.macs cron:zm-adblock cron:zm-abstats" ;;
 		hosts) echo "$HOSTS_FILE.zm-bak $HOSTS_FILE.bak" ;;
-		panel) echo "/opt/zapret-manager-luci /www/zm /www/zm-webui.html /usr/libexec/rpcd/zapret-manager /usr/share/rpcd/acl.d/luci-app-zapret-manager.json /usr/share/luci/menu.d/luci-app-zapret-manager.json /www/luci-static/resources/view/zapret-manager /www/luci-static/resources/zapret-manager /www/luci-static/resources/bytetube /www/luci-static/resources/view/bytetube /usr/share/zm-redbtn /usr/bin/zmw /usr/bin/zms /lib/upgrade/keep.d/zapret-manager uci:uhttpd.zmweb cronrx:/opt/zapret-manager-luci/backend.sh" ;;
+		panel) echo "/opt/zapret-manager-luci /www/zm /www/zm-webui.html /usr/libexec/rpcd/zapret-manager /usr/share/rpcd/acl.d/luci-app-zapret-manager.json /usr/share/luci/menu.d/luci-app-zapret-manager.json /www/luci-static/resources/view/zapret-manager /www/luci-static/resources/zapret-manager /www/luci-static/resources/bytetube /www/luci-static/resources/view/bytetube /usr/share/zm-redbtn /usr/bin/zmw /usr/bin/zms /lib/upgrade/keep.d/zapret-manager uci:uhttpd.zmweb nft:zm_parental cronrx:/opt/zapret-manager-luci/backend.sh" ;;
 	esac
 }
 
@@ -10224,6 +11002,7 @@ _pg_remove_upstream() {
 				_pg_hosts_lines | _hosts_drop_lines
 				echo "   ✓ Строки блоков панели убраны из hosts, свои записи остались"
 			fi
+			rm -f "$ZM_STATE_DIR/hosts.on" "$ZM_STATE_DIR/hosts.base.gz"
 			;;
 	esac
 }
@@ -10514,6 +11293,7 @@ _bk_auto_why_upstream() {
 		do_doh_install) echo "перед установкой DNS over HTTPS" ;; do_doh_remove) echo "перед удалением DNS over HTTPS" ;;
 		do_purge) echo "перед полным удалением" ;; do_zm_update) echo "перед обновлением панели" ;;
 		_zm_reinstall) _bk_auto_why "$3" | sed 's/перед установкой/перед переустановкой/' ;;
+		_tg_reinstall_keep) _bk_auto_why "$4" | sed 's/перед установкой/перед переустановкой/' ;;
 	esac
 }
 
@@ -11570,6 +12350,7 @@ zm_watch() {
  _zm_oom_watch
  _job_running backup && return 0
  /usr/bin/ucode /usr/libexec/manager-watch.uc tick >/dev/null 2>&1
+ [ -s "$PC_FILE" ] && _pc_sync >/dev/null 2>&1
  _tg_watch
  _ab_watch
  return 0
@@ -11788,6 +12569,20 @@ _ow_wchans() {
 
 _ow_wup() { ubus -t 5 call network.wireless status 2>/dev/null | jsonfilter -e "@.$1.up" 2>/dev/null; }
 
+_ow_wsae() { [ -x /usr/sbin/hostapd ] && /usr/sbin/hostapd -vsae >/dev/null 2>&1; }
+
+_ow_wpmf() {
+	local i="$1" e="$2" w
+	w="$(uci -q get "wireless.$i.ieee80211w")"
+	[ -n "$w" ] || return 0
+	case "$e" in
+		sae) [ "$w" = 2 ] && return 0 ;;
+		sae-mixed) [ "$w" = 1 ] && return 0 ;;
+		*) [ "$w" = 2 ] || return 0 ;;
+	esac
+	uci -q delete "wireless.$i.ieee80211w"
+}
+
 _ow_wfail() { ubus -t 5 call network.wireless status 2>/dev/null | jsonfilter -e "@.$1.retry_setup_failed" 2>/dev/null; }
 
 _ow_txreg() {
@@ -11859,8 +12654,8 @@ _ow_wifi_json() {
 		_ow_int "$1" && rb="$(printf '{"at":%s,"radios":"%s"}' "$1" "$(shift; echo "$*")")"
 	fi
 	[ -s "$OW_WGUARD" ] && kill -0 "$(cat "$OW_WGUARD" 2>/dev/null)" 2>/dev/null && g=true
-	printf '"wifi":{"present":%s,"country":"%s","guard":%s,"rollback":%s,"radios":[' "$([ -n "$(_ow_wdevs)" ] && command -v wifi >/dev/null 2>&1 && echo true || echo false)" \
-		"$(esc "$(uci -q get "wireless.$(_ow_wdevs | head -n1).country")")" "$g" "$rb"
+	printf '"wifi":{"present":%s,"country":"%s","guard":%s,"rollback":%s,"sae":%s,"radios":[' "$([ -n "$(_ow_wdevs)" ] && command -v wifi >/dev/null 2>&1 && echo true || echo false)" \
+		"$(esc "$(uci -q get "wireless.$(_ow_wdevs | head -n1).country")")" "$g" "$rb" "$(_ow_wsae && echo true || echo false)"
 	for r in $(_ow_wdevs); do
 		i="$(_ow_wap "$r")" || i=""
 		band="$(_ow_wband "$r")"
@@ -11911,7 +12706,7 @@ _ow_wifi_json() {
 _ow_jf() { printf '%s' "$1" | jsonfilter -e "$2" 2>/dev/null; }
 
 _ow_wifi_set() {
-	local d="$1" c n k r i ssid key ch txp on enc chans w changed
+	local d="$1" c n k r i ssid key ch txp on enc chans w changed want
 	command -v jsonfilter >/dev/null 2>&1 || { echo '{"error":"на роутере нет jsonfilter"}'; return 1; }
 	[ -n "$(_ow_wdevs)" ] || { echo '{"error":"на роутере нет Wi-Fi"}'; return 1; }
 	c="$(_ow_jf "$d" '@.country')"
@@ -11927,12 +12722,24 @@ _ow_wifi_set() {
 		on="$(_ow_jf "$d" "@.radios[$k].on")"
 		ssid="$(_ow_jf "$d" "@.radios[$k].ssid")"; key="$(_ow_jf "$d" "@.radios[$k].key")"
 		ch="$(_ow_jf "$d" "@.radios[$k].channel")"; txp="$(_ow_jf "$d" "@.radios[$k].txp")"
+		want="$(_ow_jf "$d" "@.radios[$k].enc")"
+		case "$want" in
+			''|psk2|psk-mixed|none) ;;
+			sae|sae-mixed) [ "$on" = true ] && ! _ow_wsae && { printf '{"error":"%s"}\n' "$(esc "WPA3 для $(_ow_rlab "$r") недоступен: wpad на роутере собран без WPA3 — выберите WPA2")"; return 1; } ;;
+			*) echo '{"error":"неизвестный тип защиты — обновите страницу"}'; return 1 ;;
+		esac
 		if [ "$on" = true ]; then
 			w="$(printf '%s' "$ssid" | wc -c | tr -d ' ')"
 			[ "$w" -ge 1 ] && [ "$w" -le 32 ] || { printf '{"error":"%s"}\n' "$(esc "Имя сети $(_ow_rlab "$r") — от 1 до 32 символов")"; return 1; }
 			w="$(printf '%s' "$key" | wc -c | tr -d ' ')"
 			enc="$([ -n "$i" ] && uci -q get "wireless.$i.encryption")"
-			case "$enc" in psk*|sae*) ;; ''|none) [ "$w" = 0 ] && w=skip ;; *) w=skip ;; esac
+			[ -n "$want" ] && enc="$want"
+			case "$enc" in
+				psk*|sae*) ;;
+				''|none) { [ -n "$want" ] || [ "$w" = 0 ]; } && w=skip ;;
+				*) w=skip ;;
+			esac
+			case "$enc" in sae*) [ "$w" = 64 ] && { printf '{"error":"%s"}\n' "$(esc "Пароль $(_ow_rlab "$r"): для WPA3 — от 8 до 63 символов")"; return 1; } ;; esac
 			if [ "$w" = skip ]; then :
 			elif [ "$w" = 64 ]; then
 				case "$key" in *[!0-9A-Fa-f]*) printf '{"error":"%s"}\n' "$(esc "Пароль $(_ow_rlab "$r"): 64 символа можно только шестнадцатеричными цифрами")"; return 1 ;; esac
@@ -11983,9 +12790,18 @@ _ow_wifi_set() {
 		if [ "$on" = true ] && [ -n "$i" ] && [ -n "$ssid" ]; then
 			[ "$(uci -q get "wireless.$i.ssid")" = "$ssid" ] || uci -q set "wireless.$i.ssid=$ssid"
 			enc="$(uci -q get "wireless.$i.encryption")"
+			want="$(_ow_jf "$d" "@.radios[$k].enc")"
+			if [ -n "$want" ]; then
+				if [ "$want" != "$enc" ] && [ "$want" != "${enc%%+*}" ]; then
+					uci -q set "wireless.$i.encryption=$want"
+					_ow_wpmf "$i" "$want"
+					enc="$want"
+				fi
+				[ "$want" = none ] && enc=none
+			fi
 			case "$enc" in
-				''|none) [ -n "$key" ] && { uci -q set "wireless.$i.encryption=psk2"; uci -q set "wireless.$i.key=$key"; } ;;
-				psk*|sae*) [ "$(uci -q get "wireless.$i.key")" = "$key" ] || uci -q set "wireless.$i.key=$key" ;;
+				''|none) [ -z "$want" ] && [ -n "$key" ] && { uci -q set "wireless.$i.encryption=psk2"; uci -q set "wireless.$i.key=$key"; } ;;
+				psk*|sae*) [ -n "$key" ] && [ "$(uci -q get "wireless.$i.key")" != "$key" ] && uci -q set "wireless.$i.key=$key" ;;
 			esac
 		fi
 		k=$((k + 1))
@@ -12060,37 +12876,62 @@ _ow_v6_up() {
 	[ -n "$a" ]
 }
 
-_ow_v6_on() {
+_ow_v6_mode() {
 	local ra dv w6
 	w6=1
 	{ [ -z "$(uci -q get network.wan6)" ] || [ "$(uci -q get network.wan6.disabled)" = 1 ]; } && w6=0
 	ra="$(uci -q get dhcp.lan.ra)"; dv="$(uci -q get dhcp.lan.dhcpv6)"
 	[ "$w6" = 0 ] && [ "$(uci -q get network.wan.proto)" = pppoe ] && [ "$(uci -q get network.wan.ipv6)" != 0 ] && [ -n "$(uci -q get network.wan.ipv6)" ] && w6=1
-	[ "$w6" = 0 ] && { [ -z "$ra" ] || [ "$ra" = disabled ]; } && { [ -z "$dv" ] || [ "$dv" = disabled ]; } && return 1
+	if [ "$w6" = 1 ]; then echo on
+	elif { [ -z "$ra" ] || [ "$ra" = disabled ]; } && { [ -z "$dv" ] || [ "$dv" = disabled ]; }; then echo off
+	else echo lan; fi
+}
+
+_ow_v6_ula() {
+	local h
+	if [ -z "$(uci -q get network.globals.ula_prefix)" ]; then
+		h="$(head -c 5 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')"
+		if [ "${#h}" = 10 ]; then
+			[ -n "$(uci -q get network.globals)" ] || uci -q set network.globals=globals
+			uci -q set network.globals.ula_prefix="fd$(printf '%s' "$h" | cut -c1-2):$(printf '%s' "$h" | cut -c3-6):$(printf '%s' "$h" | cut -c7-10)::/48"
+		fi
+	fi
+	[ -n "$(uci -q get network.lan)" ] && [ -z "$(uci -q get network.lan.ip6assign)" ] && uci -q set network.lan.ip6assign=60
 	return 0
 }
 
 _ow_v6_reload() { _ow_bg sh -c '/etc/init.d/network reload; sleep 2; [ -x /etc/init.d/odhcpd ] && /etc/init.d/odhcpd restart'; }
 
 _ow_v6_set() {
-	local want="$1" k v
-	case "$want" in on|off) ;; *) echo '{"error":"неизвестная команда"}'; return 1 ;; esac
-	if [ "$want" = off ]; then
-		_ow_v6_on || { printf '{"ok":true,"same":true,"on":false}\n'; return 0; }
-		mkdir -p "$ZM_STATE_DIR"
-		: > "$OW_V6_BAK.tmp"
-		for k in $OW_V6_KEYS; do printf '%s=%s\n' "$k" "$(uci -q get "$k")" >> "$OW_V6_BAK.tmp"; done
-		mv -f "$OW_V6_BAK.tmp" "$OW_V6_BAK"
+	local want="$1" cur k v
+	case "$want" in on|lan|off) ;; *) echo '{"error":"неизвестная команда"}'; return 1 ;; esac
+	cur="$(_ow_v6_mode)"
+	[ "$cur" = "$want" ] && { printf '{"ok":true,"same":true,"on":%s,"mode":"%s"}\n' "$([ "$want" = off ] && echo false || echo true)" "$want"; return 0; }
+	if [ "$want" != on ]; then
+		if [ "$cur" = on ]; then
+			mkdir -p "$ZM_STATE_DIR"
+			: > "$OW_V6_BAK.tmp"
+			for k in $OW_V6_KEYS; do printf '%s=%s\n' "$k" "$(uci -q get "$k")" >> "$OW_V6_BAK.tmp"; done
+			mv -f "$OW_V6_BAK.tmp" "$OW_V6_BAK"
+		fi
 		[ -n "$(uci -q get network.wan6)" ] && uci -q set network.wan6.disabled=1
 		[ "$(uci -q get network.wan.proto)" = pppoe ] && uci -q set network.wan.ipv6=0
 		if [ -n "$(uci -q get dhcp.lan)" ]; then
-			uci -q set dhcp.lan.ra=disabled
-			uci -q set dhcp.lan.dhcpv6=disabled
-			uci -q set dhcp.lan.ndp=disabled
+			if [ "$want" = off ]; then
+				uci -q set dhcp.lan.ra=disabled
+				uci -q set dhcp.lan.dhcpv6=disabled
+				uci -q set dhcp.lan.ndp=disabled
+			else
+				uci -q set dhcp.lan.ra=server
+				uci -q set dhcp.lan.dhcpv6=server
+				uci -q delete dhcp.lan.ndp
+				uci -q delete dhcp.lan.ra_default
+				_ow_v6_ula
+			fi
 		fi
-		logger -t zapret-manager "IPv6 выключен в панели"
+		if [ "$want" = off ]; then logger -t zapret-manager "IPv6 выключен в панели"
+		else logger -t zapret-manager "IPv6 в панели: только домашняя сеть, без выхода в интернет"; fi
 	else
-		_ow_v6_on && { printf '{"ok":true,"same":true,"on":true}\n'; return 0; }
 		if [ -s "$OW_V6_BAK" ]; then
 			while IFS='=' read -r k v; do
 				case " $OW_V6_KEYS " in *" $k "*) ;; *) continue ;; esac
@@ -12116,7 +12957,8 @@ _ow_v6_set() {
 	uci -q commit network
 	uci -q commit dhcp
 	_ow_v6_reload
-	printf '{"ok":true,"on":%s}\n' "$([ "$want" = on ] && echo true || echo false)"
+	cur="$(_ow_v6_mode)"
+	printf '{"ok":true,"on":%s,"mode":"%s"}\n' "$([ "$cur" = off ] && echo false || echo true)" "$cur"
 }
 
 _ow_upnp_have() { [ -x /usr/sbin/miniupnpd ] && [ -f /etc/init.d/miniupnpd ]; }
@@ -12339,11 +13181,140 @@ owrt_reboot_run() {
 }
 
 owrt_status() {
-	printf '{%s,%s,"router":{"hostname":"%s","ipv6":{"on":%s,"wan6":%s,"pppoe":%s,"up":%s},%s},%s,%s,"job":%s}\n' \
+	local v6m
+	v6m="$(_ow_v6_mode)"
+	printf '{%s,%s,"router":{"hostname":"%s","ipv6":{"on":%s,"mode":"%s","wan6":%s,"pppoe":%s,"up":%s},%s},%s,%s,"job":%s}\n' \
 		"$(_ow_flow_json)" "$(_ow_wifi_json)" "$(esc "$(uci -q get system.@system[0].hostname)")" \
-		"$(_ow_v6_on && echo true || echo false)" "$([ -n "$(uci -q get network.wan6)" ] && echo true || echo false)" \
+		"$([ "$v6m" = off ] && echo false || echo true)" "$v6m" "$([ -n "$(uci -q get network.wan6)" ] && echo true || echo false)" \
 		"$([ "$(uci -q get network.wan.proto)" = pppoe ] && echo true || echo false)" "$(_ow_v6_up && echo true || echo false)" \
-		"$(_ow_upnp_json)" "$(_ow_devs_json)" "$(_ow_rb_json)" "$(_job_running owrt && echo true || echo false)"
+		"$(_ow_upnp_json)" "$(_ow_devs_json),$(_pc_json)" "$(_ow_rb_json)" "$(_job_running owrt && echo true || echo false)"
+}
+
+_pc_eval() {
+	[ -s "$PC_FILE" ] || return 0
+	awk -F'|' -v hm="$(date +%H%M)" -v dow="$(date +%u)" '
+		function mins(t,    a) { split(t, a, ":"); return a[1] * 60 + a[2] }
+		{
+			n = int(hm / 100) * 60 + hm % 100; y = dow - 1; if (y < 1) y = 7
+			b = 0; why = ""; un = ""
+			if ($3 == 1) { b = 1; why = "pause" }
+			else if ($4 == 1) {
+				f = mins($5); t = mins($6)
+				if (f < t) { if (index($7, dow) && n >= f && n < t) b = 1 }
+				else if (f > t) { if ((index($7, dow) && n >= f) || (index($7, y) && n < t)) b = 1 }
+				else if (index($7, dow)) b = 1
+				if (b) { why = "sched"; un = (f == t) ? "" : $6 }
+			}
+			print $1 "\t" b "\t" why "\t" un
+		}' "$PC_FILE"
+}
+
+_pc_table() {
+	printf '%s\n' "table inet $PC_NFT {" \
+		"	set block { type ether_addr; }" \
+		"	chain pre {" \
+		"		type filter hook prerouting priority -310; policy accept;" \
+		"		ether saddr @block fib daddr type { local, broadcast, multicast } accept" \
+		"		ether saddr @block counter drop" \
+		"	}" \
+		"}" | nft -f - 2>&1
+}
+
+_pc_cut() {
+	local ip
+	command -v conntrack >/dev/null 2>&1 || return 0
+	for ip in $(ip neigh show 2>/dev/null | awk -v m="$1" 'tolower($0) ~ ("lladdr " m) { print $1 }'); do
+		conntrack -D -s "$ip" >/dev/null 2>&1
+		conntrack -D -d "$ip" >/dev/null 2>&1
+	done
+}
+
+_pc_cron() {
+	local want="" t h m
+	if [ -s "$PC_FILE" ]; then
+		for t in $(awk -F'|' '$4 == 1 { print $5; print $6 }' "$PC_FILE" | sort -u); do
+			h="${t%%:*}"; m="${t#*:}"; h="${h#0}"; m="${m#0}"
+			want="$want${m:-0} ${h:-0} * * * /opt/zapret-manager-luci/backend.sh pc_tick >/dev/null 2>&1 $PC_TAG
+"
+		done
+		want="$want*/15 * * * * /opt/zapret-manager-luci/backend.sh pc_tick >/dev/null 2>&1 $PC_TAG
+"
+	fi
+	[ "$(grep -F "$PC_TAG" "$CRON_FILE" 2>/dev/null)" = "$(printf '%s' "$want" | sed '/^$/d')" ] && return 0
+	mkdir -p "$(dirname "$CRON_FILE")"; touch "$CRON_FILE"
+	grep -vF "$PC_TAG" "$CRON_FILE" > "$CRON_FILE.zm" 2>/dev/null
+	printf '%s' "$want" >> "$CRON_FILE.zm"
+	cat "$CRON_FILE.zm" > "$CRON_FILE"; rm -f "$CRON_FILE.zm"
+	[ -x /etc/init.d/cron ] && { /etc/init.d/cron enable >/dev/null 2>&1; /etc/init.d/cron restart >/dev/null 2>&1; }
+	return 0
+}
+
+_pc_sync() {
+	local want cur m
+	if [ ! -s "$PC_FILE" ]; then
+		nft delete table inet "$PC_NFT" >/dev/null 2>&1
+		_pc_cron
+		return 0
+	fi
+	want="$(_pc_eval | awk -F'\t' '$2 == 1 { print $1 }' | sort)"
+	if ! nft list table inet "$PC_NFT" >/dev/null 2>&1; then
+		_pc_table >/dev/null || { logger -t zapret-manager "Родительский контроль: таблица nftables не создалась"; return 1; }
+	fi
+	cur="$(nft list set inet "$PC_NFT" block 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | sort)"
+	if [ "$want" != "$cur" ]; then
+		{ echo "flush set inet $PC_NFT block"; [ -n "$want" ] && echo "add element inet $PC_NFT block { $(echo $want | tr ' ' ',') }"; } | nft -f - >/dev/null 2>&1 || return 1
+		for m in $want; do case " $(echo $cur) " in *" $m "*) ;; *) _pc_cut "$m" ;; esac; done
+	fi
+	_pc_cron
+	return 0
+}
+
+_pc_json() {
+	local live=false cut=false
+	nft list table inet "$PC_NFT" >/dev/null 2>&1 && live=true
+	command -v conntrack >/dev/null 2>&1 && cut=true
+	printf '"parental":{"live":%s,"cut":%s,"now":"%s","max":%s,"list":[' "$live" "$cut" "$(date +%H:%M)" "$PC_MAX"
+	[ -s "$PC_FILE" ] && _pc_eval | awk -F'\t' -v f="$PC_FILE" '
+		function j(s) { gsub(/[\\"]/, "", s); gsub(/[\001-\037]/, " ", s); return s }
+		BEGIN { while ((getline l < f) > 0) { split(l, a, "|"); L[a[1]] = l } }
+		{
+			split(L[$1], a, "|")
+			printf "%s{\"mac\":\"%s\",\"name\":\"%s\",\"pause\":%s,\"sched\":%s,\"from\":\"%s\",\"to\":\"%s\",\"days\":\"%s\",\"blocked\":%s,\"why\":\"%s\",\"until\":\"%s\"}", (n++ ? "," : ""), $1, j(a[2]), (a[3] == 1 ? "true" : "false"), (a[4] == 1 ? "true" : "false"), a[5], a[6], a[7], ($2 == 1 ? "true" : "false"), $3, $4
+		}'
+	printf ']}'
+}
+
+_pc_set() {
+	local d="$1" op mac name pause sched from to days x old
+	command -v jsonfilter >/dev/null 2>&1 || { echo '{"error":"на роутере нет jsonfilter"}'; return 1; }
+	command -v nft >/dev/null 2>&1 || { echo '{"error":"на роутере нет nftables — нужен OpenWrt 22.03 или новее"}'; return 1; }
+	op="$(_ow_jf "$d" '@.op')"; mac="$(_ow_jf "$d" '@.mac' | tr 'A-F-' 'a-f:')"
+	printf '%s' "$mac" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || { echo '{"error":"неверный MAC-адрес"}'; return 1; }
+	old="$(awk -F'|' -v m="$mac" '$1 == m' "$PC_FILE" 2>/dev/null)"
+	case "$op" in
+		del) [ -n "$old" ] || { echo '{"error":"этого устройства нет в списке — обновите страницу"}'; return 1; } ;;
+		pause|resume)
+			[ -n "$old" ] || { echo '{"error":"этого устройства нет в списке — обновите страницу"}'; return 1; }
+			x=0; [ "$op" = pause ] && x=1
+			old="$(printf '%s' "$old" | awk -F'|' -v OFS='|' -v x="$x" '{ $3 = x; print }')" ;;
+		save)
+			name="$(_ow_jf "$d" '@.name' | tr -d '\000-\037|"\\' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+			[ "$(printf '%s' "$name" | wc -c)" -le 96 ] || { echo '{"error":"имя слишком длинное — до 32 букв"}'; return 1; }
+			sched=0; [ "$(_ow_jf "$d" '@.sched')" = true ] && sched=1
+			from="$(_ow_jf "$d" '@.from')"; to="$(_ow_jf "$d" '@.to')"
+			days="$(_ow_jf "$d" '@.days' | tr -cd '1-7' | sed 's/./&\n/g' | sort -u | tr -d '\n')"
+			for x in "$from" "$to"; do printf '%s' "$x" | grep -Eq '^([01][0-9]|2[0-3]):[0-5][0-9]$' || { echo '{"error":"время — часы и минуты, например 22:00"}'; return 1; }; done
+			[ "$sched" = 0 ] || [ -n "$days" ] || { echo '{"error":"выберите хотя бы один день"}'; return 1; }
+			[ -n "$old" ] || [ "$(grep -c . "$PC_FILE" 2>/dev/null || echo 0)" -lt "$PC_MAX" ] || { echo "{\"error\":\"устройств уже $PC_MAX — удалите ненужное\"}"; return 1; }
+			pause="$(printf '%s' "$old" | cut -d'|' -f3)"
+			old="$mac|$name|${pause:-0}|$sched|$from|$to|${days:-1234567}" ;;
+		*) echo '{"error":"неизвестная команда"}'; return 1 ;;
+	esac
+	mkdir -p "$ZM_STATE_DIR"
+	{ awk -F'|' -v m="$mac" '$1 != m' "$PC_FILE" 2>/dev/null; [ "$op" = del ] || printf '%s\n' "$old"; } > "$PC_FILE.zm"
+	if [ -s "$PC_FILE.zm" ]; then mv -f "$PC_FILE.zm" "$PC_FILE"; else rm -f "$PC_FILE.zm" "$PC_FILE"; fi
+	_pc_sync || { printf '{"error":"сохранено, но правило файрвола не применилось — загляните в системный журнал",%s}\n' "$(_pc_json)"; return 1; }
+	printf '{"ok":true,%s}\n' "$(_pc_json)"
 }
 
 owrt_set() {
@@ -12355,6 +13326,7 @@ owrt_set() {
 		upnp)     _ow_upnp_set "$2" ;;
 		pin)      _ow_pin "$2" ;;
 		reboot)   _ow_rb_set "$2" ;;
+		parental) _pc_set "$2" ;;
 		*) echo '{"error":"неизвестная команда"}'; return 1 ;;
 	esac
 }
@@ -12513,12 +13485,12 @@ term_status() {
 	_term_installed && inst=true
 	_term_running && run=true
 	_term_enabled && en=true
-	printf '{"installed":%s,"running":%s,"enabled":%s,"version":"%s","port":%s,"lan_ip":"%s","mode":"%s","iface":"%s","ts":%s,"ts_ip":"%s","wan_closed":%s,"job":%s}\n' \
+	printf '{"installed":%s,"running":%s,"enabled":%s,"version":"%s","port":%s,"lan_ip":"%s","mode":"%s","iface":"%s","ts":%s,"ts_ip":"%s","wan_closed":%s,"job":%s,"zmw":%s}\n' \
 		"$inst" "$run" "$en" "$(esc "$(_term_version)")" "$(_term_port)" "$(esc "$(_zm_lan_ip)")" \
 		"$(_term_mode)" "$(esc "$(_term_iface)")" "$(_tsc_installed && echo true || echo false)" \
 		"$(esc "$(_tsc_running && _zm_tmo 5 tailscale ip -4 2>/dev/null | head -n1)")" \
 		"$(_tsc_wan_closed && echo true || echo false)" \
-		"$(_job_alive term && echo true || echo false)"
+		"$(_job_alive term && echo true || echo false)" "$(_zmw_port || echo 0)"
 }
 
 do_term_install() {
@@ -13451,6 +14423,7 @@ do_tsc_remove() {
 	if [ -x /etc/init.d/tailscale ]; then /etc/init.d/tailscale stop >/dev/null 2>&1; /etc/init.d/tailscale disable >/dev/null 2>&1; fi
 	killall tailscaled >/dev/null 2>&1
 	echo "   ✓ Служба остановлена"
+	_tsc_ip_rules_clean
 	_tsc_unsetup
 	_tsc_say "Удаляем пакет tailscale"
 	_zm_pkg_wipe luci-i18n-tailscale-community-ru luci-app-tailscale-community >/dev/null 2>&1
@@ -13577,6 +14550,18 @@ _tsc_ip_rules_left() {
 	return 1
 }
 
+_tsc_ip_rules_clean() {
+	local f p
+	_tsc_ip_rules_left || return 0
+	for f in -4 -6; do
+		for p in $(ip "$f" rule show 2>/dev/null | grep -E 'lookup 52( |$)|fwmark 0x80000/0xff0000' | sed -n 's/^\([0-9]*\):.*/\1/p'); do
+			ip "$f" rule del pref "$p" 2>/dev/null
+		done
+		ip "$f" route flush table 52 >/dev/null 2>&1
+	done
+	_tsc_ip_rules_left || echo "   ✓ Правила маршрутизации Tailscale убраны"
+}
+
 do_tsc_leftovers_clean() {
 	local f p
 	echo "==> Ищем остатки удалённого доступа (Tailscale)"
@@ -13589,13 +14574,7 @@ do_tsc_leftovers_clean() {
 		echo "   ✓ Forkozz: $TSC_DEV убран из источников трафика"
 	fi
 	rm -f "$TSC_DIR/forkozz.own"
-	for f in -4 -6; do
-		for p in $(ip "$f" rule show 2>/dev/null | grep -E 'lookup 52( |$)|fwmark 0x80000/0xff0000' | sed -n 's/^\([0-9]*\):.*/\1/p'); do
-			ip "$f" rule del pref "$p" 2>/dev/null
-		done
-		ip "$f" route flush table 52 >/dev/null 2>&1
-	done
-	_tsc_ip_rules_left || echo "   ✓ Правила маршрутизации Tailscale убраны"
+	_tsc_ip_rules_clean
 	_tsc_unsetup
 	rm -rf "$TSC_DIR"
 	if [ -n "$(_tsc_leftovers)" ]; then
@@ -15665,7 +16644,7 @@ SI_ZA_EOF
 	case "$r" in
 		applied) r="применена $b — $bo из $bt (было $co)" ;; kept) r="оставлена ${cn:-текущая} — $co из $bt; лучшая $b — $bo" ;;
 		close) r="оставлена ${cn:-текущая} — разница в пределах погрешности" ;; nochange) r="пропущен — «Не изменять стратегию»" ;;
-		yoff) r="пропущен — YouTube выключен" ;; ctrl) r="пропущен — без Zapret открылось $co из $bt" ;;
+		yoff) r="пропущен — YouTube выключен" ;; moff) r="пропущен — основная стратегия выключена" ;; ctrl) r="пропущен — без Zapret открылось $co из $bt" ;;
 		none) r="лучшую определить не удалось" ;; *) r="ошибка теста" ;;
 	esac
 	_si_row "Последний автоподбор" "${at:+$at · }$([ "$k" = yt ] && echo 'YouTube · ')$r" "$(case "$r" in применена*) echo ok ;; ошибка*) echo bad ;; *"без Zapret"*) echo warn ;; esac)"
@@ -15698,7 +16677,7 @@ _si_memory() {
 }
 
 _si_system() {
-	local cpu n la t tz ntp
+	local cpu n c la t tz ntp
 	cpu="$(sed -En 's/^(model name|cpu model|Hardware)[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n1)"
 	n="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)"
 	la="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
@@ -15707,7 +16686,8 @@ _si_system() {
 	ntp="$(uci -q get system.ntp.enabled)"
 	_si_sec "Система"
 	[ -n "$cpu" ] && _si_row "Процессор" "$cpu" ""
-	_si_row "Ядер" "${n:-1}" ""
+	c="$(_zm_ncore "${n:-1}")"
+	if [ "$c" -lt "${n:-1}" ] 2>/dev/null; then _si_row "Ядер" "$c (потоков: $n)" ""; else _si_row "Ядер" "${n:-1}" ""; fi
 	_si_row "Нагрузка (1/5/15 мин)" "${la:-—}" ""
 	[ -n "$t" ] && _si_row "Температура" "$t °C" "$([ "${t%.*}" -ge 85 ] 2>/dev/null && echo bad || { [ "${t%.*}" -ge 70 ] 2>/dev/null && echo warn; })"
 	_si_row "Время на роутере" "$(date '+%d.%m.%Y %H:%M')" ""
@@ -16109,7 +17089,7 @@ do_sysinfo() {
 			_si_row "--ip-id=zero для YouTube" "$(_si_yes "$(jsonfilter -s "$st" -e '@.ipid' 2>/dev/null)")" ""
 			_si_row "Режим эксперта" "$(_si_yes "$(jsonfilter -s "$st" -e '@.expert' 2>/dev/null)")" ""
 			v="$(jsonfilter -s "$st" -e '@.flowseal' 2>/dev/null)"; [ -n "$v" ] && _si_row "Стратегия Flowseal" "$v" ""
-			_si_row "Исключений" "$(grep -c . /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null || echo 0)" ""
+			_si_row "Исключений" "$(n="$(grep -c . /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)"; echo "${n:-0}")" ""
 			_si_autobest
 		else
 			_si_row "Состояние" "не установлен" ""
@@ -16205,6 +17185,7 @@ _ab_put() {
 
 _ab_file() {
 	case "$1" in
+		t_*) case " $AB_TCH_DOM " in *" ${1#t_} "*) echo "${1#t_}.lst" ;; *) return 1 ;; esac ;;
 		light) echo light.txt ;; multi) echo multi.txt ;; pro) echo pro.txt ;;
 		proplus) echo pro.plus.txt ;; ultimate) echo ultimate.txt ;;
 		tif) echo tif.mini.txt ;; doh) echo doh.txt ;; *) return 1 ;;
@@ -16214,13 +17195,23 @@ _ab_file() {
 _ab_title() {
 	case "$1" in
 		light) echo Light ;; multi) echo Multi ;; pro) echo Pro ;; proplus) echo "Pro++" ;;
-		ultimate) echo Ultimate ;; tif) echo "TIF mini (фишинг)" ;; doh) echo "чужих DoH-серверов" ;; *) echo "$1" ;;
+		ultimate) echo Ultimate ;; tif) echo "TIF mini (фишинг)" ;; doh) echo "чужих DoH-серверов" ;;
+		t_android_ads_block) echo "Реклама в играх и приложениях Android" ;;
+		t_telemetry_mobile_block) echo "Телеметрия смартфонов" ;; t_win_spy) echo "Телеметрия Windows" ;;
+		t_xiaomi_smarttv_ads) echo "Реклама Xiaomi и Smart TV" ;; t_gambling_block) echo "Казино и букмекеры" ;;
+		et_spamhaus_block) echo "Ботнеты и угнанные сети (Spamhaus, ET)" ;; hagezi_tif_ip_block) echo "IP вредоносных серверов (HaGeZi TIF)" ;;
+		botnet_attackers_ip_block) echo "Атакующие узлы и сканеры (IPsum, CINS)" ;;
+		*) echo "$1" ;;
 	esac
 }
 
 _ab_min() {
 	case "$1" in
 		light) echo 20000 ;; multi|pro|proplus|ultimate) echo 60000 ;; tif) echo 80000 ;; doh) echo 1000 ;;
+		t_gambling_block) echo 15000 ;; t_android_ads_block) echo 500 ;;
+		t_telemetry_mobile_block) echo 200 ;; t_win_spy) echo 50 ;; t_xiaomi_smarttv_ads) echo 10 ;;
+		et_spamhaus_block) echo 300 ;; hagezi_tif_ip_block) echo 3000 ;; botnet_attackers_ip_block) echo 2000 ;;
+		*) echo 1 ;;
 	esac
 }
 
@@ -16238,11 +17229,16 @@ _ab_num() { echo "${1:-0}" | awk '{ s = $1; o = ""; while (length(s) > 3) { o = 
 
 _ab_dom() { echo "$(_ab_num "$1") $(echo "${1:-0}" | awk '{ n = $1 % 100; m = $1 % 10; print (n >= 11 && n <= 14) ? "доменов" : (m == 1 ? "домен" : (m >= 2 && m <= 4 ? "домена" : "доменов")) }')"; }
 
+_ab_tch() { local x c=",$(_ab_get tch "")," ; for x in $AB_TCH_DOM $AB_TCH_IP; do case "$c" in *",$x,"*) echo "$x" ;; esac; done; }
+_ab_tch_dom() { local x; for x in $(_ab_tch); do case " $AB_TCH_DOM " in *" $x "*) echo "$x" ;; esac; done; }
+_ab_tch_ip() { local x; for x in $(_ab_tch); do case " $AB_TCH_IP " in *" $x "*) echo "$x" ;; esac; done; }
+
 _ab_ids() {
-	local ids
+	local ids x
 	ids="$(_ab_get list pro)"
 	[ "$(_ab_get tif 0)" = 1 ] && ids="$ids tif"
 	[ "$(_ab_get doh 0)" = 1 ] && ids="$ids doh"
+	for x in $(_ab_tch_dom); do ids="$ids t_$x"; done
 	echo "$ids"
 }
 
@@ -16430,16 +17426,23 @@ _ab_allow_text() { if [ -f "$AB_ALLOW" ]; then cat "$AB_ALLOW"; else printf '%s\
 _ab_block_text() { cat "$AB_BLOCK" 2>/dev/null; return 0; }
 
 _ab_dl() {
-	local id="$1" f tmp="$JOBS_DIR/adblock.$1.dl" dom="$JOBS_DIR/adblock.$1.dom" url host n min ver ok=0
+	local id="$1" f tmp="$JOBS_DIR/adblock.$1.dl" dom="$JOBS_DIR/adblock.$1.dom" url host n min ver ok=0 urls
 	f="$(_ab_file "$id")" || return 1
 	min="$(_ab_min "$id")"
 	mkdir -p "$AB_DIR/src"
-	for url in "$AB_URL_GH/$f" "$AB_URL_CDN/$f"; do
+	case "$id" in
+		t_*) urls="$ST_TCH_RAW/release/domains/$f $ST_TCH_CDN/release/domains/$f" ;;
+		*) urls="$AB_URL_GH/$f $AB_URL_CDN/$f" ;;
+	esac
+	for url in $urls; do
 		host="$(printf '%s' "$url" | sed 's#^https://\([^/]*\).*#\1#')"
 		echo "   → Скачиваем $(_ab_title "$id") ($host)"
 		rm -f "$tmp"
 		if _zm_fetch "$url" "$tmp" 240; then
-			awk -F/ '/^(local|address|server)=\/[^\/]+\// { d = tolower($2); if (d ~ /^[a-z0-9_.-]+$/ && index(d, ".")) print d }' "$tmp" > "$dom"
+			case "$id" in
+				t_*) tr -d '\r' < "$tmp" | awk '{ d = tolower($1); sub(/^\*\./, "", d); sub(/^\./, "", d); if (d ~ /^[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?)+$/ && d !~ /^[0-9.]+$/) print d }' > "$dom" ;;
+				*) awk -F/ '/^(local|address|server)=\/[^\/]+\// { d = tolower($2); if (d ~ /^[a-z0-9_.-]+$/ && index(d, ".")) print d }' "$tmp" > "$dom" ;;
+			esac
 			n="$(wc -l < "$dom" | tr -d ' ')"
 			if [ "${n:-0}" -ge "$min" ]; then ok=1; break; fi
 			echo "   ! Получен неполный файл ($(_ab_dom "${n:-0}")) — пробуем другой адрес"
@@ -16465,7 +17468,8 @@ _ab_build() {
 	local out="$1" ids id allow="$JOBS_DIR/adblock.allow" blk="$JOBS_DIR/adblock.block" dedup=0 n need=0 avail rc
 	ids="$(_ab_ids)"
 	rm -f "$out.note"
-	for id in $ids; do _ab_src "$id" >/dev/null || { echo "нет скачанного списка $(_ab_title "$id")" >&2; return 1; }; done
+	for id in $ids; do _ab_src "$id" >/dev/null || case "$id" in t_*) ;; *) echo "нет скачанного списка $(_ab_title "$id")" >&2; return 1 ;; esac; done
+	ids="$(for id in $ids; do case "$id" in t_*) _ab_src "$id" >/dev/null && echo "$id" ;; *) echo "$id" ;; esac; done | tr '\n' ' ')"
 	set -- $ids; [ $# -gt 1 ] && dedup=1
 	if [ "$dedup" = 1 ]; then
 		for id in $ids; do n="$(_ab_get "n_$id" 0)"; case "$n" in ''|*[!0-9]*) n=0 ;; esac; need=$((need + n)); done
@@ -16661,6 +17665,23 @@ _ab_stats_guard() {
 	return 1
 }
 
+_ab_stats_reset() {
+	local lk="$AB_STATS_DIR/.lock" t=0
+	mkdir -p "$AB_STATS_DIR"
+	while ! mkdir "$lk" 2>/dev/null; do
+		[ -n "$(find "$lk" -maxdepth 0 -mmin +2 2>/dev/null)" ] && { rmdir "$lk" 2>/dev/null; continue; }
+		t=$((t + 1)); [ "$t" -gt 10 ] && return 1
+		sleep 1
+	done
+	[ -f "$AB_STATS_LOG" ] && : > "$AB_STATS_LOG"
+	rm -f "$AB_STATS_DIR"/h.* "$AB_STATS_DIR/folded" "$AB_STATS_DIR/jb" "$AB_STATS_DIR/ja" "$AB_STATS_DIR"/chunk.* "$AB_STATS_DIR"/devmap.*
+	rm -f "$AB_STATS_ALL" "$AB_STATS_ALL.zm" "$AB_STATS_ALL.c" "$AB_STATS_ALL.new"
+	_ab_put stats_since "$(date +%s)"
+	if nft list table inet "$AB_IP_NFT" >/dev/null 2>&1; then echo "$(_ab_ip_tbl) $(_ab_ip_hits)" > "$JOBS_DIR/adblock.ip.hits0"; else rm -f "$JOBS_DIR/adblock.ip.hits0"; fi
+	rmdir "$lk" 2>/dev/null
+	return 0
+}
+
 _ab_stats_wipe() {
 	rm -rf "$AB_STATS_DIR"
 	rm -f "$AB_STATS_LOG" "$AB_STATS_ALL" "$AB_STATS_ALL.zm" "$AB_STATS_ALL.c" "$AB_STATS_ALL.new"
@@ -16691,7 +17712,7 @@ _ab_jcap() {
 _ab_jtrim() {
 	local n
 	[ -f "$1" ] || return 0
-	n="$(wc -l < "$1" 2>/dev/null)"
+	n="$(wc -l 2>/dev/null < "$1")"
 	[ "${n:-0}" -gt "$2" ] 2>/dev/null || return 0
 	tail -n "$2" "$1" > "$1.t" 2>/dev/null && mv -f "$1.t" "$1"
 	rm -f "$1.t"
@@ -17102,6 +18123,123 @@ _ab_free_json() {
 	printf ']}\n'
 }
 
+_ab_ip_clean() {
+	awk -F'[./]' '
+		function ip(a, b, c, d) { return ((a * 256 + b) * 256 + c) * 256 + d }
+		function blk(n, l) { return int(n / 2 ^ (32 - l)) }
+		BEGIN {
+			nr = split("0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4", R, " ")
+			for (i = 1; i <= nr; i++) { split(R[i], q, "[./]"); RN[i] = ip(q[1], q[2], q[3], q[4]); RL[i] = q[5] }
+		}
+		{ sub(/\r$/, ""); sub(/[ \t].*$/, "") }
+		{
+			if ($0 !~ /^[0-9][0-9.]*[0-9](\/[0-9]+)?$/) next
+			z = $0; if (gsub(/\./, ".", z) != 3 || gsub(/\//, "/", z) > 1) next
+			for (i = 1; i <= 4; i++) if ($i == "" || length($i) > 3 || $i + 0 > 255) next
+			if (NF == 5 && ($5 == "" || length($5) > 2)) next
+			l = (NF >= 5 ? $5 + 0 : 32); if (l < 8 || l > 32) next
+			n = ip($1, $2, $3, $4); n = blk(n, l) * 2 ^ (32 - l)
+			for (i = 1; i <= nr; i++) { m = (l < RL[i] ? l : RL[i]); if (blk(n, m) == blk(RN[i], m)) next }
+			k = n "/" l; if (k in S) next; S[k] = 1
+			printf "%d.%d.%d.%d/%d\n", int(n / 16777216), int(n / 65536) % 256, int(n / 256) % 256, n % 256, l
+		}'
+}
+
+_ab_ip_dl() {
+	local id="$1" tmp="$JOBS_DIR/adblock.ip.$1.dl" out="$AB_IP_DIR/$1.txt" url n min
+	min="$(_ab_min "$id")"
+	mkdir -p "$AB_IP_DIR"
+	for url in "$ST_TCH_RAW/release/subnets/ipv4/$id.lst" "$ST_TCH_CDN/release/subnets/ipv4/$id.lst"; do
+		echo "   → Скачиваем $(_ab_title "$id") ($(printf '%s' "$url" | sed 's#^https://\([^/]*\).*#\1#'))"
+		rm -f "$tmp"
+		if _zm_fetch "$url" "$tmp" 240; then
+			_ab_ip_clean < "$tmp" > "$out.zm-new"
+			n="$(wc -l < "$out.zm-new" | tr -d ' ')"
+			if [ "${n:-0}" -ge "$min" ]; then
+				mv -f "$out.zm-new" "$out"; rm -f "$tmp"
+				_ab_put "n_ip_$id" "$n" "t_ip_$id" "$(date +%s)"
+				echo "   ✓ $(_ab_title "$id"): $(_ab_num "$n") адресов и сетей"
+				return 0
+			fi
+			echo "   ! Получен неполный файл ($(_ab_num "${n:-0}") записей) — пробуем другой адрес"
+		else
+			echo "   ! Не скачалось: $ZM_FETCH_ERR"
+		fi
+	done
+	rm -f "$tmp" "$out.zm-new"
+	return 1
+}
+
+_ab_ip_keep() {
+	{ ip -4 route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "via") print $(i + 1) }'
+	  cat /tmp/resolv.conf.d/resolv.conf.auto /tmp/resolv.conf.auto 2>/dev/null | awk '$1 == "nameserver" { print $2 }'
+	  uci -q get network.wan.dns 2>/dev/null | tr ' ' '\n'; } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | awk '!s[$0]++'
+}
+
+_ab_ip_stop() {
+	nft delete table inet "$AB_IP_NFT" >/dev/null 2>&1
+	rm -f "$JOBS_DIR/adblock.ip.sig"
+	return 0
+}
+
+_ab_ip_load() {
+	local f="$JOBS_DIR/adblock.ip.nft" id src="" keep av
+	for id in $1; do [ -s "$AB_IP_DIR/$id.txt" ] && src="$src $AB_IP_DIR/$id.txt"; done
+	[ -n "$src" ] || { _ab_ip_stop; return 1; }
+	av="$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null)"
+	if [ -n "$av" ] && [ "$av" -lt 24576 ]; then echo "   ! Свободной памяти $((av / 1024)) МБ — опасные IP в файрвол не загружаем"; return 1; fi
+	keep="$(_ab_ip_keep | tr '\n' ',' | sed 's/,$//')"
+	mkdir -p "$JOBS_DIR"
+	{
+		echo "table inet $AB_IP_NFT"
+		echo "delete table inet $AB_IP_NFT"
+		echo "table inet $AB_IP_NFT {"
+		echo "	set bad4 { type ipv4_addr; flags interval; auto-merge; }"
+		echo "	set keep4 { type ipv4_addr; flags interval; auto-merge;${keep:+ elements = { $keep }} }"
+		echo "	chain forward_bad { type filter hook forward priority filter - 5; policy accept; ip daddr @keep4 return; ip saddr @keep4 return; ip daddr @bad4 counter drop; ip saddr @bad4 counter drop; }"
+		echo "	chain input_bad { type filter hook input priority filter - 5; policy accept; ip saddr @keep4 return; ip saddr @bad4 counter drop; }"
+		echo "	chain output_bad { type filter hook output priority filter - 5; policy accept; ip daddr @keep4 return; ip daddr @bad4 counter drop; }"
+		echo "}"
+		cat $src | awk '!s[$0]++' | awk -v t="$AB_IP_NFT" '{ b = b (n++ ? ", " : "") $0 } n == 2000 { print "add element inet " t " bad4 { " b " }"; b = ""; n = 0 } END { if (n) print "add element inet " t " bad4 { " b " }" }'
+	} > "$f"
+	if nft -f "$f" >/dev/null 2>"$f.err"; then
+		rm -f "$f" "$f.err"
+		echo "$1 $(cat $src | wc -l | tr -d ' ')" > "$JOBS_DIR/adblock.ip.sig"
+		return 0
+	fi
+	echo "   ! nft не принял список: $(head -n 2 "$f.err" | tr '\n' ' ')"
+	rm -f "$f" "$f.err"
+	nft delete table inet "$AB_IP_NFT" >/dev/null 2>&1
+	return 1
+}
+
+_ab_ip_sync() {
+	local ids sig n=0 id
+	ids="$(_ab_tch_ip | tr '\n' ' ' | sed 's/ $//')"
+	if ! _ab_on || [ -z "$ids" ]; then nft list table inet "$AB_IP_NFT" >/dev/null 2>&1 && _ab_ip_stop; return 0; fi
+	for id in $ids; do [ -s "$AB_IP_DIR/$id.txt" ] && n=$((n + $(wc -l < "$AB_IP_DIR/$id.txt"))); done
+	sig="$ids $n"
+	[ "$1" != force ] && [ "$(cat "$JOBS_DIR/adblock.ip.sig" 2>/dev/null)" = "$sig" ] && nft list table inet "$AB_IP_NFT" >/dev/null 2>&1 && return 0
+	_ab_ip_load "$ids"
+}
+
+_ab_ip_tbl() { nft -a list table inet "$AB_IP_NFT" 2>/dev/null | sed -n '1s/.*# handle \([0-9]*\).*/\1/p'; }
+_ab_ip_hits() { for c in forward_bad input_bad output_bad; do nft list chain inet "$AB_IP_NFT" "$c" 2>/dev/null; done | awk '/drop/ { for (i = 1; i < NF; i++) if ($i == "packets") s += $(i + 1) } END { print s + 0 }'; }
+
+_ab_ip_json() {
+	local live=false n=0 hits=0 h0
+	if nft list table inet "$AB_IP_NFT" >/dev/null 2>&1; then
+		live=true
+		n="$(awk '{ print $NF + 0 }' "$JOBS_DIR/adblock.ip.sig" 2>/dev/null)"
+		hits="$(_ab_ip_hits)"
+		h0="$(cat "$JOBS_DIR/adblock.ip.hits0" 2>/dev/null)"
+		case "$h0" in
+			*" "*) if [ "${h0%% *}" = "$(_ab_ip_tbl)" ] && [ "${hits:-0}" -ge "${h0#* }" ] 2>/dev/null; then hits=$((hits - ${h0#* })); else rm -f "$JOBS_DIR/adblock.ip.hits0"; fi ;;
+		esac
+	fi
+	printf '{"live":%s,"n":%s,"hits":%s}' "$live" "${n:-0}" "${hits:-0}"
+}
+
 _ab_cron_sync() {
 	local m line
 	if _ab_on && [ "$(_ab_get auto 1)" = 1 ]; then
@@ -17133,10 +18271,39 @@ _ab_rebuild() {
 	echo "$n"
 }
 
+_ab_ip_apply() {
+	local ids id f age now n=0
+	ids="$(_ab_tch_ip | tr '\n' ' ')"
+	for f in "$AB_IP_DIR"/*.txt; do
+		[ -f "$f" ] || continue
+		id="${f##*/}"; id="${id%.txt}"
+		case " $ids " in *" $id "*) ;; *) rm -f "$f" ;; esac
+	done
+	if [ -z "$(echo $ids)" ]; then _ab_ip_stop; return 0; fi
+	_ab_say "Опасные IP (Tachyon Lists)"
+	now="$(date +%s)"
+	for id in $ids; do
+		age=$(( now - $(_ab_get "t_ip_$id" 0) ))
+		if [ "$1" != force ] && [ -s "$AB_IP_DIR/$id.txt" ] && [ "$age" -ge 0 ] && [ "$age" -lt 43200 ]; then
+			echo "   ✓ $(_ab_title "$id"): свежий, скачан $((age / 60)) мин назад"
+		elif ! _ab_ip_dl "$id"; then
+			if [ -s "$AB_IP_DIR/$id.txt" ]; then echo "   ! $(_ab_title "$id"): обновить не удалось — оставляем прежнюю копию"
+			else echo "   ! $(_ab_title "$id"): не скачался — пока без него"; fi
+		fi
+	done
+	if _ab_ip_sync force; then
+		n="$(awk '{ print $NF + 0 }' "$JOBS_DIR/adblock.ip.sig" 2>/dev/null)"
+		echo "   ✓ В файрволе $(_ab_num "${n:-0}") опасных адресов и сетей — соединения с ними отбрасываются"
+	else
+		echo "!! Опасные IP в файрвол не загрузились — блокировка рекламы работает и без них"
+	fi
+	return 0
+}
+
 do_ab_apply() {
 	local mode="$1" ids id f tmp="$JOBS_DIR/adblock.conf.new" n avail age now fails=0 got=0 keep
 	ids="$(_ab_ids)"
-	_ab_say "Блокировка рекламы: $(_ab_title "$(_ab_get list pro)")$([ "$(_ab_get tif 0)" = 1 ] && echo ' + защита от фишинга')$([ "$(_ab_get doh 0)" = 1 ] && echo ' + запрет чужих DoH')"
+	_ab_say "Блокировка рекламы: $(_ab_title "$(_ab_get list pro)")$([ "$(_ab_get tif 0)" = 1 ] && echo ' + защита от фишинга')$([ "$(_ab_get doh 0)" = 1 ] && echo ' + запрет чужих DoH')$([ -n "$(_ab_tch)" ] && echo " + Tachyon Lists: $(_ab_tch | wc -l | tr -d ' ')")"
 	avail="$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null)"
 	if [ -n "$avail" ] && [ "$avail" -lt 60000 ]; then
 		echo "!! Свободной памяти $((avail / 1024)) МБ, продолжаем на свой риск"
@@ -17152,6 +18319,7 @@ do_ab_apply() {
 		fi
 		if _ab_dl "$id"; then got=1
 		elif _ab_src "$id" >/dev/null; then echo "   ! $(_ab_title "$id"): обновить не удалось — оставляем прежнюю копию"; fails=1
+		elif [ "${id#t_}" != "$id" ]; then echo "   ! $(_ab_title "$id"): не скачался — собираем без него, попробуем при следующем обновлении"; fails=1
 		else
 			echo "ОШИБКА: $(_ab_title "$id") не скачался ни с GitHub, ни с jsDelivr — проверьте интернет на роутере"
 			_ab_put err "список не скачался" errat "$(date +%s)"
@@ -17187,6 +18355,7 @@ do_ab_apply() {
 		if _ab_free_sync; then echo "   ✓ Устройства без блокировки ($(_ab_free_macs | wc -l | tr -d ' ')) получают DNS без списка"
 		else echo "   ! DNS без блокировки для выбранных устройств не запустился — они пока получают общий"; fi
 	fi
+	_ab_ip_apply "$mode"
 	_ab_put count "$n" updated "$(date +%s)" err ""
 	_ab_cron_sync
 	_zm_inet_ok || echo "!! Сайты сейчас не открываются с роутера — проверьте интернет; список тут ни при чём, его можно выключить кнопкой «Выключить»"
@@ -17204,12 +18373,17 @@ adblock_status() {
 	_job_alive adblock && job=true
 	ram="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null)"
 	avail="$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null)"
-	for id in light multi pro proplus ultimate tif doh; do
+	for id in light multi pro proplus ultimate tif doh $(for x in $AB_TCH_DOM; do echo "t_$x"; done); do
 		_ab_src "$id" >/dev/null || continue
 		have="$have$sep\"$id\":{\"n\":$(_ab_get "n_$id" 0),\"v\":\"$(esc "$(_ab_get "v_$id" "")")\",\"t\":$(_ab_get "t_$id" 0)}"; sep=","
 	done
+	for id in $AB_TCH_IP; do
+		[ -s "$AB_IP_DIR/$id.txt" ] || continue
+		have="$have$sep\"$id\":{\"n\":$(_ab_get "n_ip_$id" 0),\"v\":\"\",\"t\":$(_ab_get "t_ip_$id" 0)}"; sep=","
+	done
 	err="$(_ab_get err "")"; errat="$(_ab_get errat 0)"
-	printf '{"on":%s,"applied":%s,"list":"%s","tif":%s,"doh":%s,"auto":%s,"minute":"%s","count":%s,"updated":%s,"now":%s,"err":"%s","errat":%s,"job":%s,"dns_kb":%s,"ram_kb":%s,"avail_kb":%s,"doh_proxy":%s,"stats":%s,"src":{%s},"allow":"%s","allow_default":"%s","block":"%s"}\n' \
+	printf '{"tch":"%s","ip":%s,"on":%s,"applied":%s,"list":"%s","tif":%s,"doh":%s,"auto":%s,"minute":"%s","count":%s,"updated":%s,"now":%s,"err":"%s","errat":%s,"job":%s,"dns_kb":%s,"ram_kb":%s,"avail_kb":%s,"doh_proxy":%s,"stats":%s,"src":{%s},"allow":"%s","allow_default":"%s","block":"%s"}\n' \
+		"$(_ab_tch | tr '\n' ',' | sed 's/,$//')" "$(_ab_ip_json)" \
 		"$on" "$applied" "$(esc "$(_ab_get list pro)")" "$tif" "$doh" "$auto" "$(esc "$(_ab_get minute "")")" \
 		"$(_ab_get count 0)" "$(_ab_get updated 0)" "$(date +%s)" "$(esc "$err")" "${errat:-0}" "$job" \
 		"$(_ab_dns_rss)" "${ram:-0}" "${avail:-0}" "$(pidof https-dns-proxy >/dev/null 2>&1 && echo true || echo false)" "$(_ab_stats_on && echo true || echo false)" \
@@ -17241,23 +18415,24 @@ _ab_check() {
 }
 
 adblock_action() {
-	local a="$1" m="$2" j k v kv list tif doh auto n
+	local a="$1" m="$2" j k v kv list tif doh auto n tch x
 	case "$a" in
 		apply|update)
 			_job_alive adblock && { echo '{"error":"список уже обновляется — дождитесь окончания"}'; return 1; }
 			if j="$(_zm_busy_job)"; then printf '{"error":"%s"}\n' "$(esc "Сейчас идёт операция: $j — дождитесь её окончания")"; return 1; fi
 			if [ "$a" = apply ]; then
-				list="$(_ab_get list pro)"; tif="$(_ab_get tif 0)"; doh="$(_ab_get doh 0)"; auto="$(_ab_get auto 1)"
+				list="$(_ab_get list pro)"; tif="$(_ab_get tif 0)"; doh="$(_ab_get doh 0)"; auto="$(_ab_get auto 1)"; tch="$(_ab_get tch "")"
 				for kv in $m; do
 					k="${kv%%=*}"; v="${kv#*=}"
 					case "$k" in
-						list) _ab_file "$v" >/dev/null && case "$v" in tif|doh) ;; *) list="$v" ;; esac ;;
+						list) _ab_file "$v" >/dev/null && case "$v" in tif|doh|t_*) ;; *) list="$v" ;; esac ;;
+						tch) tch=""; for x in $AB_TCH_DOM $AB_TCH_IP; do case ",$v," in *",$x,"*) tch="$tch${tch:+,}$x" ;; esac; done ;;
 						tif) [ "$v" = 1 ] && tif=1 || tif=0 ;;
 						doh) [ "$v" = 1 ] && doh=1 || doh=0 ;;
 						auto) [ "$v" = 1 ] && auto=1 || auto=0 ;;
 					esac
 				done
-				_ab_put on 1 list "$list" tif "$tif" doh "$doh" auto "$auto"
+				_ab_put on 1 list "$list" tif "$tif" doh "$doh" auto "$auto" tch "$tch"
 				job_start adblock do_ab_apply
 			else
 				_ab_on || { echo '{"error":"блокировка выключена"}'; return 1; }
@@ -17267,14 +18442,15 @@ adblock_action() {
 			_job_alive adblock && { echo '{"error":"дождитесь окончания операции"}'; return 1; }
 			_ab_put on 0 err "" stats 0
 			_ab_free_stop
+			_ab_ip_stop
 			_ab_unplug
 			_ab_stats_unplug
 			_ab_stats_cron off
 			_ab_stats_wipe
-			rm -rf "$AB_DIR/src"
+			rm -rf "$AB_DIR/src" "$AB_IP_DIR"
 			rm -f "$AB_TG_LIST" "$AB_DNS_STAMP" "$JOBS_DIR"/adblock.watch "$JOBS_DIR"/adblock.old "$JOBS_DIR"/adblock.allow "$JOBS_DIR"/adblock.conf.new* \
 				"$JOBS_DIR"/adblock.*.dl "$JOBS_DIR"/adblock.*.dl.dec "$JOBS_DIR"/adblock.*.dom "$JOBS_DIR"/ab.exempt.*
-			[ -f "$AB_SET" ] && sed -i -e '/^[nvt]_[a-z]*=/d' -e '/^count=/d' -e '/^updated=/d' -e '/^errat=/d' "$AB_SET"
+			[ -f "$AB_SET" ] && sed -i -e '/^[nvt]_[a-z_]*=/d' -e '/^count=/d' -e '/^updated=/d' -e '/^errat=/d' "$AB_SET"
 			_ab_cron_sync
 			/etc/init.d/dnsmasq restart >/dev/null 2>&1
 			sleep 2
@@ -17286,6 +18462,10 @@ adblock_action() {
 			adblock_stats_tick
 			_ab_stats_json "$m" ;;
 		journal) _ab_journal "$m" ;;
+		stats_reset)
+			_ab_stats_on || { echo '{"error":"статистика выключена — сбрасывать нечего"}'; return 1; }
+			_ab_stats_reset || { echo '{"error":"статистика сейчас считается — попробуйте через пару секунд"}'; return 1; }
+			_ab_stats_json "$m" ;;
 		journal_set)
 			_ab_stats_on || { echo '{"error":"сначала включите статистику"}'; return 1; }
 			case "$m" in
@@ -17379,9 +18559,17 @@ _ab_watch() {
 	local stamp="$JOBS_DIR/adblock.watch" r
 	if ! _ab_on; then
 		{ _ab_free_alive || nft list table inet "$AB_FREE_NFT" >/dev/null 2>&1; } && _ab_free_stop
+		nft list table inet "$AB_IP_NFT" >/dev/null 2>&1 && _ab_ip_stop
 		return 0
 	fi
 	_job_alive adblock || _ab_free_sync >/dev/null 2>&1
+	if ! _job_alive adblock; then
+		if _ab_ip_sync >/dev/null 2>&1; then rm -f "$JOBS_DIR/adblock.ip.warn"
+		elif [ ! -f "$JOBS_DIR/adblock.ip.warn" ]; then
+			: > "$JOBS_DIR/adblock.ip.warn"
+			logger -t zapret-manager "Блокировка рекламы: опасные IP не загрузились в файрвол — пробуем снова при каждой проверке"
+		fi
+	fi
 	if _ab_stats_on && _ab_applied && ! _ab_stats_applied; then
 		if _ab_stats_block >/dev/null; then
 			_ab_put stats 0; _ab_stats_cron off
@@ -18301,6 +19489,7 @@ _st_apply0() {
 		if _st_cat_refresh force >/dev/null 2>&1; then echo "   ✓ Каталог $(sed -n 's/^version=//p' "$ST_CAT_META" 2>/dev/null): наборов $(sed -n 's/^sets=//p' "$ST_CAT_META" 2>/dev/null)"
 		else _rb_warn "Каталог списков не скачался — сервисы из каталога берём по прежнему списку"; fi
 	fi
+	if _st_tch_on && ! _st_tch_refresh >/dev/null 2>&1; then _rb_warn "Каталог Tachyon Lists не скачался — его списки берём по прежнему каталогу"; fi
 	sel="$(_st_sel | tr '\n' ' ')"
 	if [ -z "$(echo $sel)" ] && ! _st_devs_all && ! _st_secs_work; then
 		_st_spec_clear
@@ -18329,6 +19518,8 @@ _st_apply0() {
 	_st_secs_fw
 	local what dn
 	what="$(_rb_svc_names "$sel")"
+	dn="$(_st_devs_n only)"
+	[ "$dn" -gt 0 ] && [ -n "$what" ] && what="$what (только для устройств: $dn)"
 	dn="$(_st_devs_n all)"
 	[ "$dn" -gt 0 ] && what="${what:+$what; }весь трафик устройств: $dn"
 	if [ -n "$mw" ]; then
@@ -18349,6 +19540,19 @@ _st_b4_raw() {
 	esac
 }
 
+_st_base_dom() {
+	local f="$ST_DIR/lists/$1.base.dom" t
+	mkdir -p "$ST_DIR/lists" "$ST_RUN"
+	t="$ST_RUN/$1.base.$$"
+	[ $# -ge 3 ] || set -- "$1" "$(_rb_svc_field "$1" 5)" "$(_rb_svc_field "$1" 6)"
+	printf '%s,%s\n' "$2" "$3" | tr ',' '\n' | tr 'A-Z' 'a-z' | grep -E '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' | awk '!s[$0]++' > "$t"
+	if [ ! -s "$t" ]; then rm -f "$t" "$f"; return 0; fi
+	if cmp -s "$t" "$f" 2>/dev/null; then rm -f "$t"
+	elif ! cp -f "$t" "$f.tmp" 2>/dev/null || ! cmp -s "$t" "$f.tmp" || ! mv -f "$f.tmp" "$f"; then rm -f "$t" "$f.tmp"; [ -s "$f" ] || return 0
+	else rm -f "$t"; fi
+	echo "$f"
+}
+
 _st_cat_fresh() {
 	[ -s "$ST_CAT_SVC" ] && [ -s "$ST_CAT_IDX" ] && [ -s "$ST_CAT_META" ] || return 1
 	[ -f "$ST_DIR/catalog.err" ] && return 1
@@ -18356,6 +19560,13 @@ _st_cat_fresh() {
 	grep -q '|Свои списки каталога$' "$ST_CAT_SVC" 2>/dev/null && return 1
 	head -n1 "$ST_CAT_IDX" | grep -q '^[^|]*|[^|]*|[^|]*|[sd]$' || return 1
 	[ $(( $(date +%s) - $(date -r "$ST_CAT_SVC" +%s 2>/dev/null || echo 0) )) -lt 21600 ]
+}
+
+_st_cdn_url() {
+	case "$1" in
+		https://raw.githubusercontent.com/*/*/*/*) printf '%s\n' "$1" | sed 's#^https://raw.githubusercontent.com/\([^/]*\)/\([^/]*\)/\(refs/heads/\)\{0,1\}\([^/]*\)/#https://cdn.jsdelivr.net/gh/\1/\2@\4/#' ;;
+		*) return 1 ;;
+	esac
 }
 
 _st_cron_refresh() {
@@ -18423,6 +19634,11 @@ _st_dev_model() {
 	awk -F'\t' -v m="$1" '$1 == m && $2 != "" && !s[$2]++ { printf "dev\t%s\t%s\t%s\n", $1, $2, $3 }' "$ST_DEVS"
 }
 
+_st_dev_only_main() {
+	[ -s "$ST_DEVS" ] || return 0
+	awk -F'\t' '$1 == "only" && $2 != "" && !x[$2]++ { printf "sdev\tmain\tonly\t%s\n", $2 }' "$ST_DEVS"
+}
+
 _st_dev_sec() {
 	[ -s "$ST_SEC_DIR/$1/devices" ] || return 0
 	awk -F'\t' -v s="$1" '($1 == "all" || $1 == "only") && $2 != "" && !x[$2]++ { printf "sdev\t%s\t%s\t%s\n", s, $1, $2 }' "$ST_SEC_DIR/$1/devices"
@@ -18431,7 +19647,7 @@ _st_dev_sec() {
 _st_devs_fit() {
 	local have want s
 	have="$(awk -F'\t' '$1 == "dev" || $1 == "sdev"' "$ST_DIR/model.svc" 2>/dev/null | sort)"
-	want="$( { _st_dev_model all; for s in $(_st_secs); do _st_sec_live "$s" && _st_dev_sec "$s"; done; } | sort)"
+	want="$( { _st_dev_model all; _st_dev_only_main; for s in $(_st_secs); do _st_sec_live "$s" && _st_dev_sec "$s"; done; } | sort)"
 	[ "$have" = "$want" ]
 }
 
@@ -18478,8 +19694,20 @@ _st_engine_ready() {
 }
 
 _st_excl_model() {
+	local id st set
 	[ -s "$ST_DIR/user/exclude.lst" ] && printf 'xdom\t%s\n' "$ST_DIR/user/exclude.lst"
 	[ -s "$ST_DIR/user/exclude.pfx" ] && printf 'xpfx\t%s\n' "$ST_DIR/user/exclude.pfx"
+	[ -s "$ST_TCH_XSETS" ] && [ -s "$ST_TCH_DIRECT" ] && _st_tch_on || return 0
+	for id in $(cat "$ST_TCH_XSETS"); do
+		st="$(awk -F'|' -v k="$id" '$1 == k { print $4; exit }' "$ST_TCH_DIRECT")"
+		[ -n "$st" ] || continue
+		echo "   → Мимо Steer: «$(awk -F'|' -v k="$id" '$1 == k { print $2; exit }' "$ST_TCH_DIRECT")»" >&2
+		for set in $(echo "$st" | tr ',' ' '); do
+			_st_srs_get "$set" || { _rb_warn "Список $set для «Мимо Steer» не скачался — пропускаем его в этот раз" >&2; continue; }
+			[ -s "$ST_DIR/lists/$set.dom" ] && printf 'xdom\t%s\n' "$ST_DIR/lists/$set.dom"
+			[ -s "$ST_DIR/lists/$set.pfx" ] && printf 'xpfx\t%s\n' "$ST_DIR/lists/$set.pfx"
+		done
+	done
 	return 0
 }
 
@@ -18559,7 +19787,7 @@ _st_geo_line() {
 		g="$(_st_geo_get "$i")"
 		set -- $g
 		[ "$1" = "$c" ] && [ -n "$2" ] && [ "$2" != - ] && out="${out:+$out, }$2 ($c)"
-	done < "$ST_WARP_UP" 2>/dev/null
+	done 2>/dev/null < "$ST_WARP_UP"
 	echo "$out"
 }
 
@@ -18588,9 +19816,9 @@ _st_grp_ids() {
 		BEGIN {
 			while ((getline l < G) > 0) { split(l, a, "\t"); GN[a[1]] = 1; if (a[1] == ENVIRON["ZM_W"]) { nm = split(a[3], W, " ") } }
 			while ((getline l < M) > 0) { split(l, b, "\t"); K[b[1]] = b[2] "|" tolower(b[3]) "|" b[4] }
-			ln = 0; while ((getline l < S) > 0) { ln++; if (ln in K) { pt = qv(l, "path"); if (pt == "") pt = qv(l, "serviceName"); sub(/\?.*$/, "", pt); P[ln] = pt } }
+			ln = 0; while ((getline l < S) > 0) { ln++; if (ln in K) { pt = qv(l, "path"); if (pt == "") pt = qv(l, "serviceName"); sub(/\?.*$/, "", pt); gsub(/ /, "%20", pt); P[ln] = pt } }
 		}
-		{ r++; id[r] = $1; lk[r] = ($1 in K) ? K[$1] : ""; sk[r] = lk[r] "|" P[$1]; ar[r] = (index($5, "\342\254\207") || index($5, "\342\254\206")) ? 1 : 0; gs[r] = ($5 in GN) ? 1 : 0 }
+		{ r++; id[r] = $1; lk[r] = ($9 in K) ? K[$9] : ""; sk[r] = lk[r] "|" P[$9]; ar[r] = (index($5, "\342\254\207") || index($5, "\342\254\206")) ? 1 : 0; gs[r] = ($5 in GN) ? 1 : 0 }
 		END {
 			for (j = 1; j <= nm; j++) {
 				m = W[j]; x = m; sub(/\|[^|]*$/, "", x); pa = 0
@@ -18603,14 +19831,34 @@ _st_grp_ids() {
 }
 
 _st_heal() {
-	local f="$1" ver c="$ST_RUN/heal.cause.now"
+	local f="$1" ver c="$ST_RUN/heal.cause.now" wifs feats
 	mkdir -p "$ST_RUN" "$ST_DIR"
 	_st_heal_cause "$f" > "$c"
 	if [ -s "$ST_HEAL_CAUSE" ] && cmp -s "$c" "$ST_HEAL_CAUSE" && [ -z "$(find "$ST_HEAL_CAUSE" -mmin +360 2>/dev/null)" ]; then
 		ST_HEAL_DID="эту же поломку панель уже пыталась исправить в $(date -r "$ST_HEAL_CAUSE" +%H:%M 2>/dev/null) — не помогло"
-		echo "   ! Эту же поломку ядра уже пробовали исправить в $(date -r "$ST_HEAL_CAUSE" +%H:%M 2>/dev/null) — не помогло, второй раз по кругу не чиним"
+		echo "   ! Эту же поломку уже пробовали исправить в $(date -r "$ST_HEAL_CAUSE" +%H:%M 2>/dev/null) — не помогло, второй раз по кругу не чиним"
 		rm -f "$c"
 		return 1
+	fi
+	wifs="$(_st_heal_wifs "$f")"
+	if [ -n "$wifs" ]; then
+		ST_HEAL_DID="туннель WARP не поднялся"
+		_rb_say "Чиним сами: поднимаем туннель WARP ($(echo $wifs | sed 's/zmwarp\([0-9]\)/WARP \1/g; s/zmwarp/WARP 1/g; s/ /, /g'))"
+		if _st_heal_tun "$wifs"; then
+			echo "   ✓ Туннель поднят"
+			if _st_heal_wait "$f"; then
+				echo "   ✓ Всё работает"
+				rm -f "$c" "$ST_HEAL_CAUSE"
+				return 0
+			fi
+		else
+			echo "   ! Туннель не поднялся — проверьте WARP на вкладке «Подключение»"
+		fi
+	fi
+	feats="$(_st_feats_all)"
+	if stl_v2 && [ -n "$(echo $feats)" ] && ! _st_feats_ok $feats; then
+		_rb_say "Чиним сами: у ядра steer не хватает модулей — доставляем их"
+		STL_MODS_ONLY=1 _st_install_steer $feats >/dev/null 2>&1 && echo "   ✓ Модули ядра на месте"
 	fi
 	ST_HEAL_DID="перезапуск ядра не помог"
 	_rb_say "Чиним сами: перезапускаем ядро steer"
@@ -18620,6 +19868,11 @@ _st_heal() {
 		return 0
 	fi
 	mv -f "$c" "$ST_HEAL_CAUSE"
+	if stl_running && stl_v2 && [ -s "$f" ] && ! _st_heal_core "$f"; then
+		ST_HEAL_DID="само ядро steer работает — не поднимается выход (туннель или клиент VPN), переустановка ядра тут не поможет"
+		echo "   · Само ядро steer работает — не поднимается выход секции (туннель или клиент VPN). Переустановка ядра тут не поможет: проверьте подключение этой секции"
+		return 1
+	fi
 	if [ -f "$ST_HEAL_STAMP" ] && [ -z "$(find "$ST_HEAL_STAMP" -mmin +30 2>/dev/null)" ]; then
 		echo "   ! Перезапуск не помог, а ядро уже переустанавливали меньше получаса назад — второй раз не трогаем"
 		stl_diag_lines > "$f"
@@ -18628,7 +19881,7 @@ _st_heal() {
 	mkdir -p "$ST_DIR"; touch "$ST_HEAL_STAMP"
 	ST_HEAL_DID="не помогли ни перезапуск, ни переустановка ядра"
 	ver="$(stl_version)"; _stl_ver_ok "$ver" || ver="$(stl_latest)"
-	_rb_say "Перезапуск не помог — переустанавливаем ядро steer $ver"
+	_rb_say "Ядро steer не отвечает и после перезапуска — переустанавливаем ядро steer $ver"
 	if ! STL_REINSTALL=1 stl_engine_install "$ver" $(_st_use_vpn && _st_sub_feats); then
 		echo "   ✗ Переустановить ядро не удалось — проверьте интернет и нажмите «Применить» ещё раз"
 		stl_running || stl_restart >/dev/null 2>&1
@@ -18646,15 +19899,41 @@ _st_heal() {
 
 _st_heal_cause() { awk -F'\t' '$1 == "fail" { print $2 }' "$1" | while IFS= read -r w; do _st_diag_node "$w" || printf '%s\n' "$w"; done | sort; }
 
+_st_heal_core() { awk -F'\t' '$1 == "fail" && $2 !~ /^(выход|канал) / { f = 1 } END { exit !f }' "$1"; }
+
+_st_heal_tun() {
+	local i n=0 w=0 need=0 up=""
+	for i in $1; do
+		[ "$(uci -q get "network.$i")" = interface ] || continue
+		[ "$(uci -q get "network.$i.auto")" = 0 ] && { uci -q delete "network.$i.auto"; need=1; }
+		[ "$(uci -q get "network.$i.disabled")" = 1 ] && { uci -q delete "network.$i.disabled"; need=1; }
+		up="$up $i"
+	done
+	[ -n "$up" ] || return 1
+	[ "$need" = 1 ] && uci -q commit network
+	for i in $up; do ubus call "network.interface.$i" up >/dev/null 2>&1; done
+	while [ "$w" -lt 20 ]; do
+		n=0
+		for i in $up; do [ -d "/sys/class/net/$i" ] || n=1; done
+		[ "$n" = 0 ] && return 0
+		sleep 1; w=$((w + 1))
+	done
+	return 1
+}
+
 _st_heal_wait() {
 	local f="$1" i=0
 	while [ "$i" -lt 10 ]; do
 		sleep 3; i=$((i + 1))
 		stl_running || continue
 		stl_diag_lines > "$f"
-		[ -s "$f" ] && ! grep -q '^fail' "$f" && return 0
+		[ -s "$f" ] && [ -z "$(_st_heal_cause "$f")" ] && return 0
 	done
 	return 1
+}
+
+_st_heal_wifs() {
+	awk -F'\t' '$1 == "fail" && $2 ~ /^выход zmwarp[0-9]*: (устройства zmwarp[0-9]* нет|устройство zmwarp[0-9]* выключено)/ { o = $2; sub(/^выход /, "", o); sub(/:.*$/, "", o); if (!s[o]++) print o }' "$1"
 }
 
 _st_if_ru() {
@@ -18841,6 +20120,7 @@ _st_model() {
 			rm -f "$ST_RUN"/used.*
 			for id; do _st_svc_lists "$id"; done
 			_st_dev_model all
+			_st_dev_only_main
 			continue
 		fi
 		_st_sec_live "$s" || continue
@@ -18927,7 +20207,7 @@ _st_nodes() {
 		if stl_sub_norm "$ST_SUB" "$ST_SUB.n"; then mv -f "$ST_SUB.n.map" "$ST_SUB.map"; mv -f "$ST_SUB.n" "$ST_SUB"; chmod 600 "$ST_SUB"; fi
 		rm -f "$ST_SUB.n" "$ST_SUB.n.map"
 	fi
-	mods="$(_stl_mods_present)"
+	mods="$(_stl_mods_present)$(_stl_insec "$ST_SUB" && echo insecure) n2"
 	if [ ! -s "$ST_SUB_NODES" ] || [ "$ST_SUB" -nt "$ST_SUB_NODES" ] || [ "$(sed -n 's/^mods=//p' "$ST_SUB_NODES.meta" 2>/dev/null)" != "$mods" ]; then
 		mkdir -p "$ST_DIR"
 		stl_sub_nodes "$ST_SUB" "$ST_SUB_NODES.tmp" "$ST_SUB_NODES.meta"
@@ -18952,7 +20232,7 @@ _st_outs_text() {
 	BEGIN { while ((getline l < M) > 0) { split(l, a, "\t"); LB[a[1]] = a[2]; IF[a[1]] = a[4] } close(M) }
 	{
 		out = ""; t = $0
-		while (match(t, /выход (zm_vpn[2-9]?|zm_if[2-9]?|zmv[2-9]?_[A-Za-z0-9]+|zm_warp[0-9]*|zm_direct)/)) {
+		while (match(t, /выход (zm_vpn[2-9]?|zm_if[2-9]?|zmv[2-9]?_[A-Za-z0-9]+|zm_warp[0-9]*|zmwarp[0-9]*|zm_direct)/)) {
 			o = substr(t, RSTART, RLENGTH); sub(/^выход /, "", o); s = secof(o)
 			if (s != "") lab = (LB[s] != "" ? LB[s] " · " : "") ((o ~ /^zm_if/) ? "туннель" (IF[s] != "" ? " " IF[s] : "") : "VPN")
 			else lab = (o == "zm_direct") ? "Мимо Steer" : "WARP"
@@ -18979,8 +20259,12 @@ _st_peers_drop() {
 _st_pick() { set -- $(head -n1 "$ST_SUB_PICK" 2>/dev/null); [ "$1" = ping ] && echo ping || echo order; }
 
 _st_pkg_lists() {
-	local f
-	for f in $1; do _rb_list_get "$f" && [ -s "$ZM_LISTS_DIR/$f" ] && echo "$ZM_LISTS_DIR/$f"; done
+	local f p
+	for f in $1; do
+		p="$ZM_LISTS_DIR/$f"
+		if [ -n "$(echo $2)" ] && [ ! -s "$p" ] && [ -n "$(find "$ZM_LISTS_DIR/.$f.fail" -mmin -60 2>/dev/null)" ]; then continue; fi
+		_rb_list_get "$f" && [ -s "$p" ] && echo "$p"
+	done
 }
 
 _st_port_order() {
@@ -19031,8 +20315,10 @@ _st_secs_say() {
 		w="$(_st_sec_with "$s" _st_sel | tr '\n' ' ')"
 		n="$(_st_sec_with "$s" _st_devs_n all)"
 		[ -n "$(echo $w)" ] || [ "$n" -gt 0 ] || continue
+		w="$(_rb_svc_names "$w")"
+		k="$(_st_sec_with "$s" _st_devs_n only)"; [ "$k" -gt 0 ] && [ -n "$w" ] && w="$w (только для устройств: $k)"
+		[ "$n" -gt 0 ] && w="${w:+$w; }весь трафик устройств: $n"
 		k="$(_st_sec_kind "$s")"
-		w="$(_rb_svc_names "$w")"; [ "$n" -gt 0 ] && w="${w:+$w; }весь трафик устройств: $n"
 		if ! _st_sec_live "$s"; then
 			case "$k" in
 				vpn) _rb_warn "Секция «$(_st_sec_name "$s")»: у неё нет подписки VPN — её сервисы пока идут напрямую" ;;
@@ -19107,15 +20393,14 @@ _st_selfcheck0() {
 		_st_work && echo "[ OK ] Ядро steer ведёт выбранные сервисы в туннель"
 	fi
 	stl_diag_lines > "$f"
-	while IFS="$(printf '\t')" read -r v what why; do
-		[ "$v" = fail ] && ! _st_diag_node "$what" && core=1
-	done < "$f"
+	_st_diag_human < "$f" | awk -F"$(printf '\037')" '$1 == "fail" { print $7 }' > "$f.c"
+	while IFS= read -r what; do _st_diag_node "$what" || core=1; done < "$f.c"
 	local nodeonly=""
 	[ -z "$core" ] && [ -z "$moved" ] && _st_diag_human < "$f" | awk -F"$(printf '\037')" '$1 == "fail" { f = 1 } END { exit !f }' && nodeonly=1
 	if [ -n "$core" ] && [ -z "$ST_HEALING" ] && _st_work && [ ! -f "$ST_OFF" ]; then
-		while IFS="$(printf '\t')" read -r v what why; do
-			[ "$v" = fail ] && ! _st_diag_node "$what" && echo "!! $(_st_diag_what "$what")"
-		done < "$f"
+		while IFS= read -r what; do
+			_st_diag_node "$what" || echo "!! $(_st_diag_what "$what")"
+		done < "$f.c"
 		ST_HEALING=1
 		if _st_heal "$f"; then healed=1; fi
 		ST_HEALING=""
@@ -19139,7 +20424,7 @@ _st_selfcheck0() {
 				[ -n "$tip" ] && echo "   · $tip" ;;
 		esac
 	done < "$f.h"
-	rm -f "$f" "$f.h"
+	rm -f "$f" "$f.h" "$f.c"
 	[ -n "$nodeonly" ] && echo "   · Само ядро steer исправно — не отвечает узел или сервер туннеля; перезапуск и переустановка ядра тут не помогут"
 	[ -n "$healed" ] && [ "$bad" = 0 ] && echo "   · Поломку ядра панель исправила сама"
 	if [ "$bad" != 0 ]; then _rb_warn "Проверка нашла поломку — подробности выше"
@@ -19152,7 +20437,7 @@ _st_set_fmt() { awk -F'|' -v k="$1" '$1 == k { print $2; exit }' "$ST_CAT_IDX" 2
 
 _st_set_have() {
 	local d="$ST_DIR/lists/$1"
-	if [ "$(_st_set_fmt "$1")" = lst ]; then [ -s "$d.dom" ] || [ -s "$d.pfx" ]; else [ -s "$d.srs" ]; fi
+	if [ "$(_st_set_fmt "$1")" = lst ]; then [ -s "$d.dom" ] || [ -s "$d.pfx" ] || grep -qx zones "$d.meta" 2>/dev/null; else [ -s "$d.srs" ]; fi
 }
 
 _st_set_mark() { mkdir -p "$ST_RUN"; : > "$ST_RUN/$1.$2"; }
@@ -19245,7 +20530,8 @@ _st_srs_get() {
 	f="$ST_RUN/$set.src"
 	if [ "$fmt" = lst ]; then
 		{ [ -s "$d/$set.dom" ] || [ -s "$d/$set.pfx" ]; } && old=1
-		if ! _st_fetch "$(_st_srs_url "$set")" "$f"; then
+		x="$(_st_srs_url "$set")"
+		if ! _st_fetch "$x" "$f" && ! { _st_cdn_url "$x" >/dev/null && _st_fetch "$(_st_cdn_url "$x")" "$f"; }; then
 			rm -f "$f"
 			[ -n "$old" ] || return 1
 			_rb_warn "Набор $set не скачался — беру прошлую копию" >&2
@@ -19254,13 +20540,22 @@ _st_srs_get() {
 			return 0
 		fi
 		tr -d '\r' < "$f" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'A-Z' 'a-z' > "$f.n"
-		grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$' "$f.n" | awk '!s[$0]++' > "$d/$set.pfx.tmp"
+		grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$' "$f.n" | awk '!s[$0]++' > "$f.pfx"
 		sed 's/^domain://; s/^full://; s/^suffix://; s/^\*\.//; s/^\.//' "$f.n" |
-			grep -E '^[a-z0-9]([a-z0-9_-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9_-]*[a-z0-9])?)+$' | grep -vE '^[0-9.]+$' | awk '!s[$0]++' > "$d/$set.dom.tmp"
+			grep -E '^[a-z0-9]([a-z0-9_-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9_-]*[a-z0-9])?)+$' | grep -vE '^[0-9.]+$' | awk '!s[$0]++' > "$f.dom"
 		: > "$d/$set.meta.tmp"
+		if [ ! -s "$f.dom" ] && [ ! -s "$f.pfx" ] && [ "${set#t_}" != "$set" ] && grep -q . "$f.n" && ! grep -v '^$' "$f.n" | grep -qvE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; then
+			x="$(grep -v '^$' "$f.n" | head -n 5 | sed 's/^/./' | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+			rm -f "$f" "$f.n" "$f.dom" "$f.pfx"
+			echo "     · $set: в наборе только целые доменные зоны ($x) — Steer их не понимает, берём остальные списки сервиса" >&2
+			: > "$d/$set.dom"; : > "$d/$set.pfx"; echo zones > "$d/$set.meta"
+			rm -f "$d/$set".*.tmp
+			touch "$ST_RUN/srs.$set.done"
+			return 0
+		fi
 		rm -f "$f.n"
-		if [ ! -s "$d/$set.dom.tmp" ] && [ ! -s "$d/$set.pfx.tmp" ]; then
-			rm -f "$f" "$d/$set".*.tmp
+		if [ ! -s "$f.dom" ] && [ ! -s "$f.pfx" ]; then
+			rm -f "$f" "$f.dom" "$f.pfx" "$d/$set".*.tmp
 			[ -n "$old" ] || return 1
 			_rb_warn "Набор $set скачался пустым — беру прошлую копию" >&2
 			_st_set_mark fail "$set"
@@ -19268,26 +20563,41 @@ _st_srs_get() {
 			return 0
 		fi
 		for x in dom pfx; do
-			[ -s "$d/$set.$x.tmp" ] || [ -s "$d/$set.$x" ] || continue
-			cmp -s "$d/$set.$x.tmp" "$d/$set.$x" 2>/dev/null || same=""
+			[ -s "$f.$x" ] || [ -s "$d/$set.$x" ] || continue
+			cmp -s "$f.$x" "$d/$set.$x" 2>/dev/null || same=""
 		done
 		if [ -n "$old" ] && [ -n "$same" ]; then
-			rm -f "$f" "$d/$set".*.tmp
+			rm -f "$f" "$f.dom" "$f.pfx" "$d/$set".*.tmp
 			touch "$d/$set.meta"
 			echo "     ✓ $set: без изменений" >&2
 			touch "$ST_RUN/srs.$set.done"
 			return 0
 		fi
+		for x in dom pfx; do
+			if ! cp -f "$f.$x" "$d/$set.$x.tmp" 2>/dev/null || ! cmp -s "$f.$x" "$d/$set.$x.tmp"; then
+				rm -f "$f" "$f.dom" "$f.pfx" "$d/$set".*.tmp
+				_rb_warn "Набор $set не записался — на флеше роутера не хватает места$([ -n "$old" ] && echo ', оставлен прежний')" >&2
+				[ -n "$old" ] || return 1
+				_st_set_mark fail "$set"
+				touch "$ST_RUN/srs.$set.done"
+				return 0
+			fi
+		done
 		_st_set_mark "$([ -n "$old" ] && echo chg || echo new)" "$set"
-		echo "     ✓ $set: $([ -n "$old" ] && echo обновлён || echo скачан), доменов $(wc -l < "$d/$set.dom.tmp" | tr -d ' '), подсетей $(wc -l < "$d/$set.pfx.tmp" | tr -d ' ')" >&2
+		echo "     ✓ $set: $([ -n "$old" ] && echo обновлён || echo скачан), доменов $(wc -l < "$f.dom" | tr -d ' '), подсетей $(wc -l < "$f.pfx" | tr -d ' ')" >&2
+		rm -f "$f.dom" "$f.pfx"
 	else
 		[ -s "$d/$set.srs" ] && old=1
 		if _st_srs_dl "$set" "$f"; then
 			if [ -n "$old" ] && cmp -s "$f" "$d/$set.srs"; then
 				rm -f "$f"
 				echo "     ✓ $set.srs: без изменений" >&2
+			elif ! cp -f "$f" "$d/$set.srs.tmp" 2>/dev/null || ! cmp -s "$f" "$d/$set.srs.tmp"; then
+				rm -f "$f" "$d/$set.srs.tmp"
+				_rb_warn "Набор $set.srs не записался — на флеше роутера не хватает места$([ -n "$old" ] && echo ', оставлен прежний')" >&2
+				_st_set_mark fail "$set"
 			else
-				mv -f "$f" "$d/$set.srs"
+				rm -f "$f"; mv -f "$d/$set.srs.tmp" "$d/$set.srs"
 				_st_set_mark "$([ -n "$old" ] && echo chg || echo new)" "$set"
 				echo "     ✓ $set.srs: $([ -n "$old" ] && echo обновлён || echo скачан), $(ls -l "$d/$set.srs" | awk '{ printf "%d КБ", ($5 + 1023) / 1024 }')" >&2
 			fi
@@ -19320,16 +20630,11 @@ _st_stopped() { [ -f "$ST_STOP_FLAG" ]; }
 
 _st_stub_ids() {
 	[ -s "$ST_SUB.map" ] || return 0
-	LC_ALL=C awk -F'\t' -v G="$ST_SUB_GRPS" -v M="$ST_SUB.map" '
-		BEGIN {
-			while ((getline l < G) > 0) { split(l, a, "\t"); GN[a[1]] = 1 }
-			while ((getline l < M) > 0) { split(l, b, "\t"); K[b[1]] = b[2] "|" tolower(b[3]) "|" b[4] }
-		}
-		$5 in GN { print $1 }' "$1"
+	LC_ALL=C awk -F'\t' -v G="$ST_SUB_GRPS" 'BEGIN { while ((getline l < G) > 0) { split(l, a, "\t"); GN[a[1]] = 1 } } $5 in GN { print $1 }' "$1"
 }
 
 _st_sub_filter() {
-	local t want hid all n mk st g gh gi of r
+	local t want hid all n mk st g gh gi of r na
 	mk="$(head -n1 "$ST_SUB_EXCL" 2>/dev/null | tr '\t' ' ')"
 	[ -n "$(printf '%s' "$mk" | tr -d ' |,')" ] || mk=-
 	t="$(_st_nodes)"; all="$(grep -c . "$t" 2>/dev/null)"
@@ -19346,6 +20651,11 @@ _st_sub_filter() {
 			set -- $n
 			case "$hid" in *" $1 "*) ;; *) printf 'tun\t%s\t%s\t%s\n' "$2" "$3" "$mk"; return 0 ;; esac
 		fi
+	fi
+	na="$(cut -f1,5 "$t" | _zm_excl_hits "$ST_SUB_NOAUTO_MK" "$ST_SUB_NOAUTO" | tr '\n' ' ')"
+	if [ -n "$(echo $na)" ]; then
+		if [ "$(echo $hid $na | tr ' ' '\n' | grep . | sort -u | wc -l)" -ge "$all" ]; then echo "!! «Не брать в Авто» убрал бы все узлы — пока Авто выбирает из всех" >&2
+		else hid="$hid $na "; fi
 	fi
 	g="$(_st_grp_cur)"
 	gh="$hid"
@@ -19404,58 +20714,70 @@ _st_sub_names_fix() {
 }
 
 _st_svc_lists() {
-	local id="$1" name sets set dom="" pfx="" srs="" f fmt took=""
-	name="$(_rb_svc_field "$id" 2)"
-	sets="$(_rb_svc_field "$id" 8 | tr ',' ' ')"
-	if [ -n "$(echo $sets)" ]; then echo "   → «$name»: списки $(echo $sets | sed 's/ /, /g')" >&2
-	elif [ "$id" = custom ]; then echo "   → «$name»: доменов $(cat "$ST_CUSTOM.lst" 2>/dev/null | grep -c .), подсетей $(cat "$ST_CUSTOM.pfx" 2>/dev/null | grep -c .)" >&2
-	else echo "   → «$name»: список из репозитория" >&2; fi
+	local id="$1" name sets set dom="" pfx="" srs="" f fmt took="" plus pfail="" pkd pkp say="" mt="" f5 f6 x
+	IFS='|' read -r x name pkd pkp f5 f6 x sets x <<ZM_ROW
+$(_rb_svc_row "$id")
+ZM_ROW
+	sets="$(echo $sets | tr ',' ' ')"; pkd="$(echo $pkd | tr ',' ' ')"; pkp="$(echo $pkp | tr ',' ' ')"
+	plus=" $(_st_tch_plus_of "$id") "
+	if [ "$id" = custom ]; then echo "   → «$name»: доменов $(cat "$ST_CUSTOM.lst" 2>/dev/null | grep -c .), подсетей $(cat "$ST_CUSTOM.pfx" 2>/dev/null | grep -c .)" >&2
+	else
+		[ -n "$(echo $sets)" ] && say="списки $(echo $sets | sed 's/ /, /g')"
+		[ -n "$(echo $pkd $pkp)" ] && say="$say${say:+ + }$(echo $pkd $pkp | sed 's/ /, /g')"
+		for set in $plus; do case " $sets " in *" $set "*) ;; *) say="$say${say:+ + }Tachyon ($(echo $plus | sed 's/ /, /g'))"; break ;; esac; done
+		echo "   → «$name»: ${say:-основные домены}" >&2
+	fi
 	for set in $sets; do
 		[ -f "$ST_RUN/used.$set" ] && continue
 		if _st_srs_get "$set"; then
 			took="$took $set"
 			f="$ST_DIR/lists/$set"
-			fmt="$(awk -F'|' -v k="$set" '$1 == k { print $2; exit }' "$ST_CAT_IDX" 2>/dev/null)"
-			if [ "$fmt" != lst ]; then srs="$srs $f.srs"; continue; fi
-			[ -s "$f.dom" ] && dom="$dom $f.dom"
-			[ -s "$f.pfx" ] && pfx="$pfx $f.pfx"
+			fmt="$(_st_set_fmt "$set")"
+			if [ "$fmt" != lst ]; then srs="$srs $f.srs"
+			elif [ -s "$f.dom" ] || [ -s "$f.pfx" ]; then
+				[ -s "$f.dom" ] && dom="$dom $f.dom"
+				[ -s "$f.pfx" ] && pfx="$pfx $f.pfx"
+			else continue; fi
+			case "$plus" in *" $set "*) ;; *) mt="$mt $set" ;; esac
 		else
-			if [ -n "$(_rb_svc_field "$id" 3)$(_rb_svc_field "$id" 4)" ]; then _rb_warn "Список $set не скачался или не раскрылся — беру резервный список" >&2
-			else _rb_warn "Список «$name» не скачался или не раскрылся — пропускаем его в этот раз" >&2; fi
-			sets=""
-			break
+			case "$plus" in *" $set "*) pfail="$pfail $set"; _rb_warn "Дополнение Tachyon $set для «$name» не скачалось — сервис идёт по остальным спискам" >&2; continue ;; esac
+			_rb_warn "Список $set для «$name» не скачался или не раскрылся — сервис идёт по остальным спискам" >&2
 		fi
 	done
-	for set in $took; do [ -n "$sets" ] && touch "$ST_RUN/used.$set"; done
-	if [ -n "$sets" ]; then
-		for f in $(_rb_svc_field "$id" 3 | tr ',' ' '); do
-			case "$f" in *_extra.lst) f="$(_st_pkg_lists "$f")"; [ -n "$f" ] && dom="$dom $f" ;; esac
-		done
+	for set in $took; do touch "$ST_RUN/used.$set"; done
+	if [ "$id" != custom ]; then
+		f="$(_st_pkg_lists "$pkd" "$mt")"; [ -n "$f" ] && dom="$dom $f"
+		[ -z "$mt" ] && { f="$(_st_pkg_lists "$pkp")"; [ -n "$f" ] && pfx="$pfx $f"; }
 	fi
-	if [ -z "$sets" ]; then
-		dom="$(_st_pkg_lists "$(_rb_svc_field "$id" 3 | tr ',' ' ')")"
-		pfx="$(_st_pkg_lists "$(_rb_svc_field "$id" 4 | tr ',' ' ')")"
-		srs=""
-		if [ -z "$dom$pfx" ] && [ "$id" != custom ]; then
-			f="$ST_DIR/lists/$id.base.dom"
-			mkdir -p "$ST_DIR/lists"
-			printf '%s,%s\n' "$(_rb_svc_field "$id" 5)" "$(_rb_svc_field "$id" 6)" | tr ',' '\n' | grep -E '^[a-z0-9.-]+\.[a-z]+$' | awk '!s[$0]++' > "$f"
-			if [ -s "$f" ]; then
-				_rb_warn "Списки «$name» не скачались — пока беру только основные домены сервиса ($(wc -l < "$f" | tr -d ' ')), полный список панель попробует докачать в фоне" >&2
-				dom="$f"
-			else
-				rm -f "$f"
-			fi
+	for set in $plus; do
+		case " $took $pfail " in *" $set "*) continue ;; esac
+		[ -f "$ST_RUN/used.$set" ] && continue
+		if _st_srs_get "$set"; then
+			f="$ST_DIR/lists/$set"
+			[ -s "$f.dom" ] && dom="$dom $f.dom"
+			[ -s "$f.pfx" ] && pfx="$pfx $f.pfx"
+			touch "$ST_RUN/used.$set"
+		else
+			_rb_warn "Дополнение Tachyon $set для «$name» не скачалось — сервис идёт по остальным спискам" >&2
+		fi
+	done
+	if [ "$id" != custom ]; then
+		f="$(_st_base_dom "$id" "$f5" "$f6")"
+		if [ -n "$f" ]; then
+			[ -z "$srs$dom$pfx" ] && _rb_warn "Списки «$name» не скачались — пока беру только основные домены сервиса ($(wc -l < "$f" | tr -d ' ')), полный список панель попробует докачать в фоне" >&2
+			dom="$dom $f"
 		fi
 	fi
 	[ "$id" = custom ] && [ -s "$ST_CUSTOM.lst" ] && dom="$ST_CUSTOM.lst"
 	[ "$id" = custom ] && [ -s "$ST_CUSTOM.pfx" ] && pfx="$ST_CUSTOM.pfx"
-	[ -n "$srs$dom$pfx" ] || return 0
+	[ -n "$srs$dom$pfx" ] || { [ -n "$(echo $sets)" ] && [ "$id" != custom ] && _rb_warn "Список «$name» не скачался или не раскрылся — пропускаем его в этот раз" >&2; return 0; }
 	printf 'svc\t%s\t%s\n' "$id" "$name"
 	for f in $srs; do printf 'srs\t%s\n' "$f"; done
 	for f in $dom; do printf 'dom\t%s\n' "$f"; done
 	for f in $pfx; do printf 'pfx\t%s\n' "$f"; done
 }
+
+_st_tch_plus_of() { [ -f "$ST_TCH_OFF" ] || awk -F'|' -v k="$1" '$1 == k { gsub(/,/, " ", $2); print $2; exit }' "$ST_TCH_PLUS" 2>/dev/null; }
 
 _st_tgws_warp() {
 	local i c
@@ -19464,7 +20786,7 @@ _st_tgws_warp() {
 	while read -r i c; do
 		[ -n "$i" ] || continue
 		_st_warp_is_ru "$c" || echo "$i" >> "$ST_TGWS_WARP.tmp"
-	done < "$ST_WARP_UP" 2>/dev/null
+	done 2>/dev/null < "$ST_WARP_UP"
 	mv "$ST_TGWS_WARP.tmp" "$ST_TGWS_WARP"
 }
 
@@ -19518,7 +20840,7 @@ _st_via_dev() {
 	return 0
 }
 
-_st_via_ok() { [ -n "$1" ] && [ -d "/sys/class/net/$1" ]; }
+_st_via_ok() { [ -n "$1" ] && [ -d "/sys/class/net/$1" ] && ! _stl_redir_dev "$1"; }
 
 _st_via_pick() {
 	local d i
@@ -20122,7 +21444,7 @@ _st_warp_scan1() {
 	if [ -n "$pool" ]; then
 		for f in "$r" "$r.same" "$r.notls" "$r.nc"; do
 			[ -s "$f" ] || continue
-			case "$f" in *.ru) cls=1 ;; *.notls) cls=2 ;; *.nc) cls=3 ;; *) cls=0 ;; esac
+			case "$f" in *.notls) cls=2 ;; *.nc) cls=3 ;; *) cls=0 ;; esac
 			awk -v c="$cls" '{ printf "%d %s %s %s\n", c * 100000000 + $1 * 100000 + $2, $3, $4, $5 }' "$f"
 		done | sort -n | awk '{ print $2, $3, $4, $1 }' > "$pool"
 	fi
@@ -20130,7 +21452,7 @@ _st_warp_scan1() {
 		echo "   ответили только российские узлы ($(awk '{ print $5 }' "$r.ru" | sort -u | tr '\n' ' ' | sed 's/ $//')) — их не берём: заблокированное через них не открывается" >&2
 	for f in "$r" "$r.same" "$r.notls" "$r.nc"; do
 		[ -s "$f" ] || continue
-		case "$f" in *.ru) cls=1 ;; *.notls) cls=2 ;; *.nc) cls=3 ;; *) cls=0 ;; esac
+		case "$f" in *.notls) cls=2 ;; *.nc) cls=3 ;; *) cls=0 ;; esac
 		pick=$(awk -v c="$cls" '{ k = c * 100000000 + $1 * 100000 + $2; printf "%d\t%s %s %s %d\n", k, $3, $4, $5, k }' "$f" |
 			sort -n | head -n1 | cut -f2)
 		case "$f" in
@@ -20281,10 +21603,21 @@ _st_wifs_auto() { echo zmwarp; local n=2; while [ "$n" -le "$ST_WARP_MAX" ]; do 
 
 _st_work_main() { [ -n "$(_st_sel)" ] || _st_devs_all; }
 
+_stl_arch_fix() {
+	local a p
+	[ "$PKG" = apk ] || return 0
+	[ -s /etc/apk/arch ] && return 0
+	a="$(_rb_arch)"; p="$(apk --print-arch 2>/dev/null)"
+	[ -n "$a" ] && [ "$a" = "$p" ] || return 0
+	printf '%s' "$a" | grep -qE '^[A-Za-z0-9_-]+$' || return 0
+	mkdir -p /etc/apk && printf '%s\n' "$a" > /etc/apk/arch && _stl_say "Записали архитектуру роутера $a в /etc/apk/arch — по ней ядро steer выбирает сборки плагинов"
+	return 0
+}
+
 _stl_check() {
 	local r c
 	if stl_running && [ -S "$STL_SOCK" ]; then
-		r="$(_stl_t 150 steer ctl check < "$1" 2>/dev/null)"
+		r="$(_stl_t 150 steer ctl check 2>/dev/null < "$1")"
 		c="$(printf '%s' "$r" | jsonfilter -e '@.code' 2>/dev/null)"
 		case "$c" in
 			0) return 0 ;;
@@ -20317,6 +21650,42 @@ _stl_fetch() {
 		rm -f "$out"
 	done
 	return 1
+}
+
+_stl_fo_apply() {
+	local l own oo b mem k g gl="" n=0 d sed_lid sed_oo
+	[ -n "$fob" ] || return 0
+	for own in $(printf '%s\n' $fob | cut -d'^' -f1 | awk '!s[$0]++'); do
+		oo="$(printf '%s\n' $fob | awk -F'^' -v k="$own" '$1 == k { print $2; exit }')"
+		mem="\"$oo\""
+		for b in $(printf '%s\n' $fob | awk -F'^' -v k="$own" '$1 == k { print $3 }'); do
+			case ",$mem," in *",\"$b\","*) ;; *) mem="$mem,\"$b\"" ;; esac
+		done
+		case "$mem" in *,*) ;; *) continue ;; esac
+		k="$(printf '%s\n' $gl | awk -F'=' -v m="$mem" '$2 == m { print $1; exit }')"
+		if [ -z "$k" ]; then
+			n=$((n + 1)); k="zm_fo$n"; gl="$gl${gl:+ }$k=$mem"
+			outs="$outs${outs:+,}\"$k\":{\"kind\":\"group\",\"pick\":\"order\",\"members\":[$mem],\"ipv6\":\"off\",\"on_fail\":\"$(_st_onfail)\"}"
+		fi
+		sed_lid="$(printf '%s' "$own" | sed 's/\./\\./g')"; sed_oo="$(printf '%s' "$oo" | sed 's/\./\\./g')"
+		d="f${k#zm_fo}"
+		rules="$(printf '%s' "$rules" | sed -e "s/\(\"to\":\"$sed_lid\",\"out\":\"\)$sed_oo\(\"[^}]*\"dns\":\"\)zm_tun[A-Za-z0-9]*\"/\1$k\2zm_tun$d\"/" -e "s/\"to\":\"$sed_lid\",\"out\":\"$sed_oo\"/\"to\":\"$sed_lid\",\"out\":\"$k\"/")"
+		crules="$(printf '%s' "$crules" | sed -e "s/\(\"to\":\"$sed_lid\",\"out\":\"\)$sed_oo\(\"[^}]*\"dns\":\"\)zm_tun[A-Za-z0-9]*\"/\1$k\2zm_tun$d\"/" -e "s/\"to\":\"$sed_lid\",\"out\":\"$sed_oo\"/\"to\":\"$sed_lid\",\"out\":\"$k\"/")"
+		case "$rules$crules" in *"\"dns\":\"zm_tun$d\""*) _stl_dns_need "$d" "$k" ;; esac
+	done
+}
+
+_stl_fo_take() {
+	local x e o IFS=,
+	FO_OWNER=""
+	for x in $1; do
+		case "$taken" in *"|$x@"*) ;; *) continue ;; esac
+		e="${taken#*|$x@}"; e="${e%%|*}"
+		o="${e#*^}"
+		[ "${o#*^}" = "$out" ] && continue
+		FO_OWNER="${e%%^*}"
+		case " $fob " in *" $o^$out "*) ;; *) fob="$fob${fob:+ }$o^$out" ;; esac
+	done
 }
 
 _stl_ident() {
@@ -20379,8 +21748,48 @@ _stl_overs() {
 	printf '%s' "$o"
 }
 
+_stl_parch() {
+	local a
+	a="$(head -n1 "$ST_DIR/core.arch" 2>/dev/null)"
+	[ -n "$a" ] || a="$(_rb_arch)"
+	printf '%s' "$a"
+}
+
+_stl_plug_add() {
+	local m
+	_stl_arch_fix
+	for m; do
+		_stl_mod_x "$m" && continue
+		_stl_say "Ставим плагин ядра steer: $m"
+		_stl_plug_run ensure "$m" >&2 || _stl_mod_x "$m" || _stl_plug_run install "$m" >&2
+		_stl_mod_x "$m" || { echo "ОШИБКА: плагин $m ядра steer не установился"; return 1; }
+	done
+	return 0
+}
+
+_stl_plug_run() { ( STEER_PLUGIN_ARCH="$(_stl_parch)"; export STEER_PLUGIN_ARCH; _stl_t 600 steer plugin "$@" ); }
+
 _stl_rule() {
 	[ -n "$lid" ] && [ -n "$srs$dom$pfx" ] && [ -n "$out" ] || return 0
+	local x w IFS0="$IFS" FO_OWNER=""
+	if [ -n "$taken" ]; then
+		x="$(printf '%s' "$srs,$dom,$pfx" | tr ',' '\n' | grep -m1 .)"
+		[ -z "$sfm$sfa" ] && [ -z "$ZM_STL_NOFO" ] && _stl_fo_take "$srs,$dom,$pfx"
+		srs="$(_stl_untaken "$srs")"; dom="$(_stl_untaken "$dom")"; pfx="$(_stl_untaken "$pfx")"
+		if [ -z "$srs$dom$pfx" ]; then
+			w="${taken#*|$x@}"; w="${w%%|*}"; w="${w%%^*}"
+			if [ -z "$STL_DUP_SAID" ] && [ -n "$svn" ] && [ -n "$w" ]; then
+				if [ -n "$FO_OWNER" ]; then echo "   · «$svn» в секции «$(_st_sec_name "${sec:-main}")» — запасной путь: сервис идёт через секцию «$(_st_sec_name "$w")», а если её подключение упадёт — через эту" >&2
+				else echo "   · «$svn» в секции «$(_st_sec_name "${sec:-main}")» не действует — этот сервис уже идёт через секцию «$(_st_sec_name "$w")», она выше по порядку" >&2; fi
+			fi
+			return 0
+		fi
+	fi
+	if [ -z "$sfm$sfa" ]; then
+		IFS=,
+		for x in $srs $dom $pfx; do [ -n "$x" ] && taken="${taken:-|}$x@${sec:-main}^$lid^$out|"; done
+		IFS="$IFS0"
+	fi
 	body=""
 	[ -n "$srs" ] && body="\"srs\":[$srs]"
 	[ -n "$dom" ] && body="$body${body:+,}\"domains_file\":[$dom]"
@@ -20388,6 +21797,7 @@ _stl_rule() {
 	lists="$lists${lists:+,}$(_stl_js "$lid"):{$body}"
 	x=""
 	[ "$(_st_realip)" = on ] && x=',"resolve":"realip"'
+	x="$x$(_stl_tq)"
 	[ -z "$ZM_STL_NODNS" ] && [ "$(_st_dnsmode)" = tun ] && { x="$x,\"dns\":\"zm_tun$dnt\""; _stl_dns_need "$dnt" "$out"; }
 	local r="" top=""
 	[ -n "$cu" ] && top=1
@@ -20413,7 +21823,7 @@ _stl_sec_vpn_outs() {
 _stl_spec() {
 	local tab k a b c d m lists="" rules="" outs="" lan="" lid="" lab="" srs="" dom="" pfx=""
 	local clients="" drules="" cid dout byp="" xd="" xp="" xc="" xr="" x="" dnsj="" dnsn="" dnt=""
-	local body wp=latency main="" mout="" out="" sec="" sfm="" sfa="" so="" t u dvs="" STL_CID="" mf="$1" mif="" cu="" crules=""
+	local body wp=latency main="" mout="" out="" sec="" sfm="" sfa="" so="" t u dvs="" STL_CID="" mf="$1" mif="" cu="" crules="" taken="" svn="" fob=""
 	tab="$(printf '\t')"
 	mkdir -p "$STL_TMP"
 	while IFS="$tab" read -r k a b c; do
@@ -20459,7 +21869,7 @@ _stl_spec() {
 				outs="$t${outs:+,}$outs" ;;
 			vpn) [ "$main" = vpn ] && { t="$(_stl_vpn_outs "$mf" "$a")"; [ -n "$t" ] && outs="$t${outs:+,}$outs"; } ;;
 			sec)
-				_stl_rule; lid=""; srs=""; dom=""; pfx=""; cu=""
+				_stl_rule; lid=""; srs=""; dom=""; pfx=""; cu=""; svn=""
 				sec="$a"; out=""; dnt="${a#s}"; sfm=""; sfa=""
 				if [ "$a" = main ]; then out="$mout"; sec=""; else
 					for t in $so; do [ "${t%%:*}" = "$a" ] && out="${t#*:}"; done
@@ -20472,7 +21882,7 @@ _stl_spec() {
 					case "$x" in *:*) sfm="$sfm${sfm:+,}\"$STL_CID\"" ;; *) sfa="$sfa${sfa:+,}\"$STL_CID\"" ;; esac
 				done < "$mf"
 				x="" ;;
-			svc) _stl_rule; lid="$(_stl_ident "${sec:+${sec}_}$a")"; lab="$(_stl_label "$b${sec:+ · ${sec#s}}" "${sec:+${sec}_}$a")"; srs=""; dom=""; pfx=""; cu=""; [ "$a" = custom ] && cu=1 ;;
+			svc) _stl_rule; lid="$(_stl_ident "${sec:+${sec}_}$a")"; lab="$(_stl_label "$b${sec:+ · ${sec#s}}" "${sec:+${sec}_}$a")"; svn="$b"; srs=""; dom=""; pfx=""; cu=""; [ "$a" = custom ] && cu=1 ;;
 			srs) srs="$srs${srs:+,}$(_stl_js "$a")" ;;
 			dom) dom="$dom${dom:+,}$(_stl_js "$a")" ;;
 			pfx) pfx="$pfx${pfx:+,}$(_stl_js "$a")" ;;
@@ -20485,7 +21895,7 @@ _stl_spec() {
 				dvs="$dvs $b"
 				_stl_client "$b"
 				[ "$a" = byp ] || xc="$xc $STL_CID"
-				drules="$drules${drules:+,}{\"name\":$(_stl_js "$(_stl_ident "${a}_$b")"),\"for\":[\"$STL_CID\"],\"to\":\"all\",\"out\":\"$dout\",\"scope\":\"device\"}" ;;
+				drules="$drules${drules:+,}{\"name\":$(_stl_js "$(_stl_ident "${a}_$b")"),\"for\":[\"$STL_CID\"],\"to\":\"all\",\"out\":\"$dout\",\"scope\":\"device\"$([ "$a" = byp ] || _stl_tq)}" ;;
 			sdev)
 				[ "$b" = all ] || continue
 				dout=""; for t in $so; do [ "${t%%:*}" = "$a" ] && dout="${t#*:}"; done
@@ -20494,10 +21904,11 @@ _stl_spec() {
 				dvs="$dvs $c"
 				_stl_client "$c"
 				xc="$xc $STL_CID"
-				drules="$drules${drules:+,}{\"name\":$(_stl_js "$(_stl_ident "${a}_all_$c")"),\"for\":[\"$STL_CID\"],\"to\":\"all\",\"out\":\"$dout\",\"scope\":\"device\"}" ;;
+				drules="$drules${drules:+,}{\"name\":$(_stl_js "$(_stl_ident "${a}_all_$c")"),\"for\":[\"$STL_CID\"],\"to\":\"all\",\"out\":\"$dout\",\"scope\":\"device\"$(_stl_tq)}" ;;
 		esac
 	done < "$mf"
 	_stl_rule
+	_stl_fo_apply
 	grep -q "^over$tab" "$mf" && outs="$(_stl_overs "$outs" "$mf")"
 	[ -n "$crules" ] && rules="$crules${rules:+,}$rules"
 	[ -n "$rules$drules" ] || return 1
@@ -20529,19 +21940,27 @@ _stl_spec() {
 	fi
 	t="$(_st_cttl)"
 	if [ "$t" != 0 ] && [ -z "$ZM_STL_NOCTTL" ]; then
-		if [ -n "$dnsj" ]; then dnsj="\"dns\":{\"cache_ttl\":{\"min\":$t},${dnsj#\"dns\":\{}"
-		else dnsj="\"dns\":{\"cache_ttl\":{\"min\":$t}},"; fi
+		if [ -n "$dnsj" ]; then dnsj="\"dns\":{\"cache\":2048,\"cache_ttl\":{\"min\":$t},${dnsj#\"dns\":\{}"
+		else dnsj="\"dns\":{\"cache\":2048,\"cache_ttl\":{\"min\":$t}},"; fi
 	fi
 	printf '{"version":2,%s"lan":{"devices":[%s]},%s"lists":{%s},"outputs":{%s},"rules":[%s]}\n' "$dnsj" "${lan:-\"br-lan\"}" "$clients" "$lists" "$outs" "$rules"
+	STL_DUP_SAID=1
 }
 
 _stl_tun_json() {
 	local o m n
 	o="$(_stl_js "$1"):{\"kind\":\"tunnel\",\"protocol\":\"$2\",\"device\":\"$6\",\"subscription\":$(_stl_js "$3")"
+	case "$2" in vless|trojan|vmess|http) _stl_insec "$3" && o="$o,\"insecure\":true" ;; esac
 	n="$(printf '%s' "$4" | tr -cd '0-9,' | sed 's/,,*/,/g; s/^,//; s/,$//')"
 	[ "$4" != - ] && [ -n "$n" ] && o="$o,\"nodes\":[$n]"
 	m=""; [ "$5" = - ] || m="$(printf '%s' "$5" | tr '|,' '\n\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep . | awk '!s[tolower($0)]++' | while IFS= read -r n; do printf ',%s' "$(_stl_js "$n")"; done | sed 's/^,//')"
 	[ -n "$m" ] && o="$o,\"exclude_name\":[$m]"
+	printf '%s' "$o"
+}
+
+_stl_untaken() {
+	local o="" x IFS=,
+	for x in $1; do case "$taken" in *"|$x@"*) ;; *) o="$o${o:+,}$x" ;; esac; done
 	printf '%s' "$o"
 }
 
@@ -20810,8 +22229,9 @@ mixomo_warp_status() {
 }
 
 stl_apply() {
-	local new="$STL_SPEC.zm.$$" prev="$STL_TMP/spec.prev" err w=0 i=0 ck=0 fx="" again=""
-	local ZM_STL_NOV6T="" ZM_STL_NOCTTL="" ZM_STL_NODNS=""
+	local new="$STL_SPEC.zm.$$" prev="$STL_TMP/spec.prev" err w=0 i=0 ck=0 fx="" again="" plg="" x
+	local ZM_STL_NOV6T="" ZM_STL_NOCTTL="" ZM_STL_NODNS="" ZM_STL_NOFO="" ZM_STL_NOTQ=""
+	STL_DUP_SAID=""
 	mkdir -p "$STL_ETC" "$STL_TMP"
 	rm -f "$ST_DIR/nofam"
 	_stl_spec "$1" > "$new" || { rm -f "$new"; echo "ОШИБКА: в настройке нет ни одного списка"; return 1; }
@@ -20819,10 +22239,20 @@ stl_apply() {
 	err="$(_stl_check "$new")" && ck=1
 	while [ "$ck" = 0 ] && [ "$i" -lt 8 ]; do
 		i=$((i + 1))
-		if [ -z "$ZM_STL_NOV6T" ] && grep -q '"kind":"tunnel"' "$new" && printf '%s' "$err" | grep -qi 'ipv6'; then ZM_STL_NOV6T=1
+		x=""; [ -z "$plg" ] && stl_v2 && ! _st_ver_lt "$(stl_version)" 2.1.0 &&
+			x="$(printf '%s\n' "$err" | sed -n 's/.*нужен плагин \([a-z0-9_-]*\).*/\1/p; s/.*требует пакет steer-\([a-z0-9_-]*\).*/\1/p' | grep -E '^(vless|hysteria2|proxy)$' | awk '!s[$0]++' | tr '\n' ' ')"
+		if [ -n "$(echo $x)" ]; then
+			plg=1
+			_stl_say "Ядро steer не нашло плагины протоколов: $(echo $x | sed 's/ /, /g') — ставим"
+			_stl_plug_add $x >&2
+		elif [ -z "$ZM_STL_NOV6T" ] && grep -q '"kind":"tunnel"' "$new" && printf '%s' "$err" | grep -qi 'ipv6'; then ZM_STL_NOV6T=1
 		elif [ -z "$ZM_STL_NOCTTL" ] && grep -q '"cache_ttl"' "$new" && printf '%s' "$err" | grep -q 'cache_ttl'; then ZM_STL_NOCTTL=1; fx="$fx ct"
 		elif [ -z "$ZM_STL_NODNS" ] && grep -q '"zm_tun' "$new" && printf '%s' "$err" | grep -q 'zm_tun'; then ZM_STL_NODNS=1; fx="$fx dns"
+		elif [ -z "$ZM_STL_NOTQ" ] && grep -qE '"(torrent|quic)":' "$new" && printf '%s' "$err" | grep -qiE 'torrent|quic'; then ZM_STL_NOTQ=1; fx="$fx tq"
+		elif [ -z "$ZM_STL_NOFO" ] && grep -q '"zm_fo[0-9]' "$new" && printf '%s' "$err" | grep -qE 'zm_fo|group|members|групп'; then ZM_STL_NOFO=1; fx="$fx fo"
 		elif [ -z "$again" ]; then again=1; sleep 1; err="$(_stl_check "$new")" && ck=1; continue
+		elif [ -z "$ZM_STL_NOTQ" ] && grep -qE '"(torrent|quic)":' "$new"; then ZM_STL_NOTQ=1; fx="$fx tq"
+		elif [ -z "$ZM_STL_NOFO" ] && grep -q '"zm_fo[0-9]' "$new"; then ZM_STL_NOFO=1; fx="$fx fo"
 		elif [ -z "$ZM_STL_NOCTTL" ] && grep -q '"cache_ttl"' "$new"; then ZM_STL_NOCTTL=1; fx="$fx ct"
 		elif [ -z "$ZM_STL_NODNS" ] && grep -q '"zm_tun' "$new"; then ZM_STL_NODNS=1; fx="$fx dns"
 		else break; fi
@@ -20837,6 +22267,8 @@ stl_apply() {
 	fi
 	case "$fx" in *ct*) _stl_say "Ядро steer не знает настройку «Помнить адреса сервисов» — правила применены без неё. $(_stl_upd_hint)" ;; esac
 	case "$fx" in *dns*) _stl_say "Ядро steer не умеет DNS через туннель — правила применены без него. $(_stl_upd_hint)" ;; esac
+	case "$fx" in *tq*) _stl_say "Ядро steer не знает настройки «Торренты» и «QUIC» — правила применены без них. $(_stl_upd_hint 2.1.0)" ;; esac
+	case "$fx" in *fo*) _stl_say "Ядро steer не приняло запасные пути секций — сервис, выбранный в нескольких секциях, идёт только через первую. $(_stl_upd_hint)" ;; esac
 	[ "$(stl_spec_whose)" = none ] && [ -s "$STL_SPEC" ] && [ ! -f "$STL_KEEP" ] && cp -f "$STL_SPEC" "$STL_KEEP"
 	rm -f "$prev"; [ -s "$STL_SPEC" ] && cp -f "$STL_SPEC" "$prev"
 	mv -f "$new" "$STL_SPEC"
@@ -20868,7 +22300,7 @@ stl_diag_lines() {
 }
 
 stl_engine_install() {
-	local ver="$1" arch m p n f mods="" pkgs files="" old="" back="" legacy="" keep="$STL_TMP/spec.keep" was_on="" rc
+	local ver="$1" arch m p n f mods="" pkgs files="" old="" back="" legacy="" keep="$STL_TMP/spec.keep" was_on="" rc p21="" plug="" STL_CORE_ARCH=""
 	shift
 	_stl_ver_ok "$ver" || { echo "ОШИБКА: версия ядра steer $ver — нужна 2.0.0 или новее"; return 1; }
 	arch="$(_rb_arch)"
@@ -20879,8 +22311,14 @@ stl_engine_install() {
 		case " $legacy " in *" steer-extended "*) mods="$mods vless" ;; esac
 	fi
 	mods="$(for m in $mods $(_stl_mods_present); do echo "$m"; done | awk '!s[$0]++' | tr '\n' ' ')"
-	pkgs="steer-core$(for m in $mods; do printf ' steer-%s' "$m"; done)"
-	stl_v2 && _pkg_is_installed steer-extended && pkgs="$pkgs steer-extended"
+	_st_ver_lt "$ver" 2.1.0 || { p21=1; for m in $mods; do [ "$m" = tgws ] || plug="$plug $m"; done; }
+	pkgs="steer-core$([ -n "$p21" ] || for m in $mods; do printf ' steer-%s' "$m"; done)"
+	[ -z "$p21" ] && stl_v2 && _pkg_is_installed steer-extended && pkgs="$pkgs steer-extended"
+	if [ -n "$STL_MODS_ONLY" ] && stl_v2 && [ "$(stl_version)" = "$ver" ] && [ -n "$p21" ]; then
+		STL_NEW=""; STL_PKGS=""
+		_stl_plug_add $plug
+		return
+	fi
 	if [ -n "$STL_MODS_ONLY" ] && stl_v2 && [ "$(stl_version)" = "$ver" ]; then
 		pkgs="$(for p in $pkgs; do _pkg_is_installed "$p" || printf '%s ' "$p"; done)"
 		pkgs="$(echo $pkgs)"
@@ -20901,12 +22339,19 @@ stl_engine_install() {
 			_stl_say "Сборки $p для $arch нет — берём совместимую $pa"
 			_zm_arch_accept "$pa"
 		fi
+		[ "$p" = steer-core ] && STL_CORE_ARCH="$pa"
 		files="$files $f"
 	done
 	stl_enabled && was_on=1
 	case " $pkgs " in *" steer-core "*) _stl_say "Ставим ядро steer $ver: $(echo $pkgs | sed 's/ /, /g')" ;; *) _stl_say "Ставим к ядру steer $ver: $(echo $pkgs | sed 's/ /, /g')" ;; esac
 	$UPDATE >&2
 	[ -s "$STL_SPEC" ] && cp -f "$STL_SPEC" "$keep"
+	[ -n "$p21" ] && _stl_arch_fix
+	local seedspec=""
+	if [ -n "$p21" ] && [ ! -s "$STL_SPEC" ] && [ ! -s "$STL_YAML" ]; then
+		mkdir -p "$STL_ETC"
+		printf '%s\n' "$STL_SEED_SPEC" > "$STL_SPEC" && seedspec=1
+	fi
 	if [ -n "$STL_REINSTALL" ] && [ -z "$legacy" ]; then
 		"$STL_INIT" stop >/dev/null 2>&1
 		if [ "$PKG" = apk ]; then
@@ -20919,6 +22364,7 @@ stl_engine_install() {
 		fi
 	elif [ "$PKG" = apk ]; then
 		for n in $legacy; do if [ "$n" = steer ]; then apk add steer >/dev/null 2>&1; else old="$old !$n"; fi; done
+		[ -n "$p21" ] && old="$old $(awk -F'><' 'NF > 1 && $1 ~ /^steer-(vless|hysteria2|proxy|xsteer|obfs|warpbox|tgws|extended)$/ { print $1 }' /etc/apk/world 2>/dev/null)"
 		$INSTALL $files $old >&2; rc=$?
 		[ "$rc" = 0 ] && for n in $legacy; do apk del "$n" >/dev/null 2>&1; done
 	else
@@ -20947,13 +22393,22 @@ stl_engine_install() {
 	rm -f $files
 	[ -s "$keep" ] && [ ! -s "$STL_SPEC" ] && { mkdir -p "$STL_ETC"; cp -f "$keep" "$STL_SPEC"; }
 	rm -f "$keep"
+	[ -n "$seedspec" ] && [ "$(cat "$STL_SPEC" 2>/dev/null)" = "$STL_SEED_SPEC" ] && rm -f "$STL_SPEC"
+	[ "$rc" = 0 ] && [ -n "$p21" ] && [ -n "$STL_CORE_ARCH" ] && { mkdir -p "$ST_DIR"; echo "$STL_CORE_ARCH" > "$ST_DIR/core.arch"; }
 	if [ "$rc" != 0 ] || ! stl_v2; then
 		[ -n "$legacy" ] && ! stl_present && echo "!! Прежнее ядро steer снято, а новое не встало — нажмите установку ещё раз, когда появится интернет"
 		[ -n "$was_on" ] && stl_present && stl_restart >/dev/null 2>&1
 		echo "ОШИБКА: ядро steer $ver не установилось"
 		return 1
 	fi
+	if [ -n "$p21" ] && [ -z "$seedspec" ] && { [ -s "$STL_SPEC" ] || [ -s "$STL_YAML" ]; }; then
+		_stl_say "Ставим плагины ядра steer по правилам"
+		_stl_plug_run migrate 2>&1 | _zm_pkg_fmt >&2
+	fi
+	[ -n "$plug" ] && { _stl_plug_add $plug || rc=1; }
 	if [ -n "$was_on" ]; then stl_restart >/dev/null 2>&1; else stl_stop; fi
+	[ "$rc" = 0 ] || return 1
+	STL_VER_C=""
 	_stl_say "Ядро steer $(stl_version) установлено$( [ -n "$mods" ] && printf ', модули: %s' "$(echo $mods | sed 's/ /, /g')")"
 	return 0
 }
@@ -20963,8 +22418,8 @@ stl_spec_restore() { if [ -s "$STL_KEEP" ]; then mv -f "$STL_KEEP" "$STL_SPEC"; 
 stl_sub_nodes() {
 	local m
 	{ for m in vless hysteria2 proxy; do
-		[ -x "$STL_SBIN/steer-$m" ] || continue
-		printf '@%s\t' "$m"; _stl_t 30 steer "$m-nodes" "$1" 2>/dev/null | tr '\n\t' '  '; echo
+		_stl_mod_x "$m" || continue
+		printf '@%s\t' "$m"; _stl_t 30 steer "$m-nodes" "$1" $(_stl_insec_arg "$1") 2>/dev/null | tr '\n\t' '  '; echo
 	done; } | LC_ALL=C awk -v MAP="$1.map" -v META="$3" '
 function junesc(s,    o, i, n, c, d) {
 	o = ""; n = length(s)
@@ -21027,7 +22482,7 @@ BEGIN {
 END { if (META != "") printf "usable=%d\nskipped=%d\nreasons=[%s]\n", usable, skipped, reasons > META }
 ' | sort -n -k1,1 | LC_ALL=C awk -F'\t' 'BEGIN { OFS = "\t" }
 		{ k = $5; c = ++D[k]; if (c > 1) k = k " (" c ")"; while (k in U) { c++; k = $5 " (" c ")" } U[k] = 1
-		  print NR - 1, $2, $3, $4, k, $6, $7, $8 }' > "$2"
+		  print NR - 1, $2, $3, $4, k, $6, $7, $8, $1 }' > "$2"
 }
 
 stl_sub_norm() {
@@ -21081,16 +22536,21 @@ function hostport(l, f,    r, j, t) {
 	r = l; sub(/^[A-Za-z0-9]+:\/\//, "", r)
 	if (f == "vmess") { sub(/#.*/, "", r); j = b64d(r); H = jfield(j, "add"); P = jfield(j, "port"); return }
 	if (f == "shadowsocks") { t = r; sub(/[?#].*$/, "", t); if (index(t, "@") == 0) { j = b64d(t); if (index(j, "@")) { sub(/^.*@/, "", j); r = j } } }
-	sub(/[\/?#].*$/, "", r)
+	sub(/#.*$/, "", r)
+	t = index(r, "@"); j = index(t ? substr(r, t + 1) : r, "?")
+	if (j) r = substr(r, 1, t + j - 1)
 	sub(/^.*@/, "", r)
+	sub(/[\/?].*$/, "", r)
 	if (r ~ /^\[/) { H = r; sub(/\].*$/, "", H); sub(/^\[/, "", H); P = r; sub(/^.*\]:?/, "", P); return }
 	H = r; sub(/:.*$/, "", H); P = r; if (index(P, ":")) sub(/^[^:]*:/, "", P); else P = ""
 }
 { buf = buf $0 "\n" }
 END {
 	gsub(/\r/, "", buf)
+	if (substr(buf, 1, 3) == "\357\273\277") buf = substr(buf, 4)
 	t = buf; sub(/^[ \t\n]+/, "", t)
 	if (t ~ /^[\{\[]/) { printf "%s", buf > OUT; printf "" > MAP; exit 0 }
+	if (("\n" buf) ~ /\nproxies:[ \t]*(\[|\n)/) { printf "%s", buf > OUT; printf "" > MAP; exit 0 }
 	if (!index(buf, "://")) { d = b64d(buf); if (index(d, "://")) buf = d }
 	gsub(/\r/, "", buf)
 	n = split(buf, L, "\n"); ln = 0
@@ -21144,7 +22604,7 @@ ZM_INSTALLER_EOF
 
 mkdir -p /opt/zapret-manager-luci
 cat > /opt/zapret-manager-luci/pages.b64 << 'ZM_INSTALLER_EOF'
-H4sIAAAAAAAC/+y9+28c15UgnF+lv6IITFzdw2bzIdlJmmH4KbLs+JvY1lpKvFiaEZrdRbLNZlenq5ukLBGQ7STOwJl47SSYQTaexBPszgcEC9CKFdN6Av4LyH8hf8l3XvdZt/pBSZ4Mht6diF116z7OPffc8z67u7uz7UGjNZP16/1WY7aXZOmg10iy2Z1Wsjv7Vr3bS/oz2/VOfSPpza6nva20W30z+9ok/83Bf8+dP0//wn/ev+cXvjE/r57x84W5Z5997mvR3Ne+gv8GsPAeDP+1/5r/xYMsibJ+r9Xox4tn417y40Grl0S4+fbvXrdh/+ym7bb920WTaiPd3k47UT2L3tqGZjv1XoTolSxBN9Vm0mjXe0npRrr2ZtLo12L5aga+6tb7cWU76W+mzVqMnwyyuJLsdbHdjf39MvdVb/RbaWeyzvibuNKt9+rbWW0lxgZpJ+lAmzjtJr06vV/Nj9bYTBpbP+g2Yf7ZZGPSl9cG/GlgHRdfffnyq69ceuXqUswHS2D1wquv/cOrl5fM6yWrwfqgQ0uJ2q3OVqmb9vrlGwD7Qa8j3y3Hs42N1sxaq0MHe7be3IY/s6S308JjLR3V4s1+v1ubnY2nd1udZrpbbacNgkF1M836nfp2Mg2NpmmEmze/OfetufJ0PBsv7psZ9NLdUru+lrQrjbTTB1DqmVwqxc3WTly5EQOosgw6emt7BprH+5UVeJd16x3vJfUDr+nfsupwtWyPl23CgJ20mVR2WllrrZ2Ub+Cv6mar2Uw6S1PydJEeZv3r7aTabGXddv36krxajmG0Dmy7u46k00x6r6z/eDcrtTqtfqveLt84GxHadupdGLa/JM8rCKX2dwfZ9aX1ejtLKoNOfafeglm3E3mS9HppbymOK/xJP2nKC9gC6GFpblG65h25QgdDAaVcqQ/6qf8s6Wy0OskPk16GeG+eD1q5Z9I5f8FYuxSG+Fq9uQEnd3tmt97rxPvY20TtZaQ307VXUv6o632x2aLTVYdlz7RbOwk8BcLR6ic0Go11kk9hYGvr1uHG2iyVb+BcWs2l6WkG86JgItGdUrna30w6JfVZqVm+0VovtZpTS0vcvMzNF3Pbuditw1Tgg8X9chUOSGPT9DJOJ/3eQPWhcAm7AvQzi0ByWe80S5oMAQXJMiAp+jyV5MHyW9vVeralfpZrl3vpditLqnhtt3eSEg5X9lebbiE6RzDZKfhTJmkQmaaosHbRYG1w6tCPzIkpainu4LlZiCt69v7wPYJTr0pDlPubQAeiS/i3fqY2S+8mQAgGinyAA0B4nklVILAIAOmn9axfoheVmP6JabfWW516u33d3i/v9IY25myU251Ov5e2hdKZPWq0M5verQ36/ZTOTP96F/FVPdBo3VgDqkwPI6Cr8PnNmzEcYnjfamzFNWua0msOL2BiikLiFOVe7fWX1Bzjo38+Ojh6dPzu8dvH7xwdHr9z/AuYALXBiegJzHTTDLYZzlW5kvXTrtXBv9KnB0cPjh4e3ba6gDvD6aGTbNSlB9gzbxa/P7pzfOvoztHngdlIa02qkOAtTQjAeAyo6W2tMobevHkDkCLp4LFsLsc4LE3kWrq+Dp1bv5GMAqDjo4+O7h7dO/7l8XsyeTXlVgdattuTzjoKbcAYK4mZVkLToz/mdyfi5c1sJUknARY+OjpUjwatZbWUwId6OQNN9p/AaqCr+gz3OAPg3Ej6eOUKjQisFc45zWEpvF/CPeGPCjIl2dLK6iITs9KgyswMtzQ0d4lIV5maV7sDIChxDkafHT2EU6h6qLZxECZv3HMj7SXj9ztomR7xS7u/8GZeQ3zDHf3Xo0+d3Yynuf830xYQV9zMGBivZdos2knvA72LxG0+kYNUdDX41FKtzGKQS0+G+I9B+E9M4AmIvwfyhCBEMsVwh58KrveAcj2Axx9o2AIFJh6rbrMp4aOgBI1YI/+1tXa9s0WUr03sJ/aW9GLaTDiUd49vHb9Pc3jlhf/2+pWF2OFwFP+BB0Vzo81F2vGlpnVWKoOlhnNc3oTXwJ3R32sIEosvuXlTQ+rmzTer3c16hvgd/3iQDJJm7DzrDTqdVmcDGVoie8AaTE01qjvMeiKK26wssCLAcTeSi5utdhM469KUNewzzyBKputRoyq94gBradpOgN9E7oa4zJJ+XYlhgw5gZx4S9bpz/A6emYcOMaPtisu1EWwrknkA+fHb8vnD4w9wl4/uRPDPHTy++Pj43aNH2G9cpsOrufFqP9nrX2SpZEkvQm4TZxGlhrlkYHZygxx/CHOswYPj9/WlwtMee0ZqPs5U7ME+svpm2lDL32GL1AXIRTzzNcKAKb21N2/6i5uyFkebjVIY3ZQGIZ55xt5QOnrlRWmYdovaETXlZsIUDG8Jg69wM+pVvllFGn6pbpOLtfKNNXeJzNlFjiDlwVHwGZgyhH4kXIuLZIta4vI+HrSGf6fHZjrpfB17O32A7KF3ufF9QgzjopLTxurE3GN2F2ob7TnZsB9UWV8DW59uxc88M+qq1R2quVWQQgxawZ6GXK2mH+4l93XJmuSoSd28WVKzGD5q2Ywr3VemLHygPsqL8srDK56o9xB6o0vRP2bWcug9UtVFvA2qm3D7LZFGp1ElnQ72YURkZ6tDvSw7VxrQkTtH94NX2l9v/Z+4ZvXA8hJ8/jHhLmDRATRGTIIr8dF4t6Tqb4q3adnmUXSrCHr5x+MPibQ5PcNk70EDGLAa14bsKVGVIVtJ75d9TpfGP34/ggd36XDA8o5/gY9wGjyBt4HmHg4fHPEE8GkYGsHQv3YpdgBaR3eqSJRDwH5IQEGyf4cAQuB+QC0OkXrjfPP9fVEl4oLsAF3Y2dINvsNruAuPaOsOjn/GO3AbesB7R8Y5jCtCYoONAUSPYKx7AKwP8OaFaRL6VNZh4TRAaBnWZwZn7K5/iYxEH/Bu0O2Hp0lwgP+7Tbt4EFeyQaORJM1wa5QxeR9/TjA5iPcRIqKXck+O4USKMB5nDiRcbssocDcLk1ajkwM4UXqzqnXJeKJE1gFMFR4Kj4VeAbBWWsNSLi9DG2Fob97k/VuRr1aJUteYWouwvwvYuRTUrTbqvaYoVzfPwTsS+QiQBzbygbBepGyDL3hlhGXCdR0AEN6nfYD9j+AHwv0n0NPdSgQ8zTvU9H3+4qfwv5+pLf8UQQqcx6Gcc/gLH945+jz64eVXqtHRJ9LZO/Dsz3j+KgjrR0gIqDH8c3D0BY1wuxIRfcBNuMV7fgi7fp8WJacA5STiEe9in5F7GeIMbxuZuIoqC6D1st64YrOv8urofwIi4+Bag3F0N66EOUzm+DPSklxvo8C1Dax/q1Obwx3RHCRpdlfLtAP5DVSdwBcBFqdcEXReVRJJt97YAqzJJkCHPF1UZPAuPLpPuE8AxU1XMPIE55PBwGG7KjbTgfCwxxm0TjaC5su0FnscSKvbXrgNuk1XbdW0BneW9PtAJycA98eAiG8Tkj88+gJRevjZm+hAELY/Ejr+AFGd9/ABnc0/A7oKfcRrbTQYkANZLdNaWdpURpBFtPNV681mSYTzyjktrgc73e3Vu9gjEqqKQtGKAh6OsH/Wt7u8QFfuxIYX37qSN8TQF5eUNYY2V/9CwyWcrStikqngDg7bW1STojXSM9Tk7C47ORsNMgwBy82JrR+VExpclJYIpuObl3bwA7i87MUUWFjEhjU97QBwHGMLfwl3ofPlye0u4/f3mCYYo8J7IlYYzwzjmVscnPVtNAFbjG+MEevu0zDGhKwx1nRDJhn1yDbLcFcntc1E+8IO6Z1jtVveOpM9nnUmQ+tMXq33ZMw1MucTW2v0949hrNF9TGqr+S59+HQtNrYY9kQsNkLimH4n7aTR9zW5rU530J9R74SGklMCCB2fkAbyFnKXUQZX2cxaujcjZw2uuxiut+vw0Rrw7fDP+qDdjler2/Wuwe8dGxvTLuuIb8Q79fYAILezX9lBDDe6/HpnI/mhoctPGtSxAORaPK1AU6W5ICcirLWWgGTtx+9GIAR9hrxFJBom99vpeDmCHXiIQiBi1H1g1T11mHAyD1n+1Pw78KD34eFfSMyw5T+cAsqdVbXBxZPTe702aLWb2dIKUIsbLRAZeXP6rX47ga38HQ17CN2IJgAG+SCu4NVZQwn+npJAQXxBzcAM8cWf2UpbFrsrcK9uZ7X4h9+/dOVKJbraS9+sdyrRlc16M93N0sZWBj9evfgP8O57V69ehv+9nvXxkjJ/LcBnP3jpYhVwSE2WUUhN9g8wHDPnOOxnIM7cwYkPnXAFJSzkEF+/8NplM82jjwCOH5LoFCFEQKg6iGhn7iLcox++DLS6El3oXL/6fVrOIOtfHXQ6QFWj11u95MUBMELwfruTvNWqv/5iJbrYTgfNdXSFoqFwyFeBk0T5zloQHQYL+gc8ywL4wyRZL/OQJDxEiQcigR9q7AsvCiHnL+oq8AAZXCvwAqd2MYX1NPqV6JU6EEO4tfcADNutpDeArYKVwlKvXPme2kOAA67patqD9ZyNVm30ej7JGr0WHeMhjJgrqcwAWa7NL3T3Ftsg/8xsJq2NzX5tvvrsOI4udBt+1xtamLK1JUZ5vFWbhuQgjPTBxx/VFloq3DOL16q/Ikdnsra8VqXdm46rcOLXqgL62OGfmJ+1rr6QXdem6kPsukoLh8pjMc8OtcGyAEEyEYpODxEdHqAcdXwL5KE7IDS9PcLey2o9HI+Mt0NH88j/2HZfw5qMbfN9o/NG5+j/Q3SG/0NR/QuPnB7/I6picnpaprC3kWrwycGTRMLoL1hPYg+f05UUKAS40z8f3UO5lj4+EAXCfdMetQp3SUa9X7UVV7zbvFFju6PRNxcBqpM5pPF3F56Ye0bQoaGORK34mpXjoBw35O4qstz/bbmT8C5Vhh2mwwCGEXp6h2OY94mM8xTcF5T1ZQIx6ul5MhS4sdkTfAzTSw1Ih+0ScfZxZKtJHSPGdVEwZD/vopCuje2kkK6F3BTsp8pR4eZNtPspSxwrbv5m3RKYeJ3EL+FvyCWBZcIn4JggHfnuCZY1dpR7glZwjbvj+MG1Edtut/mPdkkR/s33XuCnygvBsyayXUy4nSnNAV5rbKZZ0kFfC3lWdrlD0zF+W8CDWpPKAjuHsFt0BNqiRtjPyV0zLEWr9znbbEe4Z1huLZZ30wjHlsKWAdeWcdrm3Q98lwi5nZ3OfC+JcRhor1tks6hTxQj7PQ5nkL3eLuAShs2w9Him9rLlHsEAeTyHGg2Cx3OpcSaUJf0L/X6vBYwKMIKWOqkScI8AxHzBESeGTNeZ76SjFEgvhct6LKermzcRn8gnPLuWc9UQha5nhAPUGduha3wfGyZ8hukqF7jWmBbksQWzZPEw32VRD5P44RSMIbrywgEew1NnGsah7pfjGgmt9EOcDEJzgdOqrRYjzuwoL6vC9fzat9UHZh4ZIV9rgaKxZGNP2MWfBwEBF7VKZFBRQHhcT6Ti9Z7YQWnc+Y1DQcfbjUIfJjOVidD0sXyc9oePd1Kfs6/cfWpCb6av3N1qX0EEhKurAOIlFLIcFyexfCyX8I34QeGfOVcmJZ1pZyahxI7YZnyjnnlmyjhHqdH1R8MuE/hS2pvvDHlAewNCLucPhXqMe/DiL8jOoxdRkZBDw+MFo7vnnzh/ucDQ7/Gj6Pjn1qD3A9oT66oPooi/fx9EqHF5RCrtO0Q37gMtiPCcwrTJ4YqUML9AZP8wj0CHaDypxYVj5vAF+v7jGJASEw+7ESGdCICOD9dT88QTDVLNWKEJDXF7tOqRpZJ6s3lpB8b9fivrY+xFKWaBBA6XUZL4YpGlLQoIPcS9oHNItd7tJp1m6bFc79T2PCAjrHwqG2S73fEGsnseaV+Pf5rzDOJ7kB2PCGK3I021PndMRYieQAfFJU9MScb7j/3pDp0J4OV5SI5JD+me+hxtUjhJvpUf+hymdraTzRI/Gnno21IrWnovowHpKbjiVYyWAT3EYJDHccf7Cr3xFDgUHE8CgB3lI2cJKgKF8HacZBBLDrd0+PYwtjk9Vt5Hk3rroYyZd9gbZ0PVOa84SolVmp9vCnvCDoA8u0IfwN/BJ0C34f/exV2vRCHbM/m/TuL+NwZIJgxtw2gFILsYrlA+UaCb0v2P73V4NhrH7xD3ocjvUL7HzCZVuCGQZINk007rTdt48NZ2tdXBtB4Xs6xU9hzbFtGszV6L5hu0D6n4es7AUdZ2AMu/kZpZtgY76YR6t18BjGy2kyv1neRCt9u+XusMAM3NQ/v3awmsjx6cxbvohPlfdifK/8Neul9B/p/z3zjN/3Oa/+e/Tv4fCRo5zf9zmv/nNP/Paf6f0/w/p/l/TvP/nOb/Oc3/c5r/5zT/z2n+n9P8P6f5f07z/5zm/znN/3Oa/+c0/89p/p/T/D+n+X9O8/+c5v85zf9zmv/nNP/Paf6f0/w/p/l/TvP/nOb/Oc3/c5r/5zT/z2n+n9P8P6f5f07z/5zm/znN/3Oa/+c0/89p/p/T/D+n+X9O8/+c5v85zf9zmv/nNP/Paf6f0/w/p/l/TvP/nOb/Oc3/c5r/5zT/z2n+n9P8P6f5f07z/5zm/znN/3Oa/+c0/89p/p+i/D/9jS4azSdMADQ0/8/8N74xf/5ZL//P/Nzc+dP8P39D+X9GJ/i5FC1FlrGsvluObihcN+cLnpEfGTS+0OvVr1cBn/op6uKrWbvVSKrAybVLQFAG28CuAZsQtaBpvdpOOhv9zWgmml+EcxaVWtF3lqL56JlnopIo8usrrdUI2PEoxtV0NuLo5s0o964z2F4DilQuy7NoJbpCzUv4uxytLurzWd9Fzq59vURnLoIDGu3D/y+XJF/OJTh0tPIfXnjtpQuvXL2CvZ09cyNqNWtRvN2nlcWViF1fovjFNCq9fPUyPi3DY4zyqkXz58+fq0Rb0CO04C+ACuheyI3oWasTcih6Vn++MPfNOf05NXY+Rx8e6+PX4GdgDguhOZxdldVd+MHVV6+9elktbyWK0WpRibRVJ45WKwDGeHMen84Dr6mfLOCTBfvJOXxyzn7yHD55zn4yT5/Ny3d6IldfvHblpauXaB5RDHSrupGmG+0EkRE/uF6v9gb4x86WeoSNtluNXpql6337IW5sYj9oaF8meorOPjLm86++fO01RO7ZH5VW6jNvzc18a1X9MbP69+pRefmNankaf4Xf/t2s7vGly7rDhWdX5maeXb25AP+cX32jeXP+jSb878o8fLP8RrNceqM6sk35xrl97N341fc3vpfslTI4bGfPUPT6oA/DxbDW1uLZM8Db4flZiubgKEXfjjI5XPBrerpMjafhKMdzcTQNL4FJ6l1Mm8kFuKDLVYxloeMy/1y5zEe2NLMAJ+GMHBv43HXy728g+1faotlswbDSwRaeT1I8qk+31CmHo33uPJ5tgFCzeTNJyrNV1EhjJ8vQjIddqECrclSLttwBkS35LoiEWyX8qxKxA66CxY9734enMA18qUyEpdkf9Tdqb8y+MTsL+ICJsbLa7Gy/up3M0gT5w++me/Cd4j+AkikOJEIWpL8x8+MeMs+IUsIXR7Hkn6pRzilyXqbO0FbSgc5YEa4hMKRvnO4Mul7hAceDeIbWBfAY9RHbA/ArgUQNPllBdvfMmVHfYsouNd7Ixrh2agyXQjVLGrAo2gKgqjTYGcu5w+ljlEtLpJw83IukkXavX00vtlvdtRT4Ph4LKDTOAWWMu6TZUBFoB+xyM+5EzI72sVVMNBTbHP2eAtsOUBwlXva/vTZDQ32GzcgCk+yBzIT6LGhOOxxcQrJDSAn/KWyYoj8W6Rmhm5vEDFpwy2U4N7CLksiMmic71cagBzxl/ypx4yHDkJ5WxfSDKg7qi+dZ5t7whuUmcAineCrrrV7WJ1u6mjZj8s4GzAs2/Me9KzsbJT5e0g33s7OhP6Avuq3GyGMEbeS00H/wE7hyECW+d/Xl7yMYdjbUK54cq2BodiVoXC5+WzQuyWCMOR+zBk3p1iLa7fukUns3ovgsENdB1HpINsG/3vp1dDVpJxu9+nak1dv3SDtHFgdXhBMdraWEISMbzXafNeonmvQnIGu+D8OiggZVdTDQz1mTENF0DklNd4DC42ek59FoK2ugMDM5MMfvkj7pDqkU9fz2z9IccTiD82V4yMebpn32jB/k5Z9S1AISQiByCCvVyq4kgL4JaQf3+oh1nfpOa6PeT4HXVJ8WPK7u9oAuXlXdnhnahIf3PLsEP3XcSg6aHiVhtXwUtzrrKR+ZQIwS9wnHqr0G8uhFgAKPzc3hf2W3sVmw1b4DxnwTdaP1kZlupg3imKtAdUFUvdRO8FcpxpbA1NRpmv06e3VA+z7pSPGJSyigaTPttK/j8tQ3TISYHKdIp+L11h6QEfttP+3iiznnYTtZ7+efpiCft/rX9Qs99bW0ed1BexKK8cN1aILSuEwYQzTMr/4VegBTew3VOSVgiHF1wkyoGzfdsq7bfu86HCV6pEdP9pLGReUhiUgb011C2xqVkrL6gPsABtmbeC/ZTncSe+Ian+C75WgspEJKHNKG55sTGcFzSwphbU8jRb0aB8gVqulJif4A/veXsKs8F8JcHAy9z8icTYc2qCI5QyqSyMNsT08CT+RjFQuHchxxAv2NK6TyLYEwRz93M/UgcGiU+HWDZK1olU5C5SyySKR2MfOAAXgquL2oQUFBsd1emVtdlIc41PPmxfwqspzQsbxGpdGQm4h0SnIJkSsjEJJs+M1FxMb+BlmS7HV/HOt9unGpze9Avs73Ce+5OyQSOg0qQe/V9VITGHp1G5NQ3GQhV8meZQ3MSKdNqUXNqrznxvoNjK7MmaaNcnqjtsgsAO9AnB22wdVdU50BaEtNYfv0Q0C1ZhPliNybGtKXivL3skdUSuqI3VDsV/ykEnWSXUQF84IemDnSdcXCrWmDvysRJre1n+JvEH6T67X8HElAqURJswWf8OLhVNRwnXhLETKVq1Zr1BREhF/OfogUX7Qd/HrobnCTIZuB87RgKe0DoJQ3OUjK82GAlCYMRxsowHFmVgP8qWCHfz+frBPM8O9rzWRdAU7WTS0FamEAoRpjKHiwwVBMlY3Fdg6c6MMAlOh5Dkb0NAShQaOl38Pf1hTESVW/ld/R1JLcJEoJI+9dJKVHDobSE/jbxU1r6CkzdB5VCZCCp2bb6NtxN011ge1oA3UP9Ms9Bftnhc7hNDEAC0jdjX2e9fO9OnEH+BtXfSX5MekkbEq3kXT+IbmueCkKdYI2sAPRD4Dz/SZpEFETAXSworUchEh8wyv+stG73uUTKg+2s4v0qFwFWQnYhma6/UPkjLLSWu7W9/Ul88+JpmSNNYgv1/ub1fV2mvZK9GePuoNJ/3208OxzZWIVzpwp7MXVt2CfQ5QsZxw1C7PkGlqbyd73AFdKmxa8XNWPP43paB6msmkUQDiTBT0nnkV1HW70i6IFKnXrvSx5CVjLzWo2WMv6vRKAfgF2AOc6aoaAuBfRZFfaAeSRWWZGJSQIWDZqmTey6dkNYkUBKN9P4eRdrGcJ8xtEYqcyi6qmWzV1qPqE/ehk7klyJIUpuzeZ2/+CDhX0+ss/Ae/1kBiqL3TbL+/FFkmfXfnR3My36jPrq6KSysrDJ/BvYicH9i0i/4qfoBEsmvvrrV99i+x4nwKrdxfHjOrwbF0NRqcG9U3mtgdOBohXFa78KnPvImALhszhPjCZTECmB2Ep0wo10pSxEI4db2K/6uXXowX6ag5ua4VCqk/4zIM8XdxGSzClNaQMDsA92EOl5FTPhoPo98jkokwdJQmC5NwCerE8II8Xcmn4jPxV/sJuJodHn1EwKMUcfWCcHw7QPwvmrwBI0wMIogYj2auu99sjUOW3ghtJ8tdb/4dF4n9Cv4PohfpWQjGxyLf/kwyl/PJgCnhudzhGEv6KdeAUu5uTi8yd43eqkRv/ZTzSHFcMeFmEsZ/7kNFLdZbF1J/ui2zY6nDaAiCAD4AHuTVZKwsitx2tBfomqddlXGhFA1/pFCg2+W037VONBtqUqe4r3IbxXkl3AQ/9GUQl9JGCXt/DvtSIIupYwg0C51MSk9D9hJZVjg124u7jWfE54htGwaUOALZgfXPgKAH7Wo4yOi+idi47MHd7WYAVDNkFe/9Y68LaIZM7C2EloNmHxQQR9WNyw8LDIFDGP52uaWcMDFmRL/O09iEPhQXviDzGKkqyDCTplWFb12yiV2TZIrIT7MwEmE/jjAS6y4YOhb4Lh5Ic4GYTeju3UFEHOknoN/yPOS1EqMojd8m5O5FHMpcncIRdQeauuUC76gKFn9v2LTn7ozeaN+Yrz+7/nVxbXaLT013kROSv70TPPfvsuWeHE8l/J+eve+QXDCuZ5wAC+tC+JrnjuYXzwR1CpYP6274EbiFs0FkOQ/fx64hBQ1SY3L8eHH/A4c3KFZG8IekcoMsMuzHKHtse8Uf349DW2lMQEE53Gb0US9LndJykwPk3im5+lzzLvyAswikz0QnsWGOz1cU0/zyCpdvQXlUBFQJ+RKgAH6KqlbWBkcvo1bMLwJYzIlj9WgRPRE7cWvOQzMFluhFhXSAteP0ir/9K2tsm06HqdCRvFhl8y3fHGJtZHClpY8xAsMJ0C+lrHUBcr2bddqtfwj4BqiurxNgbVqduGJpn5xeGY+onRTrwh4wf5BL+KXNn6CqLPbq3q5KQ6oI6PguPE3dtp3y5IMeN74CVtxil2R+tXJj5H2wPrl6rvTFbWfp/pr8+szqtjmR/OJv05Z+ITOHF++U9vQTijXTWHorCJlddDPm/TYt7P7cOZmR/NDOzXELZ8iZV+GEJ+WabHGRn1uHWBYo4A4JMvdUpl5Zu/l15rGn21Q4uxeWVuVXmh/DkfgYH+UPl4QzcLoGcmKx3MS8kh62QxQGZp9ycNd/QEeAqwBecaflaTQttXR2aDF1NHWB65+foUJAPCf+eI+F5fp7O+iN0xRO7zzvHt/CQy1ffARHJfBR9eymiG6qkOgHCt0BisPz+TjR/vhzqU+l7/ceIe8RnS8LMYIMAvUGp+nK9k7Q1YVBAa/aQ0VJC9wpSBNKFlvxnII6LPsKlf0xHiBKqC7ZftdQQDG54ZqsR0D9eo0cHFTGsGShrAWe31d9ESgbjujRNt8D+XsI9103J4E3Jmph+cpKAiCwdbGe1jLmc1IlsSkxeccHwVH5h7/CLnEY4EROAitaANvxu0m6Th6ljx0X/4Ua92+rX2623aGTxh6EX6Xa3nfSdx1YiKbrnnL3EwJ9HWv5RVwpixj6iAALMgcXlXsLq4sILhNaEymTogTfm5WxjuNqagLKdbcT23uBmE+SHg5tebadNetgZbCc9TBI62TbQLxzP2whWhsXb9T0+7Njds0GYykVsTR+Qk2a/U0XHJr7/xLfpSWIQ/YKxvJnDk6eGQcLP+hiCRJ0WXTbuFy915JGzqxPhAx33E2JQL0FL0vAvleeIgwr8odNZVt9JvtsXfDyJF4nyCnl4/FOJnjjUCXEeFabAMxPAq5LUMVQfD2kcKmSq7XrnWov57vlvLVTnn/tmdb46H+vPgO5dRZ2l2ibHTemFtCeOUQpkhpeflgNAI/VUUvgzWrQ1aM1+f/pWjvsbtdlZeriMmY2T3hJJ4DhruAGfwZ7oSdfiTrbM56LdYad3dNUQE86WaT6Op1ZZvpbPJGwxwhuFkZPEOvXD1lS5L0LKLdU3KbpgZig5eR+cO+/K6QwV8l4eARX6yX3RA/jTsCBezhNn73BGOSlNbR2cI4IGkaVlRxPK9KKsxX3kYBSrJufV8X5x9G/dRjWFzVPtbPM5yR+WWIF5J5Ce/PV3vyE2CD4l6aLs7RDMB7CWgb1bb6HIMFb31BYP2SM/Apok3dsU2fmQbNUPIlZ2yX1HCoCCaQAy8F/V9R7I0kvKcHKyNUuv1d1N5l3UDCzxMi6PN5UxJ5Bu8fi/csbPkvY68oSOBoD1jeIzRLNCh6O3iVt4yDpF229ImEdp6QE4sAq138XzhhYom+PE/H2NHAmVV+UhkHUDib8XXx1B5FXvcnPYQoT2ZgCjeePztprGDN+abDSqJ7fcye3rc1pvuOykEVOF93NPomJuY0exrL7XSxXmzA5yxNUCZs8Qa8O7P4S24995bnvR9F4ISfUyB8r6JKCsF4OyXgTKRtpZv1LfTvK3VliJgmLSFJNAlD5gi7QMwR+UbLFCjad4XxlpSu8dtIKpkciBHxutAssh1ucZf6rnCxNRPZpG5N5D9BTfb6k/6uqPqdEkSb8hUZKppxBy5mmCO6je2RtIe+H60RK3QCArI4p6Ll/o3fYKWuhcRyMiEB9I0jUQviscKvZn8vszKqxpObqkgUfKfFdxmeSowXI86WxRz0ah8PztB+TbeEdvlloLsWUYblvtpxsb7aQU5xm8GWZwMRs2fyxMnk7pgbudkqM4bSCfFs7rZTd3z5w0IYn796z8ozBKuonwpoElUXfY4EOWsHP1JJi4TsotBvgEwAUmLopSNNpJvXe1tZ2kg34JuUMLTYezEPlb/4bCNmEwFVeigljE9kzfjHNAnR5vRIjdNe1L0V7XrEnROPpbwXzdTq9wu9XBgzg9LSb/SojllfbCOmfwj4DL965kn82NC5JiudpqwlVrOLl8Bj/tiIwQobngOZW5KBZYOQ/r1fTo9EuWP0CbHl0QDB1RbwA/UYtK1FBlAyQiZmumReeIUdW3KZT/8EjblvHk2LA6A9KK4xanJ7xkTziwXfaExhrebOa+drmG0c8/O1c2+MzagEAcvZKjcyFeCpXhKxKMLcXx88qoz7FcDb0Jqm3Z+YWEe1GdAv5hTtWimrPFfdA/486VuW/FmstclT7bgMYMwiqpsqimJhiGLyr1HWffzY2gaFogYwEFEFSi3CEQDpWyUzgojC/w6cv1Luv3cCKWl3MghUQgewS7vLPd4w7aPZx8EZgFxXYj9SgCqWLGEXxIqWh4rAkYNZ89+0/DmKiLih22FiNnq/RThyxYm5e72sibxY04z7smhK4vim+gDpTu3XYL1iwUu3hr7NvO4Ay3UxPcYZYjLtL+epT3tbMQ6AaZD+iIWI8vP6c5y/5g98qg8EaHLQriOCpZsirR/MLc3FzZ6la7G+fKkOAxZHfg5mIk2hzjSkueNfkDeWbfhkHSnbf5yOXIL/1hCw7IZag7E3E1cFlhT3RZWQgKG1VjjqyRxzmaQuG9RsxBD7/Qt9AN2rlS4G46+sOIyyF3mjUQFoSOPRkgYE8EBDk0ajd18D0M6C95wb3Lp3pkc+kt5JZNthrzfKyFVyL9GaJgDgyT4TpBTXunghjRq9q+qtRUJp97riOZ9IEJyTDEyn5MKbQs3yOLqz1UkQSxdHemBgyNDLbscbqUU6Kaox2OqoIHUCTkH0njgChrnQyOUZPYorElkoeoG/pcjCR2jtWymbk1iDXBWs5QRsYVQyY50VrFnw0Rw7+Q7ucDCzxOz66AZJRGnqCk5Sk8xCV7dxgWTH69OSrpKjdTNvI+HOo0dtuOPeONf0iKoC8cfxsdrVSJvmmRyzPKL9fD26iZoA3CNxnauDgmleWojYsYOoG1nOQ3xgjybx3jp6ltMChkzPNmMzejz7guSpSj+ZbdoZfuZhz5PjwCluRaJ1yWmksyzqIPTGyusWJxiOrowdZbSbspAbfMLle0eWeVTwv/s+rzx7gmrmYw2YImW4+yU8l6JljOeOuHxWAdDYEALa0yhnGIgnnF4mc90eG9n0jWsQNgoR44nsBhH8yi6GQtVygn9kVbwmA9BTxwxS8OP/VdkGMdQa3UpvbulvOiyUQbbNvCH2e/x7VsPwV8oLlbyCDK2IrIWgK6M4+LHMK+P5+sD9l0kfJMW+bfFh25j7cfn+T3//fo2PkuqfzvER4+oCyOFg5wCqlQMLC9lzo42Nxb/+5ngUMHk3vVyHjfHVrYzl6SnKbsNlpGyHlH7BGHVb7xRnfpdKM9ibmbqqZ2osQOIDaFfYxKvYAoQ4sl1AcGAS6R0nhEm/Mo2NpJG6tzulTGZ8pGaDNMVBShYqtANZoX7JWTJ0ISqD3X3YvmojkaO2/iZUgtOy7zoYl4PEKRvhLLakVHH7kchJYoJQDcskQF3dUfcl4vyjX4DieuR/L17vEvnUDUqky+9gQnzw75hFikjfggx2fSpzrRHqUptNhKE0KbW4TNVukFAbA+trleayoRs8RMuO9LZIkji7OjKnux07weHH+IIrdmPzmv7gjiqFK2WWRRFEaGNIxB4oK0a0Je0GXtKIGZomCY6+2+ZK8tF1xV46mjx1FGn/V0pyI1AslwQ9D2nAi0PScADX5exi7kJx03aS36VHqkPuH4OXr0XWZLlX+HCdLFlxxL0+dgJ+VgkUloTh1pciljdxJ6RH+R4WiuSv8PfZXkcW2ouwm5C84vfIM+m489R1yay4Vms5efiz9LpXvIaAdC/byANcbILJF2EsvHED1HkVFerYhjCbnLospofu6bc3DNoafk/Ny3vgV/oq+shQTdMq06t/vYJbMxXd7akmVW2cN8RJYGlDKC0RcS+I/XMUyR0nflRHhbC6HSZMWZNh1gP5gPbKiixTULkHaF/QJoWNXFIqd54AljxJ1RsbusgzVXLYaUWFTL78IliiMtaS9P8qzR+AjoIQIShWY6WmEba+Mu0oHQUdYt9XbryfJxNYCX34JllDEN29+IUu3kD1ir/nS8S/nT/dzu5E6WcyJZL5o7kEXLcJSmfJsBb4pI+ddbv0KEtHw/ROimkLwDTuDC1xSL1Ebw53gnnY1NK0xt+Xq/YO8MjJo95xhZ+nrZt6evrifjAU2BEFCUTu5+2HNy4S97BGQ6JQ4TrpdIHBeLtsPypYPPhAqSV5iKH8Yw45RSD+Uec3OPakkbpIGloUTSp5JnCwkB9rek/HVoaSU9WZCJeJWUdjq29LXmMhMYlAsJiAdSuWpDN0qBUjdw+2pUOYmuN69RHws1mBDSFVVW28o/vbM3pXGED02UKzsFQAspRgu0k5TLcLRKsmaQTA3saxYlQFEcAWt5ZXxAhcnH3/CIt+UU/pQctti5n47jz47fJ1wpGJvr6GqU9AYPKu1yvEmIFBq7oNk/KdTzdBR4/m02Jn4PRePJdHgF2FpEhK1AiQrGWlmcjIjvFuGpRJjiZ7gEujdDbfgHfcsPWC3eVvFTtk8zhWVYm4emR2cv7TvUDcvQfmJ4j5WdG3Z02EWhT/JkziroxyGo6sQ5vdG8sWCFGtoObjreUIcb4g/DBo7ySRnp5ZLJzRHu8j/Ky+Vk/iwBvvTUpeXJubT85wxyUTynH6ozMkQDfT0z5zPKbvwEYiosT4Rc1EQn7UvA0nCN5d4MtbSpJz6gETJhHFzF0X1VN0lrljlRxKekrfzFED2OmyGNmHt1d8tNbzRKYymRRBX6eyfRoy5dz5N9SHn5sZiHnRAkV6mDc0scEDv/BS/oPv18QA+Q4aHsFxLGfkDfIi8Ck1eMFU2yam1CvdEflrjMUSpprBjXlhLSJY12S8I9lbMuXl0ujV70PcDURTMe5TaUNwpcYUWEfSzWqkCs2Xcw9SNR8b1Lx4Gww1GKcV47L7r/1S3tPOfcrUpZU3yzAonu6oTopGjhu9W5CAMqFpWbSHNG9e3ETsI3NeXdp2F1nZkFfgCsiN+vGywzLKblyTEWk8eHaOmeqMB7QzId5EIrRnAwk85EEs/oCUnKdnmeiwSRaHBKiUCxNZ9RCtc/I1mJT8N7Thbew2kS6EBMHOkzLCrH8ibbpAQ4fMZgtjJazs0dyXcuEzTejsH00KHs0Gr6fnv13OR2Dn1NBrg6OeNrMsVzdPGI1iBP9XtvW2VFcsfYjv44gjj6h2Cgvij29beUBDlf/1J5pLe/pt2TOv1HnGfMK2b9n8hzWsP2ZD7H5O3qb6h74/uero5cENCJDvf9KfDWyaUPHsIMM4dJ3DhzPcMi6k3jmbyvTsD1pmwlMuLbk2/FchSa4jh8sQ5eNtouxezZFfeQ8Lr8pYodvI+MriU4Hb8rFvphdti7nGHkPjPJhoX1MppbjO5J2dmqoos5AHW4yFroFZJFA2qLGpERxUF0ovRBG2Hzelg99INGq+Sk0MgrheyOJtnHUuYrQhUojz88esDayJzFbjqKq5GtSfTVp1UO1eMaL6Ei53YNScyIgzxDbgaslZQkLVYiO8+WffzTWsQWKNUFETM0yFMVwDuojjX3v8gi+2dzYOY6HX66kpACjhKPT00h8LbYWgoCBDxmbp0Y1S0rsxH/qdWNaEuQS3ZKc/kTuJcwCcDCQl1iM2hY9FfPvZ7BVypqzhK2N9m6zPPEa+Y3BFKs4Kp02U6132ih+lx1brQLKPBe79GOfoqysJux7xfidVGzFa94XaNtguUUC4k4BgAHpPkUxQmYQra5vpedi/Ck/dHhsGuI+IehXNHmcwoYEG18oOylIjjsfQtNHeqovjNMtZtHDIsPKZ+V33AdYUoYh1T2bfEFArgHKzzwEbqrOr/vuc/UXNWE1luomp/yOR5YLsj5PqVwR6dAPnCVSCUH0uCuajFBRlJpMw+DKgshqnuTXZnGyU4ZErLd19Ldko0E5u8pjWy4rRWrfBUehwBbITldJbjRLshAROg9Sol/kD8RjGEooPGxMfldSVBhB+jCIKUzkpcC6IY77FdETMeY3FimfW6LipWgLZ7tafvqPvT8CLSWlEmUIZU4bM59B6kc8jMu+viWFZsV0mSZdzf4qdy6YT8eO9PVXv/KYHu73rvuXtKcLxez4wI/Vu+R1mvFuD9TjtEyv2G/EpXvVMUdcQvrA16n9cUeu+MghYrJH9hUeGbF29FBDRNeGvIlX2jPGhVzRqFMBV3E/hwsHcxedX33GncR9Jqxl/fX3/6BY7WlpPChsHus4WQnYx2zYNJFchfKj0ZlUPFZDsDmL716wjn7pk9wmRwvuumpZYt41PW0d6lu+/93K1FLmQtalJtaFkebBtjMneBz8fvsGtlgSDJqwJIXUsA8n/vQLIV4jFmxD6aoGce0k9vcnus1N4Xfs3jGyHNDe9DtuQ505jH5nqnH+0HPuvFYlXVYkOI4c4wKvgyxJ+NeAvT9ZsIal17a9r2k62stmPcePp0L1cJSc/FqTlk6ZAYruzLGW8n1ZrrbyZXMItAmO+xdjxfMJSxvT9oH+ynywzfwCbrjglD7fLJeH7RJblS7R+Yhx909LANmO42Zxmayw2LYX2/dRbnPak3C2a+NIBYVnGriifMpkg+87gJQzwZc980lfGNSZUIwnyYPp67hNII2eaXc5ORto+sLgOze7GSU0rlKf8FTcgd0FfzhHCeUDrDeuTxY4w7gb5W6e6OXIFshD3WGZ5PYcC8XpERUrNlzcp5vQ1OgxWjGI0v7nva8dNOV74k3C5bJ6RKe4mJiHbSbG5FsEXBv1IBm0AUCYGv1kxrfJpIPnUpXrswBOACndUsZnV5W6fS8uq6uqW9HcyzfcGv8C/gmnH4N/hF/X64UsadzkpVwmVQpo4scvkC0RjuD0bPshOA5CTQ2t2rKpxUmflH99HNvjnCCIEy1nCDYI8LN4gbdj2+prCBUJ2mOUDiBIRSTqwSK9KBXRdaXcpFuJsavwHKKoLqqfY1xZeYXum3KhM2DF1rtdtCrA3sq5TP6NntVfOOmjPbKLHh2HJxFuCeFf+P2hCOLvUv68goJ8KTZqOSeT3kTmptlQcMSBzzdRWsEpyqBnEy3fIHfLZyg/tV2Zs90r9rdwqjZkj7fMTlgAxg4h70AnCiV191Ovd1q2p2VuDdRnUt/CjqSmABd5/DuhDdqlYWmOzvnnZk7pTBwpsvGDuZ1lpY0hQkOaDqwtpm3ZiR7aii8O99esjbAy8nljxxGiPwH+DpwLqRF1qMCuwjXOqY8wtG9R0pnLlrENfbgykGtB6IruVhg/eNm5sFvqLeXDpWLxgowsgqwVoZ3bALfeEqrIfBlyUYJq8HCXdMY9JgAwP3bGncJ8L2m0vA3DUf9VbfrXcN7t/pOsU8Q5fHWb9G9Bf+stPpwqai4YFO2J9X+PVP4CSKK0uLD3/QRIQdMvUxTL9GzspZ5R89eauECi8vdLXF3itdFn4adxGSvKuE8LIUddCB6Cc4mMZSdlW9n5qk98Lbi3sQcLvCXWUYMbm4meU5XhRJil7oQk+Z/N1Ld9dPjfnF3NOcLU55f1aHXQUwjjqDQKZCuKTs1laFihrJpak9F4vjeAS5DiJD84tsIZy8UHldQ4Kkh3CKl8KDG2s6kui7wzlO36qRJpfA78sDDUUc44Qn5RwSn1nkfPDNJ3w/vhrCO+GElGnSR9+tVB12qBmJce1V1G5tglj0COtTvTua4pOd4I3Lmxa4uYw3i+tg9NzcXwiK8OCR3T9KuXw+iEvE4Hiqpa2hKX3xjIYXc/AopGsUIoRirSRECuhwXH+QKLcKHXChRWTzoI25v4U0jiDO9J4sa1o1voUbj8dCCdh03Mogd+WS6DTbuw6hAo5DP9Zg3mqN1poflyBWKhEAjkuQpmzWvpfoZ21/IlILJFaOqcG0xndPj+Fa0u7tb3UjTjXZSbaTbpuqz7YaiD6DlnDPWtIqdc/SkbC+c4KDDqXFwHlZ7oFHL0RCfGFP9RqJtj9+nsrdaRY7pS7539erlK8RMF64QVZqmL+3/yx3eU8G4oYowlNeB6k6QJvNTcvEkE1zIX4ppCgugxemX+Y4DyCnGHv40bPeUz3aXRaIdbzNJe6vKF7kVlA6Ofxo5PqnECpmRlzE3tjjAxKrCkoplseLYv/xTXgj98t7YYd0cvwIv0JD/06ADwPFPK6T3Et0va4T/YmUMpRhCkV/LWpK16fOIwy1qVsOmksIImDDcjIaViZV+C2ldUpcEYi2rmOgtq5iU1okrk8Ezy76CL8pK1TAOsVgRcvFHHysJaqKFN4Zzx3hAg1XUvhWpFS1PDT4RBRbJmuMlSJkaaPSXLkeSd1pXo/6CqnPdIqWlOPNxegdaw9uO2zXhwH3xcQNEirUTjJwSIdeTAA11CqSqs7RZDMaPqAz2z5Ut/DaB4efsyIUr8Y24tfB3n6lcBwFSvX19M91OSImJXiUBsmnxIxMsiifyf9m584Ezi4jNlXdgBTvnZww6BMZuONfDWMMPuR7MUOELohE8NV72NT5B4clM8aFaHk7Sg1XP3+VMO0ykzQnxjhEauPxDccfJFwZCLdZzLbqfWl2V91o53k44FtaqEs9Ps6ESRPy5uef4pDgBLGjCss87waqs8jfR7FvBi3UM0mIiIwuIS2CwKXjY6orqvqyqMhSOz6P/2iDxA74rhH7gk9vR869ccXZj+FJ+PRKA3hpgutU301anhPNB55CYE4O868MkvPayzTbvuZeJk6oipNia7PQRnn80ljVWrNEyorm5cwVrA7e3OcT2Mca+2q2dZMw5B5yZKQBNzcYwXZIOHKfwF3Hou0Nez8B6/hMxEcSj5GY1Oeh+b8ENDukd9qAi+v0wNIEvrAk4VVnJB+nPxPR9zpku9dz2XbLG9dDKJ5ysNouPilM244cG8mwM+QRVng4ReShRdPUSrj80JGGVLdkZMd3KR2UXUmRSfIe8oQiwn5u573vVAdpbUnoa/+1vXEx7iZVGVxdsKeeYObxxtDofFdJK425qx9QirDDDIxRXdimVvdougr12eZdg5x4jrYrM9De+l+wZLrvMzDW9tf360dLI+nhKvgW/2vh1fJP8P7adahlES5SdSRMey/CEOeLkoZipwlUgsL/2VlkbsxwMQj23l8uqwPFE5xU6A8tYpt7YSbO9VRE7x4mrOVUctz6crE5pxqNdKsGlM3wEZb3DvorZnEAC0dFSj51i7cxkntkfs1cmljLEMpMgGYnchAwF5wTQMlNNkkWRR/Qjl0rcZ9lIOVmj48znzJAbp0Lg6Smg5Isq3Puc7IOc4jh20SzJqR59m9acz/L25b2quptXXck3FKMxpaRcPL/bJwnSKCzIsD1GOYa8udToklz9E0ZQ4K/Fs8qcul3PtiyfKksNhG/QCWkiJ+7JXAOVl9kJfAOj0kudtXTQaepOpCYn7L4VDyApav063laJbu3eRqB0fUo1npSazTIrCqp4GiSyka5rD1hogFpBpq1JfCDWNi/sMFol9i4hC4haRilJ8A2+04ZTIrU16dNkGpeLCtssRdu6CtiiMSLCZSUHlyu9s/mBOyVPBoxux2DRmKQvr4C7m3HOLduuS55j9upVR/OzbrSK5LCBsBmZdXMs+kUMxP8do9J8eK6mvDvcaZ1kNyFj1IhMwnfp3SPKavoFUgunWj1pyQBFxYOxXUc1LNei5bP5QHShPmiNB27Z4raNWtZR3KAu8UrSlgqXSTtp9ANuFRxoz6+NERM+DUTNfzK6QH2sceeMdsVxjKBNt3Rz2sWnPC8dx48mIpoQGQLJcrFLfEzT0qHiLuhWkfKxAfwnf0XFHOvslUWDxbE7mgxW0DnCQCWEthTBluQjUA+Ff23WOxtJKP7LWLrwSwk9u6GmYnIHio/JUuQ0XbStiiarOtMZ0wkHi5k+Yu/Iu5mjlStPwvRJUGnVYo+4Y7MEMmnvdsZIADFJooe9GbTbukkecDZYmgZdEjbTdjPpYWfJXh2LfZI54KmVC/V3f8RR0IIIAWaC6iayR/yZW0UlZDCOApZYjRSV6FnKQJWrxUBMcMJElkZyZY8zY5HgPRPFgH+UK8q0cTLe79cMzqDq1NXDMjNzh/S1bhZ3uDT/TLEflN2tIPKDjCNeUInaVQro+19FBg7VilPtU5FBVjegwvg2S6UFVhmOMvnh5VeqxjLCDIED6wngVcAp5Pn12xQsBLBUEn4OxDqqBsVo6oEDc2y14e3ITrUqIDeLMatgy4wyT1q5koie6EgXkVFVnlNRgeBIYT2JnLaQpBV7Gg0u8U4WZmZyKAEQEvYL7Xa6O3P1xZnXr8xcRkl35jV6VQu9ejFlFg7tOGMoZqISyRh4db9+4RXkK+2oMGYV2GrkTFbVbVdV3aviFuPTBeVOL396TFukM4Ss2qGcthYOg8hpgyyWs5Mh+J5//pUr0ayVnlErXxXL2eoSmD/ybASG7yQbg8dr6nI2YoCItq07xHKvzbsmim6c8tYaC/7lwVq+A1pD3vk40IPjurt41vUFUClJFEgdRx6da/GJ33DYqXfF4aPcFRe04vjmlkq0MHcO09/Nn6vOzwk76TfxTTJCq5/KpRme9UdjGJps7bX3dt/k3tPFuXlvLEvnRDeu4Id85165RpH3DbpJ1eiW5/DYLtJnLO/iPCOoegxrpYyLB3r5wRwpjZfLUE+s2xymzRSgwEiLDmTsZ66Gk/jstTwc1tqDHidir7fz8R4qYoxWY3kuCgGz8IejB+gY54ObNrXXDSkClXFNA9VW4hEINysSNAYS2q/xVuHM4shdEDfHgaxAGNkOYDgnbQmQmAB2VMC/xhuYG+PohcYxW81tuIVFl4qPx5itKLq1Wjbu7trBv5zvc2wGJHe4TVb93Am39HG2Zk00caRwe0eXLpo8+TwllEdofkii8x3fIDzWLpvM+oRh2mJn06IxuxJHDrWeMeyXlYgMtn9hXaMpK+szapFR+UE3L11Wk6bY6o8VgPEWF02YBsPRwTJByXIsEctXaDG4b7yUklHDRe1BozUDCD2DECoP37cHnA7jHnurKD64MmJ5NnbQ8sqPg6KOzUWXYsDzhhzcPXj6E2HYaOFSfuM+KXgOSWksvLXHdNZE61+YVc6VSowPkIGC3u07BCRSWj8g6yWqfw4jN+GSMMcaHMxWP/18M38jhS9ZYanNRRTOdBEDU/BFzjeMg724RpxlCJPAjMWzARd7v/Di2HUkTV5mnhJnVyyqC5mvBGfXGQsoEh4GNPZjFanMl54M+d4CX0qmO4SdTtmsQLYczcPQcyYttyb4uqm2LS4rKyGFAQxx452s3l8wYfcTy849N+fqRvzahGTtoCC4lVXHx1i01NmGlnctS4GXhsYzHIjZwLT1cneX3YHWdyXPCGxI0oytQeNxvAkKReaCYRrtNCsaxqZD4/Sstylf/w9719cr/jBeJwicXBKlhxx5oo0bk9SamdzL0sSySM5wNe63AF/g3bN23b+JItKfZtW/Ubm+nm6dvzMmcfSUEF+cBUfI5AqGNFv1drpRuhERYtRyCqCcdaYI25ZhUunWVQBzbbQWSQTdNTTCZ+hnBuODkIT1B1okhOvZ/LskjSTMOCSlzhfIXB6/E0twV00b900+Yecclq5evFwO3PzjKZLwBLA700P6mNLzBhRf9hyCiXOGZMx9B9WBeCQU56rcgFw+Dq8o1S/MU48pR3FSpS1BwChpMY+kUtJqraxFJzGHIKNgzcvJBFCyjXQkHNzNuQHcI/6EJYKQVtMC4T8b8mZjj0gupDYlHSpzOcS64epQxLlvcjJZudyYwwSQiVcACMnwf/6B5wQ9lHMA/pKQMpOOrygf3ygWGP7upcqnQkVXVLwsIor1LMxDl9Ovq2q4xgudnSXyDDXjucVIK9uJMMiHwvRastzx+1XltchEWrlGOcrsQ6VKN+mmirPesbvO7wKZIiqkdh/+3b8UefaAMFL0pfIamjCVYr4emU4fffZxy5HtDa1GNl4ulQlqlCl7qM0nD/FJm2IVbNlRKJ0tiDiitEcqBlI+lriZsmMKDeYm9HJz4DVKWZ32rLJBU3sUJbdnAuZMsPaUcbXTuXxie6gCDzqTuMh40NnpOziy1nGm0yPlZ+7yADxzxLqsSHn4wwuvvXThlatX8kqzHTtSrKCOu6P/5rwlCh5NKRCkM5PkUpJYbh7wrtWB7tvoASXAVEVqVFyiET7PWnboLUrX0qtXMPuQOPPZkSv5+o7G/U9a077QO9+zMe/XqNR8OCR+y+nIrEiCQJ0b853j5KNX7mLNYmByQbfL0U6XDp5Ys8akWv+bE+m4040iXVG05rIskQ6R8vJuWfNXPKzZCPsccUobzRGePeNg5pjp8cjzsQGExitZu3leNMbCGQ6v4ao60rVbZcZy3RutXo5N4bhDueYfcfJwpP75WuAViZlxL0P+5rbm3dC78F89USUvk3j35x0dLHSXun4EF/Iv5RoiBZaWdLRB0Sr06fOCdplYS12Ym1XexTI8udknNisqMfGOaNHesfWPaIUHGHzKyXfvksrokLRjIu0dMovwjl2l4g6mlgTGgw326JMOU5u1qkthB2QxxyqkumSu5ZtL1EZht4UlSigcVTdYJZfq1VVb05kZRp7h9VnAY7Dz7oouP54vp54j12zkBrm1h8qynsr7qu/SnkOBUXNiUWD6yf8r+V97KudyT3IuWzdFu5immpJyPSQJvczzHO9l1sXw5IkDu5OWmGaX4wmJRPzVnlSTrfTQzVTK04cj8IdxsgBWLPdkDhtSoYkhFM/alfExuejyC+9yzdpgD3HtArKiiqASsYsB1kapOxjjcLezp8jWCOetKq5ubbzClXbc8m86qanxkNtNMKVOM20MtpNOv0qsPgERtfDoe9gHBjhDt9Rdzt+ldDUyojZn1Ify9Ju9ZB2efr866LWhbXO71ZnF89ZqJNksYPBuNkO8w0wvI6VVv97bSPrwBc4PKNi1NTi9W8qREckEmeblbScl1WLPdXT8OKdatnyxD0ygioHWCDxCzoASpDatC/iPo32+tcHJXWhNy+c27pOlhbtUEucdbS/DQzmGl3jFTol7zziaHZqQSvVMiptYZiP2s/+MDJ233KXcdm7ek688Ul5ullZllOO71Mp2lSc0/v3oyz9x4tomGi0P3fz11LAa2wHIXo5U5rnnz58/Rx44zep2v0uJk9kkrC4bHbRo48uKOmuVUcgjYWCikMHRrCokOOsX06gkKZvLJtH3QU53caBUNg9ZZcMlbN81gWSOXRkQhkIDnDgQrRa6HYa1fU6qpjyREguElGjIOBk08JA0MVGUTyCM5K+0VSFagUKlV3o8lMPJzblkZRXNf+tnXTKjj1P1fMp9wtlOvIfliYqia1V3XuLDLHKb9exCbyNT2TaXrVpvQsFof++TLvaW1BNFBsx2SLDS+MLr4i49wlPQeSBQyFDPE22znQSxl2ynOyP2RTnDB9XufxSSdhhSu6NyvYlu6z1VGsyo2p0P9QSeuHIdb1rbDvDQoZvCNFnDkyZcOSuIhIC07iekl753/L6m4lSjWvme5I3xI4i5KPb5q8AsNM9n3Q+srjS5IbRclHdvKdLHxnoIUiarX/sheyudth7WcHVNvoIzjiu4OVj+zj4ero6gGPmpCV2MncOuDepekJg3Q5+0kqpQonbMORi5juELGXMlgy6QrMRaxhnlsD0iEMgPAXaUSY9NL3TS1Mn2pWBX/jhkN7gds+7jiHYs0k1TNizrEsF0QBapJ94ilo01G22yEe62mnaqwgA64D1DyWiCFyV0YaX1hkXizTODACJXclfkPKf1Ua6XOQ/ENVesv1W5Ff2TAo1YXFX1JqYjJbhGtYCeKwg6nT7TxFyE81+b7JkYwMyec++if6GOHHaBCjfGWr25QaHmoiaQiGAr3p5Ye10mRnP5dFOG2FRDRu/wDfkwzwrTzatHl9TKFKslYXqhT1TorSwmsPU7SS9rEdSfKCg/MkF6+WzmK/bAXhihVFwxVacoJYcTFliz/lZf6OBr5GThGvtAIfyqhoHSHYVgMcbqo7HWbVXu8tdcmKAc5hgNnx4ah1yeC56ARJu9kva2sUf8m/OG+E+fT9bLT3J5PkNnR7QXljjbSq7b2UllauybJHVmPFYRkVgmplovkw8MKpwP+ZAM+3IckJqMDE8MPr9V3GzFeLXwGN9N90qjQKTXy58ob6DvRAsLdgKJagb3U1KaQ2ct0jBRkPt0rsHMN8t8VmSV6OtsWy18+Cg5FLbFfjyOcVb+HgLpwisGHzj1AIZv2rB7ZTlQ9WtUbwX3KMamLPs1PIYon5HP6m/sZiialaP8Fa/fUet2/Xo66LMYZ2qXzc6iof82pzi6Iy6jh1Sv6z5cGuIDfY8UrHexyJP4boh/hioozf5h9zgu7zMKqPqziXl7QI4Kfhk/OFXHv3T6p4i/j9lP+3PW4rreOKJR+Iw1CPbMDnRNmDviZqL1Ch8QA3+naqs3HWCYahBJW2kfSXzSuegbKerZAfkx6GiOwHmh16tfr9L+oXilVJ/VBuxzifeigbvQw7g6zdQ1Nm3v3ylsH9RTUsRK2s5iSg4L02JWs7EZdMpFVSx2JeOtzK1aY7/mvZy3X7bEBzftRaUWrS1qRd+OXq73N6vb9b3S94UeQDeqdg60mJ5WYs33V1qYKFXNj36yeuE1981r/GbfQt9CdTJ+lNMkJ20FuaRtAY2FKAWyzjySfPl7wfr7nPX3+VgXy7U6qjebuhfifzvR16Pz8Me8qa0rxWbTXjPpSey2frjd6nwvaW1s9i2TeGd62uitndH8vSZ2mfY6f4xh5YsOPvooQKhEDbAD1XJYLBRi1shE79CKS1CMbkPRQvmZ85wW1fFR880BUrgUaCagpg8NyuL3X48WVnNgYdkmbQuc9wM1GY0IhVq2Tv+lpro5LFcT7ZKp2nz13vX5KSg3d0Wc3kzRysFzl9uINQiocYv7G9f45zUOuFXdcEvRBlPUn/67FulWXHfnTI07kuvqhD3RhI1reHjCWr3hpMxx2ypp13blt0QOqi0IYL3NLv2BLkT4p++NxO8OaUvPgR7LOfd9x3k/h1O+/ifJbIIPP433fHDHfWdg/YXt85s//tgMgNXrW4ps6KObttv/b7pWAtSpRO1041LbuotSk5vrzJC5+E7kUuvzVxx0j7c4g/FjlaSVchJzRDWdFG1tPaTHyiXxL9DsFgH9HnMfh5RCF3WbVKcIPb6xY7XqJ++yzb8vDPqpk49hvxzyHxoFIbnZ4P7v29fWqI22SJYzPdKz64e28h0e7vp2em29D78mylzwJSIFe7dSeI+wjEPuD1IQ2QqZGD9SkbWqk+/aLu8By/JVaKMNy/iRYZFh7yyG2bNfmXpFlrFYc8M5a84oRd1kev1hav0xtPrZ1RdfvzK2Lp+bG33nE1foxzTAaFX+34Qm/6kr8m09fk6Nr6uU7KAaH3FXLoCQEn//7AgV/kmQcigK5uaU0xOPrbwnV1+tJyNLsqu3fzrmB3v6OZX9cI1901PY739FMKbrNgxhE29InnRf7d6DaLHe2hj0ktzcuHyyVSOAQ7Ped9OMKB2Dffs9Lhn1zR3jrCSMw0NMHdRKXWAhuVK/8+wg2n7AFFH1V9R8DIX1STX/QaV/U7sG4l3Id0Ze+f9k9fd2BU5HeaVpgyIIjwGlJ6LVV/X6zLxW8w5voXVIzsmvahm/NgdsyCLUpEJrmGiKIUVpUDq2jlxOLFaM3FcuDFsc5NgiMLGhIgPHIs26LZliW035QbCtoaJWe+uhsL1KVDZ8Ke158SRdsVd4vBGzHRLGPuR7dwVC/j+lyKsDFbaeJ//DepxMHi/uaahYLp8Nl8ylkatpkKKHIXHdR/EJpPScMPOVy+Z5cepvUCLfzYbJ5Pj+eU8uFwlQlzJ1BPvFfHhmU/HgTQ43U1vky/tjyvNhqA6R4vOIkJPdaUlqrfRyhFHGs8mI/Iz5vMYRwkk5i42LhW18eyXpl9B7hHJGKXHTovKqh9FU/iGZXB5QaM7JaLy9Qc5JsZahKb7T3Fe96RUNOcx52JhUFgmZgp2jbqWzSDgCw7ydLKXF8LVqqoDzYwSmPzFWRJ7qvGrqhF+lCuV8BgWfc+AJ420OCCfNNBA6XqF4SG5hNDt1VVWd1ihl1YGFsnQ3HF5I8QE6lsDJV7xjpVcDKtBkNyCt+tCpVtJOzYowgEElyMBSKO1r0oAjskjDXbIiy+hTRAFDnapTXayZUr2q0xuSQPS7Qgnk6H9KGNaj/J2vBBOa93qr3U96BkJ7TjXntEMUNGdF23MKEg7Q+FJf2SOrOGI4Zw5Mu33cmws/uPrqtVcvw1awad8uY4lNqlm6nVjh89YEUqtoLE6kTH0yrFe4uu/sj5pvNKf/bpZzRFLVXPJU4rwk8Rz+A09l7PlyWTkYLHCAyxxlVZz90Xa+F/sz9la9j7cct98co/3xe9gWwaOcxhFdh+d6gxbit4abfAIRYW88JzOqbDxtqLZymMPyv6hoVj5I+7yP7jFKDVcxSTnidFQ14oKAd7vikNMHprvSt45bOvSMurL22OURf1K4GnZQMZhFuAqT2bNz2uggxsDpyWf4gbm7Xwe/Yo3kZ+QMwfPQ1YWRp0A4W0/2y4WuGlOERGJFt26oEEEYGoSRV4KgLP9TStyA6Y0xRQky+4cUy2JpRonvs1JnWAk1PiUlrkqIp4MpVHEcDmkJwgeDbHVCj0MKbkXe4JcmYZy1wftnT7xoSW8i26EypTiKXydByAEKWipVtKT1MtGdKEjcq0Yh0UpCWijJly6zQungOBskVkJ5cPQZQdMEtCrYDI/5FZAQJuSIc09d1zng9Aw/G3yvMzlPTdWru8gDGI2fLIQh8S7p3G9jyUCvVAsphTDI8XOUBRaEZiJzgOhke/j4BfcwGDKgSKKEfX5FhsPIF2JVPitJvhaxRr9Can49ReAmEWXf9nX79/L5J0OZ9hRJiQk00EKAhLRMlUwndab13KkRdTcXwuTREpUr94+F8HWOmKO8c9ePNVERRU1qdXsvhPfbN3x/2RdCDEOYM/Yp3DGihqgZfCZ5d9xAYDcA2OVkMCn6P3LM3meURJXzerEe7+yYTn4r+ZwrJ1SU22nWzKq/+iyKuE820LW4YzP8w3Q+V1+MXr8SUV70OJBckKWk13iMC1h11hOQrIu5YPv9uXxEFj8Xa+V4W5PJ3w/U8Pj92BNcxtMZeFoCK0YmKOaElhK0yRXaaMSyqRTgZ+USP6t5JTwV0N/+Wez2a6f//a3+t7u7O0tBuygJthqzgBrpoIdB2li0bfatehc2dGa73qlvJL3Z+u5G9c1s0jEwY+Vz58/Tv/Cf++/8wrNzz51Tz/j5wtzcuee+Fs19FQAY4FGA4f+L7n88yJIo6/dajT6I3XEv+fGg1Usiqthn/XbxACvWbKPGLIP7AJrh7XgJKInFntV3LRHXIT5KzeE7BZNUyS7B9d4GZSfIQFhCT9u68rSfiebZY7YVfWcpmqfikPhxug6ieUuEnYwMRDEKTrl3ncH2WtJD71F+ZuxJdfLBXdUqVlhBlZKZlditmUJ5kUqWdludZrpbvYT0jkvLEVAu7G5ckrDkpVfX3kwa/Wqjl9T7CXUAjbXqx3zwgwz+KLXW642kMsC/yzfOEoDE5zXpLamL/4a6xGP5fAYO4wx9FO+XK6jnGNE2S4RXqMStZsG7mXiaZoNUmyZCnjBLNIwrHmflG0YsZnl96LDxdClTcVbLMSbdCDSaQQ6zvF/Jqp36dpL7AgOJ8swkXDw0XZpqXlLopE0AK+mBbC6NHuOHGtSel1jWp07XS9wvY+C3l86XZdn6O4FUP93YaCdLFvt1Q8oZ6AdB+GynvQReUVw79tlDh+Phu1NRTJs5WDfyWLhCbVeXpgpfLapkd/sEQFOsgR8DLtLKVLT90tSQrqDtkA2owJlJ9so38G9xaG62sm67fn1J9X7zJrX59jna607aSWLeV4GsXVVSf7TMBa4oBxHJX7+Ab49+Q/VpAePsrZs5Z3eWJf0LfTj5sDVJyUsqUDG9Uy6BmmQSwO/3z0ZhhOF+yxqkeSzZZ3Jx+XsXrly6dvXSf8fqVzeULx8mEC42D17Y7iRvteqvvwjsIVsEUYB6NNKsaH/HhlUaxzGr2m02kg52/Gd2PiOjF+auwmavX3jtMrRgkibpjkk/csDVlbS64PgnLMDEXLiBJ+rbU0lyfY/TE91GdQx2RJOkAjI1KVXv5Q5ni8pPMGCG2g6ZrmWwpZlHmLNHIzj7eDTaWSXqKwOPT81y9UDwG9JqwXcjQs6aaZ8tTlRDBxVe+2ZwzNIp9lciQu7gjx/lRn+VuXN/7LXr/SQrsd8CxudMU7JIjNLBW7UTfTuan1s4r/NEdlgl/CFq5BF3B5Kj77fwCOWD38m/v5J//w3+xcpKeGnPzMNHzRTm2Ylml6hfCofBFJy7cGQSHO87/AIvcoylGVgXPYojMg3VcA7LeYKk9UJrL2mW5tBhx/ycL7NCGndoAJe5s268ZoGK0rrhX6oP28uSl+Cowk8K1BMYtLJX6q9QW5Mtk609n1JGrYexNMRuvh09N6eb4QOTHv+A1Wpu63PPzZn2FDi03k7THr2dpb6MCt7rpOgj7pI18e4n1vKx8Htp3ea+9PLXq5vZNQAPw0BzbNVBl0zHDI46B7QienyTQlN0z410AFfW9VKDYdtoWCEqDckSClv0A6CUvYv1jC0jpOGd/dHKhZn/sXpjYV+bGGyY45qhY8NEdpLdCCbcrj7PF8crwCFkpRWMMySc056+QBeQ30CbTrpOE4NpNBqIdyQLR6XE4k3phQ0rLDOGt3+FbS9p53KrsTXOISVrAxUVBFbD4ZVaYkKexI5ABidgWVt9DKicwJBA/DF+PaW+LssiSvxLcuDCD2SycD+oYBhcTzI/ZP4xwBLuthJMu53Wmzn10Fvb1VYHmdyLmYRIGtcEYFm0siKofWDTpDIu7lfOnhV9nDUMOfDTUMppAf8hi6jynd8dXsgKX9uu9mue5oZ591ZnDPcBhP3Wjt0ZOaFIBjHk33LkON2wm7fWTzQKXHAn+g7Oyom+W2/tTfidmShxM0kXUTPSW7S9RY8R0bhwbdZr1EgPhwaMPvvyoxp6V3n499IB8hfif4m4lzTlp+lWigoaVED68VqSOc/QqesSRjWrrHiu+X29l2SbSsEXRt6Qs4TyoRGnCMRi0SWj+pAsyXmcDzkArKdYuZFdmhxvwjVP10moFoi+zDaBKyjb3h80g7MTuUyt5dSZpn4IuTKVbBZV84phd1iLOTUtA2yq/YVmS+2+hUH9kFowl4dcHJqGHGZPkvc/UMpszZ0e/YvPjkaGYaVeFW/6b8yIcu52YURVBIQ4gJOUWYm2W5vpdqqmYqXBvKfyhLxMLdRkLF72t4ZxjRzG9kOBgXCyHztMa6gpnFCaNdnVlJXpSj9JegUqZckgZ+r1KNaby8Qa1hsNHtK78at4KE5vAJ9aRAk/HtjR69zrQS7fPVCAFcZp9pVw/O3KZ+3SX8O87nButMnk98ja57z3Xew5AAHyDnfD47IFxNFYnpawBVhCZqvKNCfvB+U6eNLekpLJfc7diAJoK7melaiYaV4sNhUUMNvCliiokGjF5Ug/kyDmfW0eFrJVGMML511mChhLxU0JKp4f29pX5MNGVPVyL91uZUkVdcvtHfGtV6EKDuV1PE95/pqHHNsLdRyfU2300F1YUDLFsdSzvOlIqDcOgY7WOEmYf6xJuW3NN6Q8bI45sY+Zs5IALmRIF0A6Itb/P2LrBcDEkuCBIo6TEf2tbWIC8JTO4xHld1U5WKXZH3GDWUr7qy41WpAKesHX14BiYWWLJ40fVtkfY2QcS4mhyv4gEy/rncbE9Bx/x6FY4iPxvm2sLkSxmBaN73Gt5SePRyHM+fEA5QWXjjjOsP9Bxxbe2YdWTWmU86dNNM9YXX0lsGTm7GWQNBS3qaSOkNujflfo9mgUduIhU/RJkY8QBm+hChafbdd7G63OTD/t1mae6+6x/9DrrV7y4gA5fdRlBOv71cLl2L3iRcSK3GdIsdlYnFo+pWamT3G5cRgM7QGkQp4xO+tU03EsLV4/18L5RNiGh8cfsIcIBvd2KC8Z6wARKClVFA4HeAFlshpysegh8WBWKBhNdAvOAtUcwR/9NG1r/B8yaR1CTO4AjsZP7xvwzL11rPyOUm6t3rm+u5n0EtuNMsaxZ+qMLLsb7CvqTCoGLotruKBlRbecoXla7fm3/QE/R7uxSvAWO0+vYdEb/IBMy5z4wmjnzMekx1A+gIEQtDGA9TtiEt9ljvQD4hcPKGwcxoB1DtpJYK8JB/8sVUvz+wx/6X3ON1WuekN3EO8Crij2F5VxSVWRUrPjnNOByUlFM29SeDuoWR2/wxzyA3Lwuy9ujVQU92EoZJmKQXvwFT6geCkjvQw/MeWepUSisW2s8BI361kiIsAhR9d7jAM6OEmKtIj20vJJNHXNxMeSWZGfAZ2hLOa3bMLMhbdIKvuMSh0cqLLCtjNhzr9S0iN4uRGmGPnwRSCONxo/hHeIry8y6jpwV0Wa/nG0KaciiGScUsUTlayhBIB7tr/nI3FR/QWlaJF45aL44Ch3uVhxQAQZ+2BhASSDyk8ZXmGAuQhfbP/ScU37+a/ykf2TLGT4pC0+KdsqDc0rYGa7/Ebnjc7Rb1SJZetWxJ9etveKE5x43yKHfm54ndyBM3G6CgMmcZ9T2QS3rns1Lq7+N4V/KpaZNkgCFtX+/H4CG6VdmDMaOwvDSZFOpSsZtntWrA1fbmTsprtwZbWciytZt31equkuMHekhRcW3vKxI2Vr2ktaGygXBYNU7M6muLcmqRcd04I7JIob/ihb4wywjvqJrfStt04wAidbIcvgE6tNqhmgyFIkHrrorW77XE4VqzzmJ6YwBCrQlJ+1ZUj2DxgVRPc7lBS1mIoOZIVS3sJjA8nXzjmSYEl2Evkm0kxFJVsxKQKG5UJ+/MuysE66lMehlTrGLnSKrLbyG3+oSldS6hkpBAaXYswhRvu6JhrJ5jpYc0sZYDHsHxF+feuakdlfSfpXNlvr/dhKXt6RqHfGAhUiJmhAJe0rEebwZK1/x2j9j/5d56YhCG3Z9ZTZjmr4i3xFTTUXikuwHO51RREsFkLoppJrMrgoZOM9guMBexN9KtpkqcZMmHI/QtwCiP+Zy7EEasJaNZRsnyTph6dRAgS8R5wjBpr89Wcf6WmXq7E5RbrIhob/Vw/PF/j8Y9k3REPLAd/zuKowXA/o+HBMizrLzJA+olCH+1SsLDr6TbjCi1X1hh13dC6kR6Iqvv+Yu2MDmGDL5HY4gLPdFkc9UIwjMxoUOassUkJZyMcin4Yqd1tXHLODIj/5M878s5qi2Tg1HnLdONyHtL8WTcRzfuiUnb3NDPSQ4jAfKx3GfR078ZBPh18sSApz0Yl5gDuM2+QDlqihG9/o3hlk0rsGwESqgp4FTIOGYXgep02UFufH9Um2jdxG1rit9JlerTqfxeFCPcwWuVDAOKqHXOioGM+dikqBotI2yMZIfmYYwbEToNleXCr7Gf+rUKhR77y6ZTE5dpjwlNwA6E875R4UYvKndqp19GHVWaaGJf0iNlBzV15vy3yqopoSeAp80fK8YDA/2P4w/dc4yV4yL3mPvviIZStHJ5KMrfOpi9qJkc4+ZhwQxjFvToW823Qy35ZSfvCEvlVCrFcRuIs27rSndfzEkqV7ng0/pPCbnyOFn1GyJd3MuO8QFGDJXSBG/Uzpc7Nuu9UvxUCahkdVL9r9tjrdQZ8nRH8G+HN6PkPucuQJgynQ4SFlpScnWvgXXuJvMhBspu0msNR4EEyRP10ECVoR1UamXq+Bl+AqP/cwm3B/s3ZuAWCxGPGP+bm5r2u4ACjHwquNXoujuwCILm+YdJU8McL/p9+CaTGPqOeMfFfSncz/B0FZpfVjpduu+PsM8R1caw96NHfZepixrgG2Xy5PBoh8RBpNaNyC4JPrBdhWESuQIc3RdpebCE8LIFVY4HapXCky/MNpU5kXH6gy8a7VO2xlj4uLGVFyjCrKyVI0jGy7PMXVvMRrLP6K0jHk1qto7+JKCBOAkHdjDMUK+kNo0FWise1doy1bvkjvpdYjNWcc25nUAqg2jN5q0MRf/infP5YItKJwEarGB+JQHC1QJGU+9JbHw+H9jwwWcnFAn+/T/c9aRbr5kbNnzpYZAcVuvcfFeiP2pxAKJUXXVDE+mODPRVIgnd4tmeKBCX5WxeD38pS/tc6FFGzCT7cWWVpZ+7BkaR/O2qVFp9Z10Rt08yR/z+WAqcPPA4CbpbxJAzYU3w+kTJZdr29Pk02cPJdKRm0mV1T+YJhKnvl9KqQYm1tmM6k3i249CTaorbcTIPP1NnAkM6x2aCQduMUWo416t/ZNvAOwCVtVKIYxkgtzLYXztF1TNjITa+uNtJ52+jNZ662kNv+saqvoKh+ushT68M51Dvbkt86Hg5vy5gZaEnvgNFX/lgwvc621rhVXFGnx6rqe0HeWorkxthMFsPxYPC2Hb7rGFxW6j+UfIk4KhQ4M6QipFlf9QEn2ire3pdBitBQ0JmJNdkxSi8j8bcqzWMw7Obfb7sYMkHU7OqeFCLRO3kC02YSHq4atXEePvV6SZeXIJ2xsLdLkIc5nOzT17HU3xkeiMou1rVBORJwqIJ48Rui2O5Fx0Waolp3pqccEVbQUjprTH/Lnngy0LgzQdV85qZdtAysIlnuI0OvV/l4RaP/NwhG/4/ivP/sVid0cFIHdaWPoX3/2ofMKRhi+ln8mSfwgWm/1kl3WGxQkrlyvvpV22D/CMuWxiltKeHPw/4G2GHKiA5cN0YTwETHAdNEagFO+AhC7KROqiOD4t2SUQl+/76MKI2OvXb4J8Kq6bVN7sj8D6TRv3duA3m9j9AUGBL3HKh5KlPeAxRi/LVxdKtMi9afVC2rtpuFWB26wmja2i/DH3oH+fQ5MBPoGR9Z/RSeNHRvvyy3zHiXcvsu6jvvEuvycLvKA6V0Vx2J3KfH8JA3xL3LfRqgY03IJlSwmtYWteCYXRnGe8jgOFk71Hq3I7lFSsG0M015VWYG4QVXARbtvQ4EYUPmYFPzda+JvE4bPv1BiGpZEP8dIKlN9mvSD3fwhGnN/clPTOk89QQoyVTeU1tKdeJ5+lK3ibJ3h7POCbJH4kWv2XGd3tXOB9VvGWsxvq420nZbhBWuzYpubIzrCLVC2g79afc5EVZI3+BvoTlnkurLdcZYkHbdjVOcTit2mqxAQkJWHKhJHvnF6aadZRpaoAVz8660Oc33Wc7wL9SCigqXNk9lTQ5jj12NeQ69Ppf0q8hp/cuQSXGKBVRCLQyPSX1MqJ5U1KL5Y4t7wT1XcJrj9XroZ1BeCgHVWSrTz7d+v9tMeFatUHGfENzjxGT5tJtLG9yKuylxr/WqrS7R6GQVumK3RYym3F3jIClt6wDwFUmLl5pxjYu2s/DmqTkTJ2DA40T+KVOp0GQcUhi17MvNy8+dlDCeO28cfoGgTsdAEA91mbo8VU7ZisyizE/GHd6PnL7+E8s9txZ7ZvlwIKQZIyYhrWsY0Kv4Cn0or609V16gWMoOmii/YPiBWAZbEwj0dqvoKXJnt3eil+arlHOP7hJxAazFE5E52tNCd7FT7IFkk/aq6YN38No5nZYx0SUvnIV2Dyn/r0i+MUzExU45Dq9ZLIJPeU4fFaE5qlApMoYa4JLGvQRBTjA+vfO0FC4QlQ6v94x0KoOvBBWmnWkQadgoNpOX1PESftJ+26jyk7PGuSRJGjCxy/YoI9BMIcvS16wOOyv3S7mZdX2NBI8QQs3UsR5BEbtsK8XtiaOApIgbGh9c7jaR9VQV2nS0qxzKmJVNXLcnHnnjmnndZLcPX7iHgxPuiNY+0I42gEC4MYcF+2cqC5hVCof4sPLttyqCgMUcZVUY4PFCBR3JGU8n1LOuz5fmAGcB4KOL/kZZdUV7fRx/5VlBj+/wikiKOhxKhr+nbONZrdlQXak58aIU4VAL5LS5XqaXt91zrMiMGFYJRWK09C6fEdnLjiflSiT+6zvRu9JQ2hhZoZkX/PWbFEZmrVo8pruIxJk/elnyS8ac5kbHvOYBTsUIQ1LKbwNsXrDmnn9Or/SjfteJInqwWXs1y0C2ao5oHxbBZM/Tn9wS97xwtO8YyOj+R/0wo+ATDq+hC6MYqkPMl8vEqmXkGdSe+O+1USevBbFoNO8c6Cj/y5TwyHSf2mBxDre97HqrYwjvGYUhpv0MRK+SDKNYoza+FgyUPQzECpL0wzlcfaN+B/E2jD24+E+gwJTlHNuIKqsib3/BuJQkpZPlc9xznk+UP82bkeD7bLDIBGM2FL4jkhncqFHpizqY6mNDBc4kozJ0IVR3VRflc+JPFhCZ7WA59DDaU1A6hyJ5R4VZnvDny5BftqRO3SI+Ju6XqsIky7i4GbGz0QdprbcSrueWetWoecHriMPgI+T+xHNKdVDQRBxx/bpvt3BaW1lJdjk/RbbX4vnFcCH8RLsGhXUEdL9j1rY5KTa9cAhHi4jUWD/NteWps5dPmK3PmD/aro6Q4ebbShW3FZ0atb0/KbD4xbpM203HoJAT/KOfGqN6T550s8xalmOGB7gzzcORzke9UcEYC00WsIx6Bwhfukg0gtn0rT+wDGLscqhP+cWb/7JjuWB6OePfk2C5abjdDZKMTOU+POmg572HPy8hzI6YtEN/Nz8W24fsSY5+0NcozsGIVsLyD/ojG9/EeZ1XQLo+0MwqxAy6CgJBFPoGfjGsh/Fvy/sNUVchqrp4d6T+nmH66ycIstZMhI8dmBD3lTuK+4/nHyc01sXdGnvU9yzIVJ+97qNNdMAPFkq+OJzR8NJUyMo/QV0x50Vc8jUDebYFptpOIQ+eWUyfCSvevqI9yvZPSXN6MlsOpOGCgj3ynacIgZIv9lckyWNGTu3I8udv7rhaw0esM/uI/gAtX0y+a7W81J4v//24ASOg67AGpYly40Q7zgOgwuXDfdh0WDfLw6VbWAMcFRdBkykYTf8cVEoilX+ewmQwhkVT+0S+O4Ln8yG4wKA8tVr9CENL1ej9VCkttZkY6hxSD70mqD/CsqzHXelVP0/52dLGdDprr7XovEZuw5U6krl93niHfGeW3zXvDudijc5ZHFmz4PxtMN3pVtCRpzyg/H45TSoAWKQrP91QxAQ+vxdsj6BcyZbuAxAbaARfu4gMgfRF+izuHciA7mbPiY+hFlA4fWq9JoZlYSH6RgsJKzmFpqPy6s+FEmWalWv8QVHDkibXlLmzOZrHQaGyedXaKwUsY8LMeyAxGlv2ZhLrPOfFm3aTdbmwmBAfJp+q44rY6M5tJa2OzX1tYsP2Sz8B+K1/WsFQH2MR363JRg1qBALkYEpvtD5e453JRx0uRml0Y7aSynXhBr9VRkw8MJ8Pou/VeCYtuiZSVdi6SkOOhycjlD5GO9eTwL3SBQ5vGpR0Ql0uYTZH/EpfsMmJhRU3lSh1zcumJ9N2aEFOzb6xor6c3VmdbnL+xT5kW8WUXUNt+7llPPiaB4QGWQ7eUz9HKS6rPVaSyK5ehl9VwSiEnfU9e1/XPnHYiKIyH9Fw59x2t1HKcOvIRS3SL3LXsY0XewsFSNwWRtXYpKEsl5dWcQJTaMkl1NEJUom4v2VHosrWqPzA5pfrDcGbRFLygUUUPxvmucr7Vfc9pOZCq19aIDVuuZHRx/aRh/uwqYmaPy9OTVLNMt/Qju/qFW9KiXHzgZf14MalTM+L0CQkZ92gpWlZvNuklpvJLOknPhEQUqa+LzvS+RVsabg6DM40nF8GO9y1sSKOvraOclrVT32lt1IGOVeHb7lqKQTK7PRBHUfotaSDmC6rYlOATYV6sXH6k71H5e3CR6pTbyVubaYMqBFSTvaRxMd3erneaJbi1utfxo4kGsA2yv3XbOlaJk7AUDUuCOjOxa8ZHQm5uH/+CVR8ilDwS1wfzBrWg6yZ88gMJkkcK9eWf7CBoKw3PIz/S4Eus8fWR1q7YGTgotYAQL5V55JAgex8ZE+2LiNRQ8bVkxqwWgg9vQ4uFGebo7iptVSazogRK8qa4amQuNeTx+3amIYn3z4X7Gw2um4JIJJKs75WrC89jlDOOHZ2cT3sAcNaxZcU5TWiST2hGOWDhVIwwy2ID4M0nuSzsbMZ2jNK3PYTWoirjr6qiXLwyzmPgZ1JcZ+VJbnEmQMLNzIW7/MJL//3ay68+f+mK5C2geF/2FtexvZ4Mj6Wi9yuq7bk5q+m5OTvgxWr1nN1qPmLhxm4w/02nH2mBJdIkRN/ki23tXQAi/Bg52UZkY/sq6vz6xoYTJXDzk3ECZK5lSZ/UBZR7zvIvhOdXW9tJOsC8ctRLJfrm3NzcU8yjl6NcKOQJoCXBcohuPVauEaNSKc46osZ2ym9oSmeTM4t2aA0bF+TQvvehvpzypJSgW5uMWnvK9Zw2aCnareosgVJIF+1L7u7pfjrprp2yfrcKDyhfPX5vZcR/vt5P8B1AexbLBcyVMRv7NkJUf8znRr6F//376Lk5dBbec0eAB7rVeRM6tdXqUo7pCjCpFG2Ef2b9QWPLyRcLHVBTtXe5kiikAIAWK51V5fantgm+pb6LvqWCb9hipantpE2zyQr1moOeVDygnP8IBIIULKw0X+G/e+kA2CZdfMCIV9voSPYchgRZ0N22ShRg1d/pCB59nZtxYjf57RcS5kCbbfup0ABTRoAIdV/NFiGLbDRuaKkPe0SbqacnJY+b1Y2k/7100AOuwC95bFVGpmYvtzoDDOWwG/qT6AMLfKHPs7DLLTSSVrukgdevED5OR/NlAojgEJVFUHhy4YWrl16j0Aq8J3IXRIUuBh0zQcY5ugnsKwDuWUmkrk9uEU+zUpSzma9fPl2BRHO3/UpKEfoGrawa9VLByCfOLGmqps7bEPFyueWLpnrpKjiPhpcYizxBomDaLBUwkw9os1lqKpLKlq5bJOu/jZVJJUCEsgJ9jp3ZatrS8y9fisTfrspKW8cidXj80yiX7JKyn/BlcvQp6/SUf0yZM9hhTpCfc4Lu93UO8geqju9t6l8494oPOzdsF9d4h7n0z9l9m3TWfyG4/7IopJe8d1itTZnmpLwsyR3vo5laFUg+NMnHbIcYSjLCItQH+dwvB1qTYgyHbgIEZUXU+mZ4Rv48CJUK2fOIT74jgbkEkoPjf7TU6YREvNAPjj+ACf1Ba9IP87jj5QtS1g7mRE1A1W42LDQQDssM2W4VMS5mV7XgTjV0yfd7iu4D0cJWiAQSlddPeqgd9SJPpuT7Mr9liT+csDR/qshtW7HaOh5nF29rihvTSvqC3lUcr9Ab9EG1dfj5rk3Q8Yj5euY7Qnly5yKszXfcdHxVslankdjXOfAp+Ehf6MQ+9HstKhhhtaJHhjlAvpz4MasJPjEtrBxaPayNNPuj3qAm1Wya1d3N65I2A4gv/ZS75xwHiSifBB8SPDO4gZErWVbFp1T8ikAdxlsm698QQoW3H7SbNrEqyBXg7TXDQKJ5hCljqHXZTvtjz5LtGcwFMTNjLaow7QQdGDLu492AixXnGJvMGOXCfTqbcFothZpBASyfMfmgsXdfwsXEFb6IHWF+QN/8jFfTyFIq9FlmFKFnAMu5clmHkDrrELMvf0SsAy31UKxaCMKy7ZVCy7KWM2HI/cSx9pYqcZAlmUdlJgg+KNP3EtMlseKLId8y06zQqcyaVDZYgznRN0YuQc+qojBAqgKWUXZ+Cs3CSDYOObGil8dJiWLHNa9ax5bK0o+jD8x2oWmkMA8ruQ1Vt4qYz0It3Ah5lXtJ3RluRXaQdcwL28PuU5uhGHITOAE5dnUP5ilEY0gZUh7KVXnfSe4hCRyLAUG51bwVRPrNTNpR0oKTrobyJYzqGuBK2YOMJXdIQ1MrT1C3Qgi2XPiZVohBMx3gN2JOtN0Zf0YnWSe6tmp3BBlsRC1hOwr476IigRrNUModv2IgekYeKjWw7cQVuhlUQpohVcz0NFRJNK1tczMjbftpcseqjLaNBdGQOSFtwQSZkSwLptOHo7fwj2CCUg025/9ljRMdu+VCqStQpDaqDWntts3Hzr2nd4c5W+2shvAgWXMF57Yq96cwBZT1Xse40QndrnJxSOX4XNZZd7QGKsWEAcAE4h9C50VgPleu9pKdpCdF/JR9Eu7dCaXEfHyKlYLQS3ZMS1fSkccHosDxgMB5V3KffvmnYIgCpgCil64D/pf3HA8lWLFWmE9y7nBNGuO57htV3HJxve14U9hMZbvat3nOAt1HOIEYnXBbz0Ff+dqQqqUNKbE6JO30sfgZsiJeY5sB4ge4L/iwXdXlTO3EYOzdhczfM89EQ9BhzGxh49krT+BwYx/rXsIHWyWptjlOOFuf0hH6OaejYEn3IHx2HzlhyOJ/Jxdn7Dr2SDO73oXV1Mp/FbJ+vZhoEiZFAUM6ZPWq0Phlx50UND65bucTUxGYEo0TENEFAImY1G8rKCeifD+NdSsyNcPY/Oh2J6nvKRrZYQMt8Cp7UgXICPX0KXucqFm+47gGKwNXdRh8KP8AKZrIIC+VHKgSEZmwggmNwiXrhpQWKfxEUWqDHINOKVzl6z+q1hPRt7e2X0xRIW4fP/Ij4Wgqf8aLouc0dVM0RLXzi/Lt0cCPOLOm9r3hY/q57/mj3RsZke4vF2Sz134klNXoxbSE+6PTZdgV2GQ62MRYJi0lchvINrruowc/+m33yaC1nqb9MfNASo4pTCqZdCQr5Gj2Gtti6qlRbB/32ZdO6a9yZVTzbdVa0pfpqXSL70P6UrHkVGa7MnoFCCbmzBFewjEHwLyRfrcPe9ipRHBy8nCd7Aahc4LXL/VVcJV0fCLHEVSu1R2WUG201Hz417iJT8fIdTr/3EJ1/v9n7+2b46rOfNH51/4U23XmVHfHrZZkDEmkEJcBY5wY40FOUjO24trq3pLabvUW3S3JhnEVhslAigwEZuYmlRMgTOZMblXuOdcIC4RfRBX3C9hfIZ/krudtrWetvXa/SAaSM5NUYvV+WXu9Pu/P73n8u43Z7x5rfHvu2PGZ72ioU/hcRmglLnyS+jBu2BE38WTCr2nQzPnRbV7Nrkuusgd5gRaabBPqIZIAfQoi/dBhC22t5DX+V33FlmfBGaRPWkfcSv70Rn+QrwVExhIgHENVT0hNRuFsp9M/rV66eHFm6rsnp55Np5bnFo9eWvx7KEqdTr1srjamFo/W5uD+4iuz9cdtmWpER/VoakzmnEsiwLR1mztCoTcPX03iS6qoq5no5by5EcnOBOJveHILrQLZesCCBREADfncQeC09DDPsTA6M/UwyTyrbpqzLiJMDbF6w6F1mmSBHQYHxkNyIaXoNxhB6bNlhepo2j/da7dG9MCi7xKRRCJcefCuQHNSyJeOwkd8L9M5jq+5jb6R19Ct8E48CL4ez3Jm48jCmfNT4Ifgwgt3jPzyrp8QtIP/3lGlTV1KkdK5ac1ejyYSWYV8h6r+kIuCqepFoYlerW3ZIoaPpRudQSW+SSh8wRJ2nr6PnDdpj8w9GjjVwxGs/OnnbyazyqNHV/34iSEorCrXQHnXisCrMSeWjx1TNIjv+F66WiJIdSSBU6QaRjUF2DIqO2PMWQZItpIpFujXcTB1y5fDA77aI9x7TCbhjD3A4H08cDW77J56yZR7GfwuZpn76VJ/2JEHdgUjGaK/x8fhv+eEsC8o7zVIceHO3sHj9Ansa7+aBH7X5hPZLBAMMAPEXdQEsMyVmVgMIac5IJOIkfCHLpQOYfejXgphqePH4Q0VhplIU+JDOYEuLqyDVb7PGIXKPVrAVj5kKF84osIVsm/GpTwts3WzrMUanUOvV8j8vv1TNicc1DLSWUJ8ifJ/+UdNp7+8yxhTDvsB9pkCUzRkyPJTpEm45azJ8jPcHjsBmFgB2AbPWzTLW+2gZrvOu0g4IxxKwYs9XKKwWNmvpDjgvyNJv1tAoXPtrKdUd6Ey3TNS8LTTNz3oN/e881CUf3U0AGyANxtrfrGkA2tGNRv28d8WGeeQ4UNrJCYarop21pC7guQQfF27sDzwtkMHDYDHscL0Q+YURqdRTtArib3oo2mgraZICXwwDXj38goboaLo8ap1QWtjsIuaoF1437vhmXoLHQ4xLByMHkZtW3sIgaFHEOgPPXrk+UNrVxv9XhMMWFgNej5Sfx2MoRRr2Ozlnc6Z7iD/cTvbqr6SLGWr6WY770HdnjVzUFal9glcQJwoTB+gSTpnXvEmCCZDwyUULUFSmjTY8Wvt1XxtwmqHw6fhmzLVBFuSBhbfkC5U+IAVtb2a2h6SLsoPJCptJ8/bvgRVsaOl19fa18zTl5EaQGLaSo9rEPKQHK6fh78HmGucSCHmIvvlmtN1D1pbppSAuOiRrzO98gkvvVLnV0of+U5s6DajkZSz4SmNh/rpZnZWwukLaSgWx6WQb7ip0sJiUe1EPcmEvzkEDnMfUERhaqHer8r2eNMvLKgzigpcIULTQsBJN04FAfrIcSi98bksOf9sTJCkpkZaTEuLbp8Vm/VDn71RZmgXy0O5KZ4NAxGPSX9jZSXrD86la1lV1cYATz/ind+Yj0fYR/NK8C0FSeXFaiNGZ9qHsyOc7EnhZQw+uo581mxdM3kQ4j5j/gGzFbyGbWyZ0WRJlb7TXVvEjx49Ou8eS44mQj55DbtrZX4iZHM0ZuGbET+R3CpPkvpohJfEg7Qq6FK4wCUf+ToyoCb89GjX1q8ffJa4089Rw5y+RB4GuuMqf00nP2n3stMb0A3Cl9FZeYbPYGIe1XEG2KRYWppyUGMQVK/Z1+lKuLvquEPnEuWVUulFZIzlJyzaijyWhEltSouBjzX6AORUrZU9hQk34b6vJU6og8+77ucbvWb2IuZykFqg0FhML/vZShW+WucGFLFpo4Ju2223okTVXCKoGSUbk9gH9QbnXQcauAOAuAGlM4KPqubBfJaeBbIZ20u2JRU58bUjJHCll8BFoJLoL3XP99qbRhL6IZjdjZ78H5e6J6mGiPk5O9OA/x6bfuzYpe4PYFqPX+riM5e6lHpv3t9YMkKrfh1Er6x15jy0QA3MTM9c6p6y9cqS1bw/mEOgQKGSGHBTII+QNmkX0RaiV6vqOOGkmpNpBSMVyhUnJfTww/MFGFvdZdjIhR4nhd6qL1ckxyXyqcMTcVnXZoHJxvYmSmj2wPKZqKnD4bFHl2N1ID+VuKD4K3WsrUfBNOi3mi2pu3estO5etz3B/PDIur7DykhJZ81u7T2dYsjSsEnjshIP7hHmcZjzCtaKblu877EGwG6yZQgC7JrlLakxfxPto19w8Y+7rGsLWtLntsBLxabGoJHrTUGMixSFMTrS2ZPnElevQJ4tw09vROZrGWjwEfwjQijHGSMCttWTiUuqfA3VU2IDxu7ymPHvCYY9QmaRFi2mmcWF3B7S49fF6oLZDSU4dUU4EYp6oTAjTKDB+duzgURgEL+nNwfVUeaNBptBIYEps3s5+L6KsxHXpacuF7N7Hv6Mi7CInPSCmcuf9AYumaZklh9ZgNijQ2lSNdIxjVRoTcSlLD7li+nUy4sXyYV8efGVmfrsjHUdd9dC1zGSnLmErFAc5vmPlIjA4Uv3yU/0KsqZuzzVENNkdtLDf6Bii7vJ5ToVYJydTdD5dY9BGiGLcKgJaAieDzOeElQfuRsMqABaET0CkHp2U6H/AJTiRAhAtv/o7b9mOES/JHF6WGVqi0xoFCqnuJZEMLG6jHFMRm4jC1N3zcXlWzpzIpnFZBDvlqG5hes8h0XHUJEHod/e7J95Zzl1wi5r8Goj0pQUoqeKWga3K7CS40ZUHTSMKhJH5cyyvuqpA6R1lYzyYEkjpVYtJgJceD5td6tSUbOAAK2y9NVvsqq739aAjF9UH4JrUCgv5JW9bCnPBwud3GhQ8YekuHT8bidfOdWJ3yKwi/g9jr6N32RDSvwmk2W8aa3dvY0unLxawmZXNmXgvfVVsE4QLZxnYA3z+fPmSZAzswEeZyOSFbywpEwKiM9S3rqOIrqZj34V+oVUpdnJ0p5rghoOKYDYzqEbtsHVdquVIfD+EY0/YH9Y8AH/wpMON0JZFEj7WBikAwjCiRrGE90LwdGAf6FtBylv+/JkwvfmPZwZuuzIl7o3H0J/0rP2t3cfcrT0ffN7XmNRwDGMGBYZwKIO2ewccs6nFCuhHjY7Hx75q//6z/85/9na2prubDTbU/0BFBacNpsGbRv96c12tjX9croOFgo2kEybA9rpN9NO1rjSH/8bsJueOH4c/zX/8f+dPf7444/NyjW6fmz22LHH/iqZ+TomYAM8hebz/0nXv7JhKHjfyLHNgREjKr3spY12L0tg8fVvfx8YWr22Zrht2jf82zwGdP8UiF+OLKZbWtDS2hg66M3DJ3u99HpjvZcPcrAmUBKKoUqGpaa9FaTj/Vo9AbNEKkmfU8nsPNLaNiSbzmKxFXg5X07Si+1FKXfdw4JfhoAW7nU31pYgJbXG11xZVvhdSxatm8SMAJhj53qV1IMUo9QN4axutbutfKtxCpQZGMyLL/zowqkXzzz9HMhiq4PBen9uerrXJFnQTOyq4aE8SfbRy+dO/cR7PFvLB5n3yjTJmFNw5rrZgFs4ef6Hl3/04ln97kp7sLqxBGvizqf7ayrttnp5u2U+Ydhp3xzsTorV5Ki9My8shO2ZUWNmqznl0Kb5S7Xbbs0e//bM8e9+d+axb3MTF04tXHj27JnTz10IW4LvLHcwi9m1Bwm504Ozzb89+3c/+LE0cfLM2YUXnv7hwpCxLfXydSND9qkzAJofGdJhKwlSakWz0+fYc5A7XHx4SdIvvMP5T/0RYfQtjFOvUeuYE3VDfR3sSRgVC2AxkGHofb0sfXP8jE1K46PGCx8H/MXVXrYcHTnbpeG+aZUeq1AlQvjK5aVO2sVQNTO5FcR9AijKrOei+P2Pddrdq+prdZi6+CdjijoqRzDZJETWH2HHjOiz3q9ieYSgP3mnOLWD/hS+gK3hS4K49VSem13WrfnpfG2NEmTa7LRtCJWXndfGqCk2MOnuNc3KVWnG8qvP91fG2SKmk801F+d8CmzhrYy/ZDMsAvuImGp1IMr4ZbSM8AuomoTp6XpL2G9xcE2X9Va4L9ob71geLjCbhmnbCKhVMwlgUi9YYUw/2t0rWXPwdJ/VNnGFgovdiKb1w4dZKSu8i4hSKfpnXsHUzLRFdbGpXgf8PtXroSZdT/pGyQHEuJ6477kBEIGHBKHjbVyippiwEXaLNbwhbzbNbf2KUZsmfGN9Ne9mE76zdH3d3JzwJdRI6XkjDkToEya/um+AQsTeOcyIbXd/1OvwPCMEgJ5ovnQ2Wx6QmxzE0ucJLc4iq0Gzz7xw7hRia7HH2Xz7gvCn0GOMZTzIjrHnwIS4SHUBkvkXAZbSHW2gp8JLwcdUGQ54Yj1tQzTag/cDm+iuLbb4GkVKP/wHBpzGsNmbxT4/fAvBv7Rtw0zgStY6wyHntPtZ6UsHrLy+SNo6+57sq0anbTfbaUe/yoUVjHJtNESol2Q1Tn1NVGJ8PWy239uUIAtr+HFfOqGmygZsFtq2Ig8GTLzofs1JNQF8AwmOxQvVheAExNf2yrDOrFOFGFrP2JCix22t3bVGsYrDM3TdrnlTiy8YHgWtzXsBv0MGEm+iag7L9FraXAUhBg7MdCvbNCJvH2jvdKtL18zph+rkwIcuwkcXlXnlUKHZAuAkjv0ssGR42QoAKHRvYNK5nRsr6QKQEJD3DXmcCkRqthLMMJxMc5L1ulemmyuGmRjRDm5Ou2IQ8NMFNGOvp2HuYOROrqzEPvGT1aznba7K2Y2nz2C0BLY//VNs7tL05rr5P4FdKn4U8ZcqPz5/jkJeVcGqCie4mxbdVg16cjW7fhZIl3d21DaXAheraf+yeZbeRojZF84+c/mHp/42eZKZd3NqOe9ABXD4JyP0SFhBwtO2F3+w8MK5BqIDVDu56dHCIO8ZrQvS9s8YwaQq7ZIz+5UblRqXeDZsV2Nk66/4Q4I7z2VpqwqoFpQB6sKkQKoCTxm9frHdWvSBJY1Av27N4e4hRkifZ6Ave93CuQft8ai9EfaDEdZpLkihay9fr1IbCP+kh8rpcL5J1sOVLpeozKJQ1uxRAoW3mDSbzSn47SBFenknEKQG6RJiIMFVgPGtpL12OpVdM6eshV4maRAEDWyIwzoocoOycN1TGJ+Dzj/0g3KENrqFgxtaWjPLwe1J9uXcmNmXZtfoqwlWiTRXAGDfaN/PUMoYmAtpzVGuIxWFE5xLNRWYveZqtknhU3969Q6i+BTIlfk2AVYo3E88TObGZTOP7R446SwaRnCrxr47S8kIi7vdP5eeA0g4OJlwap41z/xtlvbMZ76fHJuZAcDSln037NCpa+tef2wf1WdOPGLMjYZtS/V1zsaQ+PN1vT9G/xRua7WVTCUOGhdQS7/zxHE0tcFHvmv+w9iljrFf7zYt0bPxW7I4JG9QJI0FAPHlj1pUelOcmN0K0Erwqrq0AEH8wbVzWdbqP09s9OTGYNV/Pl9fNwev5gub+GkLFKfbwTFWLAlPTXuXN3od733vTmEHb6Vt6GFBJpPxITi8E9xUdWArs+meWBHM3fYmofBuDn6JLH4vnKlauMw2CjnEDzdkscTfQejDpEy1hO+o7TKvXXAe6rqaMhDz9e5C2EmrD9TI8SOw3eoGxctqLYEQkz0EX8ubPA1D4YDH8y9GeqMKCkvUlS5pHNSTWMLF8Lk97Iq7bKVw4tzmEc9vMPsSaq/WwFbF8RmiwzniFlWgfHF0XhUa05ea7+X/GWHCAaYGYq9gnAKpWr4Ste1qOLuAJxTgrPoQwL0HdTpthPohntTDQ2LjZd5tpkc9OXrUbZnvMaz1Y8AF5pLZxxUUfDWyV9npSUEoPF2s1trwxHCazTStm9d+AHECYA6ok96sgpJc2RutIttYR0HCBzYDyu5F+jypAg4WB0wtCWmbjJDJJa+tiutSzRl66D5rwRSc9CnGY9ynapdYfhekEFwJLInOiQMRCP7YsYa4CKk2MHA4NN9QbhMdtKAIwtC8pgNlNdlnOZwjSFryt9FXV3pArweVER1SLuLrXpnkfC9fa/ezBvgYO5sZOlYEyXXUofJ4U6S2hY3IKlve4kkLFnz4cjuc2TErVpATSU5NpAqSfaTvQo+je8Lr+f6TfxRX1qbT6N4B4a0g/21pzqDEO7tmpNHBY+wiA8Wmao0FdWvED/U317Q7vDjGLVSLPrCIDBBNaG0Azg5HRUcJTkPKRN+3yIpSVTo52WzmG91BsmBtLGyrM/v9Hr/35R8fvIfhtq8R+qCERcJXv7xb8Zc53KRasolMKt7o5ufz9Y11bZpSFgaRRNGAka7DY3oxxjpKhbWKfOSI60YSXzZExhtjvVwUjvuCJyp86JlZb0k0o2dm9aQBiwJtAeUfvv6nV/+jMPc4EVwsGedW8Pwq+yl0gzJoLYHckLyfVaPVauAFVA9YbFJaAt9SEXhbam4bYOaArjTAr6UeD+fVfb0wxYVj8Z6/4bc96BKSt6TQt66tHt/09owxLAqhclA4qodNUjgEMTkzPAgQ24cU9BVvftxwgwFS6FK5JoPj/12x7IHsl3fF6E/Cz2tsPrFzJUXnVUlyyueyVmWBbB3xEeUiGCrS3iiTmqzV+BkqQl9QxaQ4PYNtcEn4D2PV7qE3zoCuC9F/WHR1sBHKlp+nFSitQW+rashozT8/f/guFwBTdehZVA9xJSwVZ+K6A1VJwOrshUSgd3dkJARMLpee8Hfx0/hc8vx15A3mUbNZHVrdoUIKMpfgAE5h6VNS1aiyptFn8q0uuAiTZzI0V395t8a1L6C2R1D1DrByEsrKUDWgBcXe9/VgCoR5jl+z2dCV5zHKBnTRBFKv8GPkPtKYPXrzmiNrF75uOgrW9QROim3AfPVti/WDJU48T5T7uKAFJQiOwGknDG0Kp+bBbQTjQYAVkPxcfkCIrHmfCmQr8PHb0BLM2ja1fh9JDc2XrW6iEj8oWeHQoi1Ma7enJAJhkqNhPGqrBqOHeqguQw62stQxjGXXVJjWLta5jGb3havKnHpNCW4cN3QNDahePoBEK33/yeQ7zD5uhCzpmseQrvkQ1FLaVX+iiF83/VPApkunlhdfeeL4jb+WuPyrYUT+/0Icodimkpko31Zmrf+FC407QohAZBYZqDjfZUoSTxxFVdlzX0+uliuVTUTdmYw2fhRzEh6MGnrbzfBtTRl/Kfs15B/hxpOYJnA3UBBldi1d47AoADKA1LUyNylNBDA+7RRFJKZJDoc93bHNb0ifhVHiFIBaYRRgCU2oUUiBgjYZ6M6RUI8wWRJp85ZuoiSPkGchWavr2j9uNuHqu2RsYnjhxgQndfqnOPUn5i5Nm/8uHJVsHHu8zIr6J7g27NiiqGhPLG9n3Za0Uh9CI0qUdvErFsyjEQc16ROoFnoiMXWIJeHIkVpNuyvZAm6g6jdrpEF0zw2wOPphAzbeIBI1ICa2srPv9ozz6OrD/y+UgAkMiQ+92cW9fA6LINgkOL33okcF095s6S5EFjQU8RP7x4NbglnnA9wJop3NpoPMJwKzv4eQhrfNsQiiRDCHb9cnwXwNcZvepEQwCcFifu+dHgFBRiFkl5a0ERK9xFKQ5mrexmrfREIccTKrpYjJPyOAH5t3b9kkQ5jvdczaU5QUW+op6VRqnlrBRWzHO1RYGKXa266qiyI41vrsK4n1BGEhPwMZ4g5mIr6O2U63RGIhwEcFUi5YDFZiQ00J1wlkpIgsqgqJqRpynyWoKBDu5G5D02QpLEsbWlWX/aXuo7dZw2EqM8TpPF8Bx+tJCKetJ8+3m728ny8PJNXydHvw3MYSb73PdbvFblocTLs1SqAvw9EwL1JjKWG5PJDnhOGZ/WQ2hfTmLiNy4nHht2EL3yPmA0mMAu9oG3VkH9AroiR605OsNn3JCq5tNq4GYU0BLVekM3gjEuNTUOA8A6Avv5SKOfRdozzWgbX6cg5bOIgEQoBibxMsJJcGoG+ap/dn8Agn5Yif7BWgYSpiGAAfKcBPDr0jvUrvZ4uMVLSo+K5RzJgi/kSufJqMsr7QplVodYYQEKEo+aLHOMFsWb4iS4OuCx6vJ8tdf1HGyEHmMPLx0467KpC5pAQ6cCptkl3uZWCBPUqJZebH5atLXEYEUDztLfjBt47NHP8OBFciDAu+//1kBksHw9/fw/dwViR0dQhI0O9d+CNDsUIOsqAeCHRNWUP7R+MJTYqfO/nkDhXQvIcs6T6XvtScE6TO3TJkBUVp7QZuJJ4RCMn+HcqTHacGhZVw3/J0rCDTvzFqsuIpA+RemFpKAeIJo5ZWqb6YxCphobvihM7NHlu/Zpb9OIBvLOfdwVS//XI2N3ucp/hiiAtqE+/t2r9PCv1dwgUmdCaCGN9usIXmI50IXlbiUwO2IkrrLea+1ga562EI23WZ8xhDPWG4g49x/e5H8Cega3WuYoaZ8Z+6B4sWkQc7DOF9l2rN3iREYwrm3QNRwa/giojW2lTDxV8ll7piq2b5GRioFhqtsD8AXJ6rm91GJ+9MV0blPpiXDSXn7IfKAr78wx+fw5knkAep4rufI2iPGdeZCqKq7zgsa6VFEzS5MpfuBlOKp1NsPSoWQB+1P9hCLQWEk8ix8art6nOPZTBVZ+psi3PwKsoMHDm7si+2PQGK6/EKgLlqIrp/9nWmr24qqAuCpXkfbS33EcTeP5cV1segQC7wG1XVG+k/VEE/dpw9Kr998G5i+gY9fHMKVfR7oLtgPU3anMgCTjA4F8l0H8uCVYhnnCjWllQfxQYKH8VTgcj1PyO6qCpV+uMZ1RQk7nGJagUBMNkEFwFFgNdXSiBDHvw+RKBD/aZY2YaTEYJ3lI0XHV++z1Lke4tAjdse9TOqekv69n2pBL2t4eFHYCAQ5AGJCnZ+IlCAJWDonsARyFGPTDLAqMJBJKzQiMGbQ/JS8IxQE1c3IzhONsIbrXBePN6YBVS5QxhOyMA+Xqyr5adGtlvvpNfn2t1Ou5tNLXcyw1HTTnulO0UekWYGwbbzyUq6PvcdZLfmEUwXmoP/Y3ZbLAS1V8wJgZWvD8dwj/H6GSLnhKQkRSRCkR15Kx/UwDX4q+DJX3x5tyI46IekhhVOGBd3LtYsHjGo2tC11BrlV7kIh4t+K+2TVv5tjBGHEr/bcUMEx4y7Qpn7ysezw1tPW5CwNgcy2ywi/42rU2hbn6TkecjeTERqfm6LUwNxAKXrQrRQ6XAnYpju7Laj6LUvCo7LW3DgyL4AtKDM3xspafypmNJ8L++nRD7JOOm5LYpfcsG10S9sDwtzDMaCBJ4MSnc80dTsh3hNZl9asnWuPQ+zPRw3vBVqr9eS6LL8zg+9VPlrX/PRuchZMXl/IE4L/NsWI59DOh/UG4BxLX6V52Zkkit3ox56dgqZruPkuQaHqxh5G13D90TwjYm8FanrkV1rDy5vpVjIusg+ggq0bue7dzHcM+SGIM5yORyKqgoE3nDPFsXesgLk9rQGehoXlvG9ZzuRUhdGB8Lxluz8f3HivxFr39HWaPt6fMhKMsGefElF2e1bzXarN/mgoq0UBrWWdjfSzmWICI6O6oNQqf06TvKh/coYuHfAfislff2CvWWVJL5OlugdfLatmmnv5ZsZpOZV5AB9wCN5DcNAAGARlaVbQvqdg9OrlB5WVi+mqlqca0G/3HNfAlYhVcJ5p5RQCKs5aPZWd/lLss1dxtD3ksdmipKZ3cmILIi+F/JqsHUZWwtKldKp+RhNGzexC2+QkO8zK4asPkcodSRRI7YQsV6C9qiILAVVd7E6D003ezKcB1C9CfGJW4AvLGLYLhX+2kH2+RlSqj2kWO8I9iSxm3Ip8z1csZvwytfPKokSQGVtUN9ATDJ7DFNTefr42LApd8vIcieS/RyheHmWfR8qOsvxk4U68cZ6i+twGDr2sUj9XOljHFV4iP7LFTxss7tibt3TZBf8/KHJYIjN4OpmWNfJTBrsOfKyC0j1fqxpIyAKyD6irFl+EE4hXlMjDOxqS3OIMPDl3SLFYjHTsnqqxsf8Euxcy+1etpV2OtaEdcMFwIfpbWw9YAmffrycd7PagabrwR9sjT4PYXZHR1wyuf2CqwVUI6iZA+3/pMgWstiJl3GPo9G0z+DzBO2AsCQyE7XYIvwaDIcaEFcB9t+wwPCb7fTsBhYx9UK7xcGlw2Rj8xukD0prMPM2CN9MvMQij5z20jxoiqH2pQBn7/ejjYPIeM3Y9yc4/BvZ/Z1CjXzFWdZ10T/zWSQIN2ktG+hpcOHKwIf3PLrAtQfR/EGV4LD24K1Ami0CgqD7W8ZGgEIS4HqxEEVNjCOYsVgeAblHGJREgmLFv1Gpa+wDsOZD9Qh6fUh6w8PXw+8Xsh2MZmUL7thwG0m4O4Exuh+iFfydsCmutYs7NSFrgg3CDb8qYYB0fy9EA2ZDEsBUG62UXPhkR4Lvvzf+l7eDlulFhYcUgofge3VOlCsu1wQdr7iJHLkLKK+XP70XhED7sXC7hRyW7bA1FGzMYUDvoxfkAp/wg6iS6njBIubFh28QIdwt0ehAeBrjKW9W3mOV1cWO2RDkmARNpkkzFhuepIhBCAGsfENRrxDh7Th18G2Em2Z1UPbc4oFplsTEY0YSqv9v4ue//OO5Fy4kL/7o3Lkz504b/mvjvznqiNcZSUPE5IrhSTRlhsfI2f+saIW1JWWJDX5sZk/2lWgkjcqoouviDomMk3zEM2yiRqA3ncw1hMDVk6g/xVqNF6NGrXKmd0RxPcvovg4+B0dQp3UccM/4J5TjGGwVaBvdZU8qn91idNc++V3AX+XDDQbGedStymzR1uF1q+uMvlHZRqU7aX/byCZswY+q3lQsSeFjfSrSFzFD+yLbV7QDPxzpWFe4ZAcmYo8uUJB4K5UtxrAbFuJ+bt6wQZ5zTs8YMxSzPjKqYFsH4vqemEdH/5i1DfMV+5GsoU+oHoYK2rwkbLNSHxoT6gWGR94sicDU8Ye1R8P3LvpS7u+Gr81tlLawUncCYR02kqMYB2I+hGxlu5jXKFtiNymXgPwdjKqeF9hhuWNpc5IOY9exobLHfN3txFBEKXjM2zXejP2aOjc6fmbb160CBeTQkKQ6xaaVMkFqB9Sa0xmht0YrDqSF2BTA1zBW7ss/LhCMW0JwJnOJL/VwFLou51f0LQ+VblDKJHLyecAkPHHzkL8lXQokdHwuIkYfQKuwaUss0o/TduLrFpytbkTTMHeqUdAhywgCj4yTF79gtW20ulXXm2dMxcXmgIVh9frEFRVZp9yIyH8w7eaRKjT+RBR1Fbv3IHo0FE+K+ountnwRzc1VktOj12UOLVriro2dJQKStkCJkfPIIzFyGgWelCGbQmum68s/mv2dJ09j9cONXpY8yzY1PuNmvXepfJjNGr0vEW/Ruf6UDSDOAErFQiMGzDKrqDLTCYBZWezBQSaEbBox/COSqym0NJ5fZKcgEt6Ac2XOZYT8OwRQhTZK4T8UwLoH4mPhky6pOp4yrzkTssVg+nxBm6rD9LLlPrhcxzaglzLUpfxaqbhcxNpVZOl+YOSjg/gx0Qs46Y/McvmxE4ZJDqbIWZVaGyjJc0ks/gMfuI3M+RNuDe2cH2NciRhJ90swDPHRVFu4hdj/gUCzVR2v4rGSo1RHxWAKWDUqf+Rkg64knPG3wzXpIAdeR9XhoVyASjTQOawN9/LLaNZULoldZUu/K75TZP7KPMT59Ntgvt9lNEymxyzyBaYUTYdwHj8nXSamF1AgXiDfOzfZgw8xcNwrhRXWvtsNQ0Odg7lzXeBJYujQX6i2Ef05AqQ22d6gINFSg0vkvEKQAkB/ehfaglRDKOrd/tm0az0ZHJDhmMf8oz/eKggnSEGPuG0ceS1kBc350Rg4UMH+9e6YER+UJPxOB55fyDrZSi9d0+e/f+H0TxbwpHoZCsMGFOOBfOzivBCPDKGQ8rKBUdiwjAAGnRUx3HDPnFsosMo5SncIKlYOQ06pJ1KTs+BjkXKebA4FP+87RLc41VAHTh6y/S66XiKczzOuaTbYIvW+eFphvCrcdyg0+XgNerOiFBG0rwUmb1c7vAAcUJHcXkduiHOp5DdIj4QEvLjjQ/Y4sfX7pOVhzQm10Yeer3jMm5Oc/aAq8R7dtlKYL9z7YVB1VWzQj5y6ZWSLhJxBLvTJ+rz2EEDkbRFSxv0UM4j7tFiwk6nmpJTY3FFOAZGfJ2QP7ohpgMY6nii9kA/ukq31Q8yih4giyq2IcQ0zhrR51bKND/zYqokIvI0LgkQ/BNFGSAK6wwFCUFHp+MFFNIcuztgTvnk9GrlEUyTIAmJs1iFISKurioTyTe47JogYOtaoQYrIYjFqIT4dj0ogDSbRbINvfBIOi1/1UX256g1yhlyM4/TFp+n7ZqoqG41sQkg5A3PjF3j2vOi7bfPnZww0ROzV/K9uYUliUvi28skQx6PjjHn1t/GLt8SYuF0yo8XwuHsk05FMa5sRc0kAGlVXQEiJq6bQXkdf9uzMTOMaFy9QSRW2LRIVP0WCc8/Juh6HHIunHkybDKQEVQ3EcxX/Ppy8CD3H2HEYugT/WcbmGRS//Az/e5fEOv/YPUOhbLBJEwKQB3am6P5YMzKhqOBNWlTR3360QgPMyOdRtX28afWXBifAM1G79FaXPYntaxg6B6b2QzvZyXQiK8Dw/WVgP3JEKJpzm4ybGPv+6Hz3H7Fi+jrhj8X9nI3K+NqTtXZYZQhDtKpBrD54EHUIPtbu8OPb3TMkXdVqWgXbWk0hY+7iYhBIPuwT8E5jfaO/WvUDTz16QIZQf7GDE/QjM6i0D+W2B1h5DnZLibAWvHnKvYKW3JkG/nd6puZsScVI/8JMlI7kIt1h4LUTKhL9NWsK90VGPFwfjHhoiFzpui2rco7gcHVHvp/MFnKiqKsXZxZdABVemF1MkArx3a9AlQ7XKJLL4eVgTMKv/rPymC//eKpltjbVfZfiTQg76b4um4MXXEOoUKNGrvhnVsnfIDUShmMkMkTB2Qbp4YSPQqHQN7VhaA9t6XcDswJbkyLetzEsWp4ARBb7XVLcdgPCSQFtQSRH2dqUst1R/NUPWJxkO03IfZFO+RmePoZirRC+GPZmbOZt5TuOV0TZ2lql+KIR9kSYDrTwsaZrFJtgFnCAg7IderPBBHTPbJG7EfGDWMI5yxIoHBZkeIeDppBYwQVsduxv/X1NMXBShk8EEBTvWTq5i3/csZErrIqLm9lZG94/sNxU8zfDQRtk6qaAR2KuIjqG4b6zMe7ebFX2v23KODJvmuGB0MGi6WjYfTLfUkpK64lo6Ho1LHsWuhMWd3208qQL4IyIlrCmgbzsnBlvGVbw+9Auhq6NejHsybmcy/w9glmiA+mHo6j4oCkSs3Gb9qD4ZwHEVxo0jMmlanhkDXJI6XFg4TCUn4vXIsBjMveK8D27LkLe2yVeRmGpH2e/GYaTJxHyPlOQlA4g8T0zL++KpTMEmjgR4lLWKf7k3cKTFp05htUYInUHMm0Z7hIYfMNipDH4qyK0tzL9lpCEih8gCA5B0qqiLLjU51EVjEwSUmBDSqi1xomG1AdXbhIN21QtNMz9Fwaqkte8hOgytliACBnlgi05T8VvV3wfqOdGFXduiDD+GsWFl2cef3l3HubQiXVIdW4H6dEBtfXPmuS8fozdv1kI/7X8oUBIBZaxDJkRjbHmj1jmbTdm5g7d5N5w45njrvrTIU4T/D1JFfcJiS16xCKWdEngWnL6dgQqcYn00aEgQgUIlRKLfx/gKMTgr8IYJDzu55TLz+XEdVW7sMicAisBA4MX+Mxxz2BXGN15H/Ukip1tHRpcf0o0CfHW6DSXcOAeiLEdVjT90h1NBuYp7b5y2o+dJxkFdaKKzkFDtxSek2O0JfWd95XbGi7uBCmXo2ekkLQ4auTvlVUtwBmIaIwHGXMRg0aPiOIwymJGSw5VLys7Vl8ELRWO1xi9+WAkPtjhUvEg8q5jvL54EP3M4XFlgj+wQZUjBD5z/o0ie4eIJrWHYd2UV4UKXCjEDMxGKOBrjs8gxZDsKlCoBdrW6DrCgzxxpqAhRtCqJBQZIw8sdCMHK72Kw9ihFNNdL3RLb49P0G/8GezvunuSYqE/J+kEiJudw/fU6P0wdTbSB2fGw9V9RyQmVwCDueo4PBWoY2SzR7C3FKvUO56KhCvriaMrHSotHt6PZDY5scYrAu/f8nOrgjPnamDpj3sZaH4ekQ2YjyPuRI7uaz4n86W18U/xsGZQqrIybXioX4uWoXj0R/p3YSAZZc2zCIkJPyOLdA6jD57cSqFMk8J3FuiASzjwptOrKKOihRkx0XYeD71YhgLAz4Ldr2SkEWnHg3tRAMCmQfMU9o6r4pDE+dq+zrDZYvmGZVn+8u25XUM1qPQGixzpEpEAwO0F49LN0gTcy3vL51stgJ3rzWFpQL3hS175erb9XnDaUC3aHf84VPS+AJoOO3igYD3U4LjumoBM7GD0QUj1QZXaxS5It8ymqehqVRy066LZdymgSFeDZ8Q55fMn0GuyDxmmNNH+Y+Ev3BoTYLaMCV/qbdF9A7gulQOgLmQD2b/9bFAGfyq30K7XYIgfCXC1iKjRTAmxDVW6RvRWldBjLXqA+/JEOXxqIUJYeFrsVYDQ23ox3woN/LajFPizH4MFxbdrq+P4lkSyOLDspYGysXTJx+itumODC83fjRjlAf07txHHbnBP+iHHTDbhPnBYDMQz+k4yJ4BedMlHcg9wu4LYaj5YY4TcRyoFFpnU8Bb4ONTR6DjOWh854hnh6mhB9ITyUrsa5YsWVVXnRnAGO896FdjYfCcVX9ROqqOIGvFPmCrm4w/tDjcF+p8Ciz9+TFV0dG78AGHPfXr4dvKnz9tEHbT/l++hMqDBBBEYbpMuEWIKar1iPADEZG6CNU2KgI+RHRVKxCWEaMI8aazOYCsHHPbzkid2MT+yDIoCSrbTLAZZb+0yVo0Wuu6uYOY/AHmXTs/whC/P8/VvuJbo3gEuSk49nYdSkkrvK7nuOLhuor9u0EcMvJjZnnw3vF0STafkjNEhSQoxP7oYrDU4xz4hKbrkqAuqGvw36Gq7CzW8CHzaz95NwqkhbGuLMkMVAPYkvEQMtXcTm39cd3+qfLR9LFkFCzoVs4oCxLQQ2NElmZJBmU65Ffjq7J9kyO1tCmXDQmDiBSuxnI2VPFYvtU4UAlG9MI27luRwGlY9+bt03cgmkkCFmSkNnSNW8H18LCXSMF0M079cwpgnq/Kjz6cr7SbKrcV0PNqnashUKfC2VANljS201N1ED0UIahd5BrvMY4UuYRpaYZdZhJ57WB7illebyv6BcBKl8ub5VSMGCqNZhx9lMqe7+eikzpI2PbkTmB/GGTxZHn7gcfxa0F19qlyAO94nIkAibLmX/DckTX0RU6v9erTaGsQJC/gdb0DxnmkOZjuymrVXVgdY96ZizbswIRv9bGhKW5ANZ99rdftn1s1r/P4JTwrijCL1eHudwwPpvROciwM/9pOFMzeiDABOt4qpgQP2jg5C8MychXz1CHI64WKWzvjq8ZKVT2YSW7hpFlKW/drIBAxQNMZUfYOiZ0NUFsPa8H2wPkEgB5VDEvRJSx6CqAsks+QFQXakqhUTuf+c0bODslOQR0elo/zUWDCnM02yFPn59rV8LWcC6qtJnLCww/gd9x6+RQT0M3aUg7T4lh+kQbA491A42mto46iuKRqfQh2aN0a43YhEO4EfCeKDYC0pFKlf+szJVivp2udKHyPwjT+9+h8unT1E9FBpFcH6gAGJTimHSVH2vgAaJRKWIxaN0bHSW+3Bqo6WjtctD15cSDczxt0I7ryY9Qe9dnOQDPKklYPNhKMUF9Y75htmjmtJ2DfOU6noMX1kGTYpfeF3TnfypbSj5rtfEuAXvPeCebTXNvMHvN6+6b6snxWZgFsWmCC0GwlMUBhHVlBxLI3z4SZOYRkSK3aQnLrjYU3QrChQGwmp0obVaNCs5DC41jkMdFF7bfd9nP78MlHhmBGxphjwQlqNXUQGHvhYnbZ4yipO7GTn8F+DwtQRaypoLmVl+MxX7DkURORwN0ON6Yg+5LI3zeZCKdaW9IPB/SwWlFktORk4UbXS0MUxDoo+A/JaqOOySFJInpiUTUJBwXSJIOKJLZaaPiIWG8JcpRQ1Ha0e5PuWJh6InlGe7GeTyNFCoq36FgUchS3ScwvpxFBSvAqBUg2yzr35YKdG/HFfkg4UT9TCzjFCjI7Ux3DCZ9pt9fI21On0F/0kXWeYJwb1Onn+h5d/9OJZ7dVl+m+aBi/0XeeNmOKWpza6bSDDaacmGh63duHkmbMLLzz9wwXV5gK4XxRZBRKxB4WrsZQ31s2Wal4EzrcTAK95Bg2CnSKgSDQ6mK2q5GGY38LA26hF+eM+84L08eT6uhGW8l4mIcS3VB3JHdkjAjDA9RhlvKcWLjx79szp5y7IgA03fbYDWgHwqCFyZEi1CxXhJAcjrCoZEAF/1Qx3TxYbzbzbTAdVXi0EDMIbdZ4g9kWGeM2SrXUgPK0iTJanmSurExdw8g2+ctVLSzisAuB/z7p8EbygkfAGNzLxm2IxMVsGqsUhWlhEACRQOiUhfvnHP731v+OZnpin1k1SiEzsppiYY8XGRkJ7bA4b+H/jDXjQd7EHCtBx5rD/CksbYkyUj3QGGbwBz/Rx39yRkwY+xcBdtzwcXRaW+/BzRhy8A10q1DBSrH2YYnlxsaZZb0RKKc/jqBdLBkEh8Lw/sAL5cCHyZAfKTJ49eS5Jm82s7wmQxQTFH58/R6TK1TLYa8S2g6NRipfGju2u89eEQnRSpZif19G9fxdvAPN+Ww8Kg1ZrAVc+MDNxsRCvk2v6ZqII9lelBb/nPmIxYGMFGULJnE16sZlSnF0q5GpEWe17GuYhcpjan0EMV0yh1lhTw6fIJ/AjwMUQP/N36GnfhQBQ8M3cZ2H6nVJ6Afu0euFH52puO3sGDggLx0Skcb7+y0I8WRxyEB/2CqaDYM61cXDigK3vKoZ/q4xaVBUv0ZZvkpo87fK94vEf09ooAi4bvQkzAQ0ud1EBr1pSUysRlg84YxYwdDiJKnjl7nKIPspHHqZtWZkE9ovd18iHYc6mdnWCx0itEx8gWcw9KUK8M8qJu1/Xa7XoaI2kI461GEJ/Y8Csil2Zx6bY63IHMhBKZ/J3aPKnzUrCqaLwjMq/O9z0I6zXApqXW/Xi1kCMGypY/Fw5c57cOQIK+ou0/47J0EagYTp+Eql36cVdBCU04yp7uBdKjv8HEnsSjTvhmunJgcbmxX9Yj2shgdNSsBOJRf//1Inwgf8x5geMePcKVUV03rwrBUHqKEm/NPP3cMdLSlPgkAmDCnY58+jFjS6AQNiRqJpHmIii+Jq4TkgcHWKAiEYcuH1zOAL6SbMAERd32IGwh4QAdpMQ8qDSFk2yp63aw33L6c5GKVur+yVfrYbFE+/c1kYo/Em728q3+rhDz+dbWW9hNeuAvn2HTr15EpOZdeL8Nuxru+6BOpB44TjghadIRIFV9jzpgeJxMOZL5MoubYODEZFWVVyo48Z6MkVFDKZoaZ8MctXJ12dHX0LH0Od/mGId/QUVbDgAVb1LSI/kgvWY64kEDVLa3gibQU27uTI11cv6Rk2dmlrOe83M/ErNNDcqj4CahTIBCqYg6ekMhqIaofh4CT513d7hwXxhhve2KOZgo0x+0p56th1SA9+RBI1Y536Z8wmNKLHojoS2GVh/YFJ3JTj2LjJUFFwS3J60KioIw3eOL0G0GrgS6mh8NbpgG0q4opecXLlDofT7m02fBgx7cmo1g8qW4eJ0sYQift7i+aN9sxzFv0w/0iUhaCBebcGy2ICnrq+btiU4YAl/lUUHqLuPLjygrNFCfICRSAABG7qDcTEq8sOr+RJDCi1g1qJ559aDT5JZOMNf/nF8/z8wFdunl3tnuhi1QIluuKUvwzQEWEuF24bKqWtmC/QHuqU+HJfShtRdaQcvKVbHHVN5iSuGD8BP/pC9s3zV/b12zf2dtjDmHQLdhqw7L6asVXIj2CflgcTDJZ+yAs5uiDTCWlLyMTzcFSIyYo6iyY7UWY6k3M5FKldbmA6Vkafqn9rmtTHolquke5vcWpSUEQGT98haMQZW6FxJRLRLGFCB0OpZmgqupxSkopm+CDnGT4nHLYiMC3URlN8DK4cC+h6Kbm8jHnFnjlhGAiWuCl5xTRZ0sHK5t9HJ+gD7eGzydbUVhktkfSsDOKDkm+MtDMivMH0StIZKtQMuhz0eT1x1qvFNScIoSftzsWb0DT2xdMZHTCqyZGupRbtUpAK5NzVgBh92Nrb9B9XZkPYLQfssTm0H2O4Pf0YiQ0OcZUj6Ca7T3z/LV0eMk2UOGeny1ZJa66NGandLUT0sDFc+wi6ZwKKhhDDrlab4R7CtDIultgj1alYOOzRVD8utYoUtwROlnn9MDg3YsMMIDtqqh2HOR9LtR6RrfxgeMyOoSSf3l5mdLBZyM9eujdgPFMMEgwt3gLXUa+E/yK0fi5w3kv1JKN7C74Izs8wutK+Uh4MJPeFEWwFh6Gw/eHdknNjQpaDoa97q5SGuZ/MUCoSLHGuztiJSbFlGl5JNJLUMvH7sVVZZE34Wb9o61esdrDTN7wowv3tc5QRA9u5SfQD5Um0f8Is6L60AQDR2NXYLMdTu9Qcw4Rb92NnukQwUYK73CWW9lbaVQhu3KaJ+tY41C2v1gAZq6A8LikHJ5nsI7r+rjS4Ym+dDfvY7+daF9prhXBDrBCmjtWTSJY6oat9RqlokE3QbIWZu2Wwdl66FcZ8AMMV2dRbIClVeENwZcHl8W50vNtiB+xWHLkpySd0ZxerqjCeLjeW8dyptrro0zSZQ+2Z42MyVMnXhBh/kwjk+2elUJeezQ2cafgaHXOkbfOv5FCuV6wTLeT/6fT5QeElXsZ+3m1pICH89oXWfl/PHQ1M7A+YL/sw3BlWP/akxcIlPoRXe69S8Gj6MyuyM4zMzM7Qu+p4yTry81jC7n0rcVcPM2ZaQJH8fQw1R++OI3dTNTpb2ZBD2AT4JQO1BMQVl85UbNBM0MyrNsX+929T14guddozDiAU1QKHvAH/gSH6HKAOHHhe5lmylg+aqbvRGrdGEa26Y2aMbplvgKuraWWMt6/fTlQxxihYGPegVFrSviAndkelblZJh33As66KlHfURZ6wO4EOnOrGj1oXts9VL1z3607WJy2ofw0/eKvCC+XnjMDz0V38Z/9na2poGSI2pvtnh7eZ0L+vnG71m1p/ebGdb06RtT60h8GlvGmzH/caV/mTfMEds5onjx/Ff85/g3+OPH3vi23KNrh+bOX7s23+VzHwdE7AB4EDm83/1n/M/lQ1DESis3AhuRo94aaPdyxJYfP3b3wfgIVnL0Q308pp5DIx0p+BI2wPUS7eIo+DB8Ag2xj2ah0/2eun1xnovH+SA9dDoG8EnM5THHGrDwDcAZbdvhI22eTQVPO2pZHYe6VcbC22gsQ5ezpeT9GJ7kYKl+0hEKkBDCve6G2tLELFV42tG6GGaA78hDlD6bEbQwKTTKmE/pnD44fxXt9Df0zgFgaIwmLMnnzp1dsG0ZWhkF0AyMPwN/2r0NiRfFQX0Tzgk+R2KX+gOmvTsoNlYT3sDTHB98O9YV+11sK+jpUnlzsf9l9gWmoXBfIItnpFf0KL9gSExaTNbyo0CgG912ks9swOoG+aH6XC/kTWxH+8aye1jNJkg+hOIM/RS2r4MKLVpG996ejUdnD5/AV55wVw9eaaeLOS91D5qZLWNVkaP4p8VDHAdrPby9XbTPraSrbW71OJp/BMeo4Kf9pm03R9stNo5PYX3kpNnzArCRWxWftSTc/kAx3n2+XpyNl3quw/18qvUQI/UoGsnz7jOmj518gH1lv6GR1RB9qdwb/HjrSxb7+DDz5i/znrwZKhCg6YnK2SezzrZZtbtmO7gS6fwJ/aOjLWfIWLeG95Uw3brb/SW8Y2f8A94/um8lbU31uyDg15K03zB/NFI2xWJjrjNUOJ7WDucNXt5yxzpDerN8/AXzeIUwiAQfI082M3hCOOT53JroPiVxVO+IwVmB1vtART6hp7gn5W6LS6/i6ooPcbmPnpQbH8/yZYYdG7nwcdT7P0HAEo+Mv118+3l6/jSAv2Nz/8WQjHQ13bLexCBZ9yzEAoMskOLJwfsDm/iYdqxWqj2n1NbvY1B3sNm8C8jgi/njI0BR/VVmikZmHmmlzavZvYN+tXIeyvlL/WbWYd20sLGetaDX7jGRtFZNZvOUKMO1Fnu8T7u5Uud/BrF2f6GUMzQJX0Hkz3gHrw96DV6S9earS4QbInwQvMKvvKWtWbvoAP1bWp7pT1Y3VgyX6RTgjV1kxfTLWiR7hmK0WvmXTOTA2hZv6beqYgX+HZCacmYiwKrxBsgNcR5HV+gPxutbLOiatLTY8ttc2C6LRrrv1MZLxin0bXOnBcL+DPtfjPv0ar+Mzrt93ABucKqDiV5yz6cLB6+YWi41U46S51qu6X4VpVI+8V2axG4ycWkbRSzGhRnMGqNfa3dP9n235v+qTkv041B1h/ADXj6MN8CxtqgTVg1/ALE4QKcsFE52t0rWXPwNKpQh7UughKYaCMgbNaN0EvisGoHNABqC4tTGLmUcn6jRgC4XWHBFh5f6WFGAj9uLyMcskWUMaT7qvlFvNE0NjgD2EvWR4k/YMoW5XXsuFEzqGUjTRQ7Yhgm9UOrjM2N3gvdKjbIWgi0tgbs9gbK/lX1sVpRlG8PREtsDxoZZoaZpVq7aH7BsopmeMNT+taKFrDmKmBaWR8udMJ0zbxPHbRTAFh4G4MAMRZmS1ytcBvv2FeGdfoIviu9BSXryBHzRb5Qg8YI3gsv1MKB8LdwKLiIKXQZUGTSzeyptFfFweRGX+oakuPvRL3GojqfNntDjdV8rk4NQNbiXIIC03nz2mHSyfiraRskA6fKFi0S2K5eZL2lgt10CDZozOYIn+pnHXMBe25eCNcGH7OfzlrtQXW5q5VbBEsxQwetPzevVSmww4ZoEQb6Z0hGgZi86eLlUERil+XnCca6oBGZg2wNZQLfBkgPtcCTix1fdzv6kNkPSRUuXk3aXRhSLSFkqc7Fq2bN183/y8al57vVddaMec3WtZ4cLpq1QtmZGLQ7GW062x+YRiF/tPmIAsLfAMPCKTOKNPU3m6BWV1/BgIu5pIM1bq5mhlnzWyA+HDkCw6AmLa5bB6rfnMA3qCgr5O2AORauS0toGY1hr9M6yuV1OTrr9pC0jHQxyBK5ME/20vUSGgCg0bFJSttGYtxYr6btAppQ2hYc7OAI8+y4IcNXWJsxOkUHZpkxjk0bdJ3XVD7bzwZg6ECQtshI4dPl5GOzVhwmDr4wJTdq/D87sv7WEKbRJ8kOM/Wpsqy9OMWgSegOgbtgloOh+k+1u01+DCQV2AemaX7MSABYHBNhI4F7k0MdQ8vxTKk7MVj+bNNtjk2Eiz5vtI10JaWNw+DgPLPQN7fy2g4OhurILqdtwO3TXgeZ2UoZUCkB/C19EIdEP6onpP3UE6ve4NGooKAO+tQc00kBQwRvTRDna23cbOydM7JRu5tNLXeya/Nm8tor3SkCQWwa2SzrzScr6frc7IwHzjSkygV+M1GrSr6ihO6CF7oG7Zh7mNa5y2Uf7da10Jn9raBQ21LeMoOV+TP0yLyzlq5XgfLY6huDfGUFyIFdx5x2OHOPXHanPp7EX8xdxU6HHUWS1nxmiQxlXEALKfjhLXatpCE14DH7dyTooJol5xBzE87bfJIRzHqekeLGFd9MoU1FAIMFgNWxApImY0beaJhjVu0m3zefNBwEGGyd/5/g1P7VZRXteCjI4hfc0dW8md2St65L9KMorKGw+WK7f7XaMwp62jSnDnQ2P+zQrA1w5BeM5FNF3nwZX4vBxvlvPMNQqLRpoeE5bF52sWCV/lJlEeBZwfYxf4txOimBDfAx8ucE+LOTgUrA0UNSdWVb3qWENappql1RpDFhXAMX9EYQ0DPnp3ShjLkiNDEYAyiy08YjsVerbqu3YNAI6MlkvALXegPj1wUbw7Qs3Q8wWC96yQ0BUvBdPxxV6lDo/RhmtdiooTpCmd2iyiouJsjMp0JSkUQwTJ2DOfaLwnkL5EXq37J5/Rh4tSNRQ1yXDqcKU5TeKQBk1Vk+pHgGwQjmUh5q9Fx+iumk3TtGIVYYux+VzYSPFweYuwPG2P2Is4p8yONPXH05ikW/JZn1nxdD0HjCigXj/FIADrQeNyeEL7A+YNhiPjAD4NOH5/xXtgj2LQ8rl9Bsb0o0BInQEJZBO94rTPKGNdPsJD7V4qh63KXsg8Wl3OWa8qpbP2yDNaFieJ1cba5mIFlyVW7OyXp7jkF7d4KY6Z9T7LPLEUJwGDmh42zexO3cm0wB7A6VMoqMmQx0RWJ647OpVoAB1kPIxYrHNCPk0qptWrsF5GVN1p02C3fEIs8k3YsjRpcsPNPP1zLF5rSJRPRaEj0DOuvINxUGCbyu+VURb+Ev7Py5fAs/aVWrBCPDNoz6s2wEJAhqI93TE+2DV+PzYu9TH52WqEbMthGrkQnbI/xrdItaDbWDNhBDfp588vuJXizGWC4yO9hc09mgOc2LTJqXGFQaKMCdhflOWy0M7+mv5lvsKjUsS9z6K1V5BT2fjSt5u1utXOpqQAoQpGYMA0zbHQwCnyETi52RLkApaIUZHTFqQ1i5G76Ahglu6wQP+IMH//eDXz9498FvHvxyzqZaI4CiRvDcJQueYwj3MFLtVb/O5B4h3XAaKu5+/MY/u2RwfN9NnoeFCBIGRj2tpf2XHHWm5DJE9yJEetEXJphLfJgsCG78D94fNVo6wL8uboAiuqldJNNw1uvlPXwXLdPSBW2x40vapGP76dkUg7OGgRQcm9DzrEA9svLZkI/TWY7XSWoNIghceEnRgmTVsevdJhRTzXtWQ1NH7JBTTNE8CXvuYvvo0cV6QoDQmqQc9nZgJUkoJxv0GnxYYHw5KJROHk3+783FXaT4cInxa3Q+KNolyFLM3ZxkX8h0X0BVBxoJJzzr2zMEB8z8buD6whTSkh89Op/4g/vtr3S3KAoRLriXRXWiEJDg7X8O3qaPkq0UtfYg5hgmKoI4LKtGRGJewOYjW2GScYRVisPAPTCn8RcdrHzVUXO17ZxtGm/D9FZDe3Ut5Fqe8mhNyBgXa0t3r2T5alvBCctvBBOu1GwCielmL62VxTLZwM+8ie7vBijNABEzSNvdfhXs9IZTBsxRsRcKZ3Jm1yYEkpWbcOC2Mwv4sZn/YutXvBVwH9LVJwrFQ4DoKYdlEVbdjkhyBcnzIx8ui/NTvwhFHcH2QmAJfWptlYfdh2+6sgl6ZFJKEtTeumawdebohyXDqxAYBDPppt0s/lkMLBrD02HfOO05XQovQKesbwReee6FhQsLlxdefBrMxkm2MQdu8/w52HSnfmTeB5+uvfKjBXNlLe1sgeWo22/Anw2opmOaVH04uTHIpdtSS7NWT1Jz+amAlTgRaSUHQbU60N4ZMNo/nw5WzYeuVY04gX/3ciONVZ9JB1mja0SqWjKdzM7MzCRTiXlXZVUk30u+O2OdJRUPCZuAJyrew489MeMeV1/qmw88McMEHBN2aVuBbnDbb+I7Txwvb4Pah1YevlFoAVPmgKFmWwkMzcxD8i0cl5k4MOn7IWXiV6zMoPmiRkEv1aljGFyibBPr1ZYhIgNsssZw9ub/+fLzhiSsVuHyLI9vO1G3n8s3en1+bU6/1u5uDECUL4sLPU17QGiR3RKlzpZe01ywW/Gipn2LAokrtBC1MAbf5+Q307hra2MJbeGHCd+KsIKxDDTg69wH1ZXq6d4h925yfM5snhDJEDT3N6Q6HRlGthmr5XOcoqCz0IVFNmb6siGCfBOxpRRrUSjrhXwSsVJ9YRHCf+bZEuol1b0aCjYPOnIZxCI0lHGlRQopRnPODkcm+zjeD3aIz8sp9JuSfTNno1IQ6DHaDsnZYhGQ+cYCu4cp8wUWm0zzDr2eorxRi/cn1zzsPDkhbIMPv33LN8Kg4e+ehbD1LDCgJPN4PkLYjTcIOr6Y9+5hIIiCwCmlbltHK2vkXUXyTlAOpdsVUt+LEePBqEaxL4zdHqpzEO+OHR6vFfIaBBk+4KeAY3kkxwhU1T0QQI6wh8VMuTYR01W3ITKIiY4PfRIEyA9RHHsTo9BKdhIvHVt4UK+Zc4U6pDOCyiimQIYlsUWMdoNIHMHG9wDf95itf8wl/FRJFzk7QD/EJ6t3dZEGyjTn3UDVh2mWKf/ancOK++oYdkuqRctHSsX9DyqXDFExYrydrTzmKRi4p3/YkUMbsL/UXQzZHpFkAwMlZbVWHEjgFBelM+t7vmyrZR72tGwaNOv4qg7LXnjsBBKpePTwmP4rAsERxd3GN0t2udjyA+QzqF+itfC4/lOYdr2nDjSHN4bwdpo4y9tPl4RRXDTtY9gqRQOCsFiJBcnbfCxpa6yMozbEcx4N9Cbwf/fEPwy5UJuZ8w3Hiq6LLfQ0NVDtST6HY0E9mx6l8zu8c3PjcGRbOXn46f3rT6F51tq4x1SiGH9PjNHC64lBg+vlgwf/48H75v8/evBvD/6fB/9boRRTSrogwmrTF+ZR25y/QqxjUhV9AVGOySTtqQs1ZuegsKlQZMtgUYjCKogkEIk9Htv/mDNzlcCkzPR8aLF0pOUdqH9avYyWqO6xcPmFCle5gsaL6VYXMWEm1NLwnacGXS6fMX5ynyunJ1sZm3oOV+VGscRy4FepBN0+wLYc8Z1xdyUVHwSnod5edxIU8G6KS9BWIJRSnC4n2ittYLcPwd6MsUHrwbasW6T/dx04IWIHwR+htI7Aha9inDVgbb3dcAMfI6/T7gIObXA7qXz72WWrhbFvy+bWKgShXM2ydTJ+MlUdZZd1PLyEUaKN1rBnZ++K89AbyrOjexGaY33XiL7rpKUjGV6CeI2CRwhH81Taa7TavcF1UE8Vz/t3Jle8lZwLZJckQ8J63k64TJ+NZyfuyCKkOMuHBBII/IHZdoSH5luZPvRdAJ5FiRUOwXr2EdwVdqwLOtY+Cl1k9HXyIzuJz5YN4A2BlOFZiMmLpmL7nC9baRck1q9dSnVGSbRGDnXY8QDAr8add2JLZKDquQk8cGr0lhezg01xQ19ppa8sFpZG+MsEnjZ5pc4eqY98ywS6+XRlAeqZNrN6cv2L0TUvJwlLUZE+FOXLu+s56UJHgp1ae9GXSLUQP/QroZuOF8bNyrtss4uvE1k3QkWgMmErvrh+SJHkYQL8Uii8jzmXo5wZzoogpiQykQtdDJXez6WUAdRXIK2mUjuANqEGX3ImRXCpftMkZ8iJf68M+Med/yIBdox8gnPuXpLlHufb4eGGUIFHeJqLnfpqznPxOyUnersgdqIkVn54S16oPPLDOmKq/kKPK6gKJImNpytYFceJb3q/2fQd0ZYg1CztZWmkwby73F6ZonbQFbiedToYXwVPYJOeh1ACmRGyQvVEpEXKVqH2IF+F+1FPXtF5J14p82BLaddhgc/yGkULR5oHOTakSCzCjCwQ1gAPY3Mid/44J8/GLQVhJRUbbuYJusV4lgBLLzhC+gy5OCU7PpdjEj9a+9653tBcSJbycC61V85A8JtEq0QUJyUn+0oTXDs9nKjuazF0esRW2kdXFveTZsl1GloZ5PllcyU5Ab+SORV2g1yTn/37v4e2amynO2XPrYb0kK/U7MFoIOnCznIqJldcKo3yK7ZPU+EoRcwaqO6WQzmFWcZakFXqpdYOaRXKWx9ug/gQy/DeQ/OspxNqeOFdDreSyGa2iRlJ0PP6CzZKaVdGWwUOS1qFswpxmHHMNiQxnoeipk2+d8ijxe4cuiMbaImHnIJf3EMSPnXIBmBIiaZfFHRqEVIOH1IQyToU68ZhfwdLp5k2l+ER7WeWeahTSynszIQlMfgXYdH4ehG+6gYBKXhGhY8tyNPeg89JDOIBgBXJHFD08VutvY5PqGAAebjffjnD4IVjx9n7/psH7yZVlPas/+/hq3XfdsWmq1ojUcVFBeWQCDVVcf5UStaFsKPsEX2VYpQlBYpxIbY931i9uKgOKvQWg+R5J4KClF2MFxbCIzvf64zGJ7BYaJfjOaXgdrSp2RqM6EEeHSyu3LIKEOwgp3AMs2ylzJ8QkXxiBJmcDCBTbOvZ0SMID8p+SdxHBfPSzrAa18z2G4lfEAPzNSz0uvWw3jaLeNupXRZmgeoJkNP93WiU1FJ61dLM0gM/lHXwW7UR7GVMqhshusNo7jCSi1jTa6dzHbZDvqYCvU18+RK9ja9ycdE9tVA2mPg+ptYkqBHjoilBjEN/Su2kTtZM+1erNn7OUYFJMqe0xKvtnJYYnKjEzXc6rh5mqQrArTbAXsXxOtn4dG75DyfuKYCU6McFE/RrWNXYiQ+Eq1oJDZhsufaV4NZIQhpjC2IW7M6Q//MVr1mB3nkVb4ecczMzgas1FE4K3hLXHCkDf8Hoav+n4b8xGu2ECHBD8d9mv/3txx47HuK/PfHEf+G//Rf+218I/tuZhQsA/2bkkVcSqGlaoaqydcbBqJzln6a5HoA2Pf54PelsduaSWZe1+W86yplQ6UFyw6JdJMRpOGeq/ISaClxDWCPOyH0DIcyRLbwhyZ+oZdzlsjhSF5cTkYplBe64QjH3CRO3LjUP0LdPbv6fg+CO6Z486LWNzqDtBv08/5RBzz7+XR71MTfqDyzULoqpUOXg5yQVzAXjrQejBe0KNBVzFSHWIC5X0LQ5ueBVK+4Ad93mvFtmuNusIO1hUOBNl1OKedQQdaLHZobgRnYef9hxfVdW87G62TvNuYST/niIDiDtvqv2gBnBCU4RFeCx3yUoYbuIbt1c0PCD/wGxC5iO/blEvioNT+m5iJVFcPiF8ax3MLzLjenoUTWqYzPf4VEdd0P5VzJbqyGYzvyacZJvU9FPneD8tqC32nxlF4AHiiHEZ9zh9QnQyi1i2G2G+gpyRFySh9JAI+LSXaoh6YKxqVKRmgpYg7V0kLm5+JG7YqfjsVmejsfddPwWteubiGn3OlYRp/ThWxxxYmvtSUf8aJY5XVLVKzLoMlt0YdrPdSp5IW/e1Uu4Szsap/ptGOvhxXlLpy4/9beXzzzDUENIuIpxfR2g0u7hix1Gj+mQvOiAzwwx9dIamJIqk8nRLlDhmVqtwc786vSlp6onnqxear3y2I3a0eqJI5datdr0ipExv/wdqkKu+Va+1qf2hWVgy+lSP/oJszDAKpL/DukX9SS3PyxJ5/6CyQZDEAfIRJCLDJLvmT+PY7z3bcl9wiIFRmDOkXfM+jfpBpZEMe/n8H74+i0KKfXb88dIkPzNTp+2lZrMMTBazGsjcNtb+YAg26FxALPR3x5s5X5WSjf5npkuGMSMA/BBm7d7aQu0jEEfqmltoY6Fht1B3yXsmKMJ6v/QzJiuvlE1TSGzNo3wE/w+LCj0Mp7VYu94eS34XbRC2A19TQ3SfvUavPmsYe1/m6W9qunTNZVZw784/Qb+hHw90f3wE+3lZdmRtBGr5qswn1Pw+arZ1ck0JRbxgDCzD98ym0knOPlwEpzKMwjfmHVvGJr/htR/dE+Lx0ZmJcwdctNVkj1kGnl0OIWsKdjotWg+MD5sNHFwssz5BQmjLiQSwMZAPRQwdfiH8NT3B4W4mvXGiQLmNAl4Wr8N6K6dCT2wKQC2T/gOzvSE76BLdsJ3OpPFy5YCRhYAHv3tAJndc5oBUbEVc9XmlCE2hZXLBu3lOckpM3/XDedYtRfM37ht/EyPjv6kQgssVCwg+IuWF+Qozx/h6nv2ZDI+Ic4vIUNWY3CQ8D4NAfKDmw1Cl7BIjhXPbwAnU80FPb3YAFmFEqw4sV09Y9unx2r+h80M8XfNX+qz9iYwMSWJ4yEEA90uSZQAJaNTulwhL+R2o9/0KmLaImB+J2HVqJPmr7CTcJM7SeZsLAuGrhMQCZ/Jnxvev/KXhnQtBNRUe2Qtb2VG9qn21Z6qwPxjWdQ+LTWslZldvFTt80TPmi5xcqkZlNyj8al7kC7ypJ8riDxBKj7OmEdnw53ro1uOH6ZFGZb3cQoOHKQl2cB44igjVg44zQuf3r46uH0+s4c9ZEsP2NI7YX7BJMp7W6dJf9KeL7oIs/6k7H26BN960u20ECCDmMxzhrI7a/BZoOsl30WgVyzJhcYDyLvm3YG36j4+j0C+3I/Hu5eX64LAemhgWOWu0biv8ONsugTArzHYoLqE2T3X7qLG8z+LXSFLQrwPDpmlPhnKrExwgC5bMCPZnWVF/OjM97/WaU9UHEsYsFItINCFclJJfZmgOoyKCwEmK4meWPPlFan6UohaUXvVbnTL38TEdoLu6GCVYrWVRxgKFItUkQFwudwg0DPsjvnwunnhB7j0NJ0Vru2iEmnRITIknBLuF9BxXHoh1RkM4xtDm5yqzkAZqYL2hYYZDEWxwHK6XCGjz+H8EJt636rzmKji4yFRLTmKKhRtHzNgSjZlnTxA5G+E5mX2dRRltTxyCE4VeV7pUFll9ZvgLF5A3FIxM9bbGLwfTtIe0GPgaKkJAsT8MFKvlNSEIbT0LMxhMbDQHt5x41njHTn4IUxbPzE9q5biZnoomCEIpgUwjBUm1Hasm9a+iWYwzyJmDX5oOKGGCR2zKrB48fa3vZTcW9E4Xi96gs6cN2M+UiWXorIvcdAHRgxpGiDuXJd+/g7iBe4kzgzEXFOXjxtJICBqCAVrP6JNgBtvk7VVQDh9DM6LCCkGwUVvIWomxwzVCczkE2oA2NtnYdFIgAC9h6VAAPRkF4xeAlQJhSrW0t4gufBjZ6/kydpmJINK0YqJmVyFdGq8egdVBCo1A/P7qtSJkDH85uE/GWHi44f/hPXoyc59H6fqLS4tSyuGo2NLujY036KsG2+9dvxPvI+39ihkKvAI6LnzykODP/4fhXrXya9Ci6dSXUV02BPIz0U5KD7gJ8aGTZGbxZ4NIf4a5vN3uCY+w+HwcrvTOMEdbcS8OuAq2dEQJoLBVNhyaFGHOK5YcV2ORSiUIzJ/QWQX44dqfYrhSAsvPHzdoYaW4nA6smAufkLxcCGBGGke17WPqaIsH5cY1qauLr4r/oRC1yuaY2o8/Q3AFa7+GeheM1ZEZo4YQB47gSlmm2MeQCiciOsXiTLxRKi4AD5ToyCSMAlOOWZ2GcHVL1wcm/SDq0VRIQfXbHlZhZK3NIezJ/Q9f1OX7IzAn3UCC2MbSbsn/kHZdJEGeVviwmBpplfQkT1HRoVKPaAWkoACXk5zRqlOunnK5wIUpD3Ef6zBU1QyPhpMvMhUkmnvk35XxrAAQdlGZ9mVv6XRe72Vj5ApBxOMyB3kNgwqNM+XedcERc71i74kycL3BQTOdrI0bwL7wx1A6fs+uTqhhNLrSIZgwc3V24U0XyVzQd2hcwsExbuY3CAuUDhQm/o8Hdn0UlyHC7tFabfCVeOHCbkxjNBA8B0u22LasiJqowtRFzFTbhWSUoowpb6SMm6i1wGyqjw4ySK1gJrt1m1niGfXl5HHAIhgD14dc6AQU9I8sMSgUxVWwHW4checfah4FbsDhOECUIVq3++IMgv3fdOxNUJCR0aZbVVBD7FPymsl1tRKgM2P3GiQDvq2ahT+Oo/VeSspljvDK095bgO8dNavhctXpbQvYhQPetfFKARGRnMM0s7CIO+lKxn4vABsFhI5G+lSQ74Li40IgOsUGzSLIUPy69hx7yd0sKa7rG/AbOC/c8nR/joEiePmTLBwricYgB8NbD1e+qz4EZxPgSYKPq+G7xGDYF50FmxABfDJSl288zKEWgzpl4oMR6ZcpZ0i7BOakGQ5e0wGvNvOQC0Iwg15ns+n3g2iHHvm1nINONrFGPYRbxSHbI7Fic9AbZTNtFN1+6jmZlVVnLYPFuKKad3iQK3iNaxhwe7SD0asc67F1XarlTkIN4XmRtMGiG8kU6otRTNWT54Qn3NkMiBL0YNScIfOYrl/rWKqPvSatalNULKpL5sVIkjJEXhn3s6Ow53xvo1kA8bsOb5PIEQtsxv9yBF1XNyGV8+cSHpiatXE5djxKLwZFNEsCEmhtUMshKgckaxl1uDhP1DBR4guewfqh4hE5RRZK9IQWirClBDWYvSrIROvQ17zu1TawEp5HpJTMX07WGcGLqzpYzuKCjxCGDVZ0QgdWW8OqkuG+9qyfAMXjjFTmUfGs2m6sUQRLMl0MrD2yuomxhlBYM2m6d2z7WtZqzoDkfju56wKkao0oG91cSVA0z9YOPN3pzDG1Px3pu6UBjBfmEvfmcGLv0Vh2YjCaKtwUKnQI0xSQ8n0Hiw+FWs1rx57nN79iMPtMNQseP+xIe+bT89QtWCVXRd+PzFdK7xNdQyc/rXmxRUdKo0sOnTg2KJD+4suKt5byAzRbwmi7tcRe3Ron9FHViB0IUhmP0IQhYswQhLjYotwpIxQbJb4cdix+4guKjQTASh8KQj062LgXj1Zsn+XR/Gl3HlDZ5cwZmB21osOMBofkLHUxuqlFKsHseNLEPF2DBlf8v1k9ngtfFNi+PQlG8VHa7Fw4dSpFy+fe+ECRMBXuOKQsx6/hXoPyMdG/ZvSDYHKHfEE7Qls8Z6Eb1uvLJH2O5zBuePuYGhxxIJXlwobaBgxTzUSc1CB2HM/P8WE0vtU7eILPLK3vMpSeOFTNBfGjYQEquuCNrNN9Ch7G/9a4yoJyz0UlTVphum1t/t0+w+WJWEv4RFzZFA8Nv+211H4mZ7jArtwBdYN72AFh5glk+2VdiohhdGPl7hiKEA37UBCWHW53bMFX1hxQYX0YoJ3gPJdaVlF5oqvslx5tjNwOs2Vv8GEyHryktVXjP6SvcR/tF/OCgIJRZ6lw0Kz0qUrU/AIR3fmeac/4ml8hh4HaXXE0/AIPbyc54MRD8MjEvg1buEBCJlrdVYocu6K+Wdrai1vpVj0upcLNgjY3+BK2munfH8OylpvZPZqB3YbXH3wf+m9HB5YCpSFKePpomng8S26vo+IEDR9xihB7jhFDJaWoERZITNsPu0Z0oibHKs4GK0g72c2n/gizZjqxUtnGGay3V3fGFA3wAYIvegbpkFF1T2zAj45hYG+3DfELUGZYjXvGPmmIqZ1tLvNKUdBvcT+T3b8M+cjs23bIT+LpiQPXx+C/ALBS810vT1IO2bvV1hklxv52jrUJZXLsqnMdAAU06lNoxoBLlPWzXpubgrKGepcUmHjJaXfHXpJKXexEhxWkIMvGoVtI2sYtXkNAjPys/lW1ns6pXXD4qrIbq78DbyHx3xzHrUxu66PPT7jYSy6qEJa/mHdBRpx9Cj12mqFhCQaTMPV7Hor3+qiJvTD7DqPlLOUom+spv1VCvyo1KkvSv7GfMz11IjEg3N5y2jvwQVuknI1cTdHauViT/wzYLpJVP5U36x/VpFbSFsl+uT7IDUspSj4k1FBnxR/Dv24UWzmotfYVDK7OB+81U+NLJWaw6+9HA0MCIDOLdGfICU0WnylRT+v8s+rYZMredWOE5vfrFPnbC7wPPWOQhg3zVgs83AbBk0I/aahfZ0L+TqatYLv0LTEZu17ybHCp/L1avxDQVHj3kpVlzPe9KLqRGjcdDNUaeVryKbNvyiAbTZaqMqoJ7JNeiLb5CcgnqgChc/gJ/JHI7iZI3OChTjz55zDrvE6SN1WPVwD3nX0qDke1MUrnu2g1Uu3yi3izOMhswfGXWoowINgPgTn23zIN8MfuuLrnDjHPY7M8joQV1tL2k5izU4YHM8fj9evNiRvwZBc38cgAog/RCWWTDCtbI9hQ+PmkOmNij2CO4+o81HMec9GMzHevEyOb7BxNjA2OzR4NLCo8ndY022TNjoSbpJZPeFjTzIkKU3oiG2n+GhgRqn7oNiB/SRxjv97NGTFdSHOBc4S2QoKRYZ1cHIf6qwj5rodoNky5uLF2UWf0YWOGSYiQ3Z3YWn3a5MZupcB9pkDqNAZCh4YYGV9P4NK+2BEfNJAML4cSxWRDGWCxCohTfB3WKWcPxl1zQT01VDJs9BXXfsSO9+qY0gL+m/3uKr5z10hDAr8bwVuecNqXkGv+hzR4XrSMgo81W2v23HAnWJHjGIG370mUg5scKWtzXu969QDrUxpuXPY8dcpwtfrOocoYgk3mEdR1jpI7PAXTGsVHsBfRomvWaD/8pFmIIhfRUWxnnQoYNn0EEJnsBkef6BH8mxstlPxRYUSxGp7vbo0Ts4dtGPUPtwcS6rt/mBqSaqj8++USqQvWUtCGBxwiwvocfQXWAnexKp6Rd7cHMA2WQqqo0LTY/gXKSepl3avTi0NcL/L9tW1DymCAfea5IKVeNRLoZMwZelkq1VtOXykQnQSDd1hh0BFoa9yEJgb/iqDVY01DOJo/jB+FVs/GkSEKEFx4eogQoaGVte5MgXvldMdJC3F42yo43NZIBptuqSjARYSIkINWm8M2g9ZXyjaQc9B4Tdi3TwX5SqnUxXhotb/F8qBrjk8t8C1N0GEppY3A8vPr7R1rC5RhW9iIOWblAf+RtE4NJwc4cxuMiXCf4EYDXwj0iYbkSrJl5+xzErWJHsqaYg0mBG2BjdvPsA8BY6o6DxSr6Oqty17jYWjJfm/JPLbLgOutMbSCZWrIukYwhbDc3hlClQQ/xC+b+vhFU0E3j05c9AEHq4//eMvK2BSPlW9aLHTCv0fatHCTtgMaIKjdI/FdBZ+cy3vUhx8hQ5XvZzyW0A2s6QK5C3W0X3P6jV/Sn+FuAKMzhiZ1sJ9mVpUlXFu/79fCURbkWpcAOuXJRtoCyslDkhMaB6xlCmY4/BE41slOI+BgF3yLH8FravZyhCLG9wV9pqtaPtgL22185VevrEemaXfoJV815aZsTb30MyNs2iRsMDBxpZbcLLdpAhhuLhUKeUI4u+UR9OK5YGOv9tHYrWULIYmTggWSSQzspn13AjmNn+2oEkeQWe+GJ3hWc8IJbWVs5WxzpV5bgriBpFoktM5VpLJWwHcvelSu9vKrsHFGbsaaP3DuCZqCg23ibYGytaF0VlUVDFolVlTnSUJwiowTEdfTXCLmivrvQzsXs9ky+lGB9Hc1smlDBMD5yQ3+k7NajPzart6NDRbKb330plu6b3x0ChV8NeVp8qjv2BJoctX4mUJS0oNUjhpKSkABHQtP/TyLXAjVK+0GvgnF0ReS9fdTr1m5G4l3VxM4ALgJt2Aysk9ZU4NrGzVJbM3GwNC60imkmqqf0OJPbMa5vrSxVlqzfvsus7Xxk1+Q8MjQ3ddBXoypum1QNHsyt/AZ/CkHNGhW4ZRhWBJ9xGO8DahdnDJSVcDFENcmIwknBsieVkTRFcgjmYkCggH41ehjnrT+sD3a7WS0TqNTbY4an2YFjvUnYOPyN+Y0s8ctvSNHkHy8p9TqyV4vO/hVNyDlOp64WbEaxd7zBamjt38QIwJkZsI0SoulkM4xQUqfM1S4Q4WfxhTEDGNVUjdXbIEk6diqeKEeA7EPjRUyyRhY7BmGhuAkxFqJddq9XFe3VrN8WWn6Y/3HlcLs6aKa40WBiE0ncBY/nJTyy7oyDcvMqwI5BMdU/sdLFgsnQCwzMYaPmtlQKmoNaq/hP6KyruZ8TEHmeJLoFGb4cHozIv0XoEDFI4T4jM4YmMWZS3vZWXnjlxjd1j2vS9BV66UL8gkGFHzmUdQqEgaph69QSnYkgKKbrZGORl/Jl8rUwPNXgCKbrqMfyFBLxnlsB3e31gLgM6H2kk86wiezBJDyIM9slnCXjB9HCwJltOk36Hl9WwqRLv99tNJ2t9AuYcPB/XuBO6gTdhBWCxBtm49OUIPGKWSvqOe5CBYedTt1oMYP95nvLBd64MR6402Ce+UWjt0kMI8ey9B47d+T2sCsKEP1h5HTAF4fsy9xEUCqUakMmYjAfYx5Snk1WzMkayboAJJs7dwaIrxcsIZZo1JLsmrVJLSM5GXsVzsxJ8Hy4WuPDqeOyZbLVNrog//LjxksYc+DGje57bejebDOO+PlA+Py2iFW15U/LKeiMVahzFZ23U07GjoR9rrFTJMw7MTsrluTKboaoGCOOi4HJAqeNM76ZjvxKWRyflmxCcCCfDkRsE8NWXmRryS/NqII9PPmsr2c5z33UXyzVB0YH2EQT9r8qRgDxwABjsw9VXMfPEeg5DexxEs76gsCeq+3vZGAue3AxTuWpF0LJUoIsVDyWbNhvIG+kYGQMUMTJJMKzX1g27ocjZrKcw49hX0siZwytl5l04+7JSGIxq2bi2RlseVlctbWkvbXe/AD38cinxERd0RxyYq4NqjBAKsO9HDe9DfWKqMQGw0DH8JfMoyQTgnzvzaE/8SNtGm920xra12a7A6Z8uWmCWtHq/rKGEQ6iVA3dyl+N3/DtYvGEOyD1ogPB3ogUyClbKXykiF2oIlIm22aUXa/9SSalFgIpuslUfGl0WQGEHj6OnKWmLeYYIG3A3uojsvvDtMMvtVlNYcXC6baN2bFN1qD7et/BqXanADe/PAEn1dvV6Uc/A1b4KseL9Yqp49m+cDu5kh3DRqbgcafKWJuhprERIzcoREbEMN1MW5xOaB+VEr7mn/+hxmeuzT6I55nxLYwWQbTMWQLlZiFS6zy5eHrzgjvISwhBynH7GSN/Eg9EfZyHF7u2AniYWC91RFjz9XM7nwn/7FY4sU+PS+p105T0bg7fjmbez9iI0dVq9NZfKOmAUcHRQVRwe4aavrMNJWoyKhBVV7iiDy2RBgzJ6jXBQksHTZ8jEUGNH1a/OcTQsnhBxfZXJvy33hc2Bwtwi6OrkpACmoO6MypFXfJYJSmXcEYVwqBw87NaecX9Nx06EY0QNXg0yEFd4TuBAT+yw0VYglrXuhYXzoOG7OGQs+wIUUnIVfVLSuVCufpiEeW11idC3trbS7czMk6gOcVRmltlTaRVfMa5+p0nPKPKZHrrRqQzmlhdIQl42tfCYhFGa/cYhjWTvv69TKPc7J9Wr66YUmwUJalTCxKcjHjX7cz90u64M+sIUaEgiSJ+UsKIpD5amSooJl4mLoRJj+OKyPRxwfHK9/IUGR+hdQOWEHQ0xeozqS6qSAzeJTLE4Xfl45xVXUjDXEjnoag2KsjKueth65ebsHSXRwu9UmAhSTIaJZAJwEUHy6LAPAz2jX0+oi/VUMaFkWBaExFMaOhsMTmNwyh7k4jZc2st71hayTNQe56VbDRkTUaob9NwESM4RTgFNcltz+FEh0VZW4NcqOMEXoCCJ5ODQGjggWDWRc/Zbam6LcFa2F8PO2TKG1k0WTqwvphspasz4+yTu+fi2ZSWZsQcE76lSG2Ygkun+M+Yp7WLtSP40lOtArwcaFqFhdeG040iXi/rxBWGfgGfzUImYi4JcPdoflNeAE3wyIG1W4RLyfO9EwMAfcQ5VtTA9Otk5vQMbVc/laBpUuqRKOFFXbdYUPh3B1rPhZ4Oq1ekBHPI4LPfvEfuUNLoLu7AdjOAXcn1wMMWTIIZzDWJxZkCGoBDRLbralEx4c2i0v2CCESStS9Ievx2vJ+uo/pVlCZpZgn0CY0SDtzEGeJKtq+LcZAdSGwr8H+focamFgSIa/VJJ0L+uk15+6jk02Ntvgk6kohzxic9ONOe+GXmaXbz6mvsQEYJJIJaqHuAuBfZYQQRjSLBvmGf5O8vWP28s3sZd3bCq+jVv6FWNzARzDtnW6j4g8siqVw6Hg4CMntEcULJdE4YDwRZtygBYUl+QhvtAzxCk8uJ5+CVyPzSyBxmq1CMwOMydBQykCiRxiRe8vKBzqG4mGUrm8/Xa3mYW7QkJnquYA0QNwtgr6GOC1wdRh0Rh5tE74J6h1wcG7ScCNBI36WhHQZBfiRQ6TWmc/B8n70kwyZa/Xku+5jn4reeyJmZl996zqjZgwBb4oOrX4bM5F7u6Yw8oPWOTBiUUJzvIeR24QfS7Zp24kkDQ0xQJ7UFRYrFbmsDugKi6CmSFZqyfoQuagWS95Ych4oZHE/TmlSxwdHmFcpzc4a32UgR2fdSoy/kXW76Xy57tsWJZJIif5HKGSDLedUwNi/OdAYuaIjgFOsDOgPV0DGae/guneRZCJCnkqzCZHdlqrJ5GN/RlBGpbv7ujx5/eKnIb3jmZRtbrq6vBY2j3XZeb7NbKYD8Wv9L+AjBYx//ce/iORliharXkMsH3cp2B6eKbIOYJQNvC2gF2WSed9yM+G6GY0NQ4aLKcAzAp2qVWJO+RvMbIwkSWkUL/gpQS5G+E8kVixQGPzZ0Y3y7PIPcGl5z7C4ik4TATERcgmEJTVx4hEE3QupmCQC3IXwSy9KsA2jxKJM07iuvgWEMmuoSM9tNRhHnwevY/+Syf4N7gjQWGcnddvnB0VVYGBMxEXcSWGpB1H7q8EnlyvfzXpxWRl3T90YaOhr7dUr3JGCO5BQYobWEmspFPDJikWODH0+Ukcr/SG8r1OmJZJ7yNmpU7T9IKhRqVRDsAZWRIHpVBfiqmV5kVKLkTX5yhnMXfVxlkMGt2Cc3i413ffjl3zKYc8hsfJ9+0WfLRfQe7doHHwFEKY40mSCKOuBQzo2Td1+I2Ar/s0b4cYiICcaeqhyIRQucIBbXmuq80nTOdsKFELgouoHEXdSKTgFmlZMl31OAnYykOKHQNfZt3c5ynKy2HpO28HI+62CBgWvUtjQihhRSqJjDJjUvlzLZc/R5/gRfnzpUutxtWJsuPGpE7VluK4MSj9cKdh2Vzg/ZoLY6U3KjijMugJ1msXduZuIJgQHPo9LmCx01CereHpkuQtqMJ8wLDqtJKLgifwVG503bRba1zJ290qLTdmb5h9W5uMyEpWd0tldbvJgnPg7cpgp7UmhfuifPGWzReHVYdOy1ahhOQRtN30RS/un8XawspOtlw88omYWavx0pjMbLiSWT3CSwrZuE8Q5KCyCAOW1Jnz5obnjB0SlmOjZlqNJSJwCC8AQr25AvPxEnHCWsVxwdIIxmuT0CcJOGGRq24ZjxevY2iei83Ayq+Rz0xg1P+OZ9QfnmFMOQVuL2Hpjzs2MzLGOUBmwmoZ9yBXyScQYGv4xTybvEuzlpUV/n5BLJPgRTE0OeToUR6X4WJ1IQgpnp71KEBxlaIcsVX5eRoTm3sYS09Y2L4tOUSYaJ8XhAigQFJTJZqAjicPnyre4ogHmmyswoFUKqBodZqlf0JP8D2qh7Ev6mYauuWqm5Of+zZKl79wCfAIaxkpBIVYmtQHX82iqjH0/aL7OqjHZFqP1sABn9iXf2RAzbJSONtRj4jgcnKxoncgNlfU+soBvkaFp9BetwNZoFR8KAAdvYkmFJqSwKc1QXeZE5TuaGT/fRGLcnMGApfovjxd48sXUo1YnFkO14nBb4ejOCTVMGqAkGqGQz+M78h7pG47W6An4rfza9pqz12hkM1Q35229fgOvBtBqUvndCFqLnj4saAZ6/Zb4rFLIUvTeax0X8W63BAHUrdQ+CcQXdpLfybKbccWKf+Lpmv2I4SY+lCwqJ21vG/mKMaHtKHQhH7F/IXveHVohHQZoqLiX2w76oOEgxkpj0KTbqdxTIbiew4IHuNGPRmnRgt6EpwcU/blobg2Ux35flB6qB4WHqLQYADseQ2rQ3GhnteotA5JzYx+Yp5/B2gXECrkTx75MoT6I1VW6Ln0dPZ37cTfKrYxJoO7FuIYzRWU8y0SilfhVxDpGABkgsXgkjJmf8ABwODZVUrfQqMzXy/J4IoEe5mfn2FxIy6USFwQZBh0O5EKp/sceN5ZPgnrj+xrbGahIRVXZOFCmaltW0IPSkK5WoF+VUAoFmXe/bdR+4KeAvYPpAyP9qvoIYTr/+4q1nAxMbTmItOT9PwEv3mXIzDerhhVycMZGBC8gRQdGg4LBgNHbbmdfC95TLzDcBWoh8pmKW+iRdDJ9cSCEBttxKHMTLIQmuHKL81yoWSRYkBT63m/jX7sejGMg7aQqioEJeSgl1jYbmTWw3DpFAQcojx41BIr7XziStlSLT/UHzBODzUIruSHgXnxmJJgZ8sZsITe/J0OIHeLbm2sm38olH+m9jUfbamN5idK7iAoYlggk1S7Ah2oWhe2G5x2YgO8nk8MEK8/UaXkLeNznomiOPwFh2exU1Cxt4ZUK9ZaqJFSAwgSqpL2OekcX94F4uoSJpwKeMTrk5S4wT9Ufeuvmf5+pJi5HkYZZwcFWmrJof79GkWdfaxQ9XXtV6VM6spz5Hb/DBlZgcv9YZR+ihVrQUcKOkgqj1SPFX4saTr3J15GlfZiwd89BOGJ1qm/sTS1bCiXEDH829eGh743egUrys8Prn9L4HQa3z4/Y6FJyACxHVPSdoIO4LZu5hvdAScbuAs1G1xw0I59EJCTvaATjoIwPVQ05MAf/6Wh36B/R2habC4ABR6pUUwog0mdOW5LsBzFN9awPgvnZ8xF5Oc9izygXdWa1AwlKjqwWJn1glpcwV+2ZFuhOtfhw4+asYd83SrLSxNDRXkHPKwJi6VdaYdgWcnSkq7byCx2wyqfByvbCkJSdLgER1+pxyupSllXvf6+vrpuhNdqV8WM5xugjzJOynLeS6qYr2Suzc6bf773ZPK4+ffo0Ro8SZjuzmUrC4fPdRlzkGuTgaDn6c/DzO/QLd/n+pEvJYmQ1iV7HJiHHo9El47zFkb/bcTqSpIyfzbbBPmPpqgDP4aq81JyuI4Yw8UKlEa37DVtHbRek6HT/caDk6HU1/cxoM4LM1cCpJhfS1sa39Q+BdHFU0+sX2Op9Q+8wfljn+oNbnZtnarg3fPdxGHxU1sa/lPWc822d9HvnDUrLbk4eFfbGhn6fSz6DjR115XkjTvdnSY7URjzBAHMWkIindvGMcPiRxI524NC1HF70GhTxQXaJc6d31zNAdeyDPswa7UHAU7ceoMxV7DRebICjor8ZXn8mwv/tR1gNE8c9lcfBUzfURU2DiEiBjrp/HDg+JEieETZXxhA3mte7JiJX8TsZPnRgEG38rV+VV0iIefnb5K6Ce328mtImoA1PLzZUN4swtYderbLLBStrN8cQ47kJ5XlzFlzRWKkealLnWLDOzqNzmZHrnQavawZtyPuIM2iodyGILMH9yohLNQwjoBdY4esKL/DRTPrH+s0EJze8kBbAq+9fI4WDGsB03LBn95i0QW7VMeOz+xjdV5ea/S3Xsy3qOwwu+yGlRz2TTjYPI1WRx+x7dcv/X3hzLOJkQrbc1CR8ucP36XoJBgq8jxDSjmh/z4alUzL9ei3uSLiHvmZGFrFWrPMa2b876Ov5T75+rexX3uoyN8itGbOHgLRylfieDAeTYuSMliYJ5Mj+Me8QN1jndbaeNPdylfFjojWA8kUj3l/gXuBv9b69UrK21fqoXuSrX8WnNjpulwWmrglOmDFvvcZRUaAG9YB6bJjCqy71Wfy56afyS9AUhXmiYESnbAxCJRjayeM2RTZZBILXsX67Fifj0yUbswxi7Lus3Wefa7UbNNi9dm8dzV/+eU6dtwIpL3kuQsXzi/UoHcXTic/WUjOG9J23YbcOqO2ztx9Cy3SBP6NmBmg0sMGg0+rnj18vZFUxqAZ6Dgh6eVfUe7YZe/9a2RDNdt+T6RtOGdvoAnhbXJsYSVXMAP8gV3FhKZvBvjlXcx+u8XTjqludbB6NFbyfKUDMBqeGsbRCWR3YGCQ+6g47JT1B71qOMUUAI3WDVoVwTKyqunoQwQly/EQmT9ihwgLTxrV84WuyKWoiB55UheoGXHS6P16qG+JXuUUoahuy6tZ1TototRWrPHSXhWED6PxjNCHyVVPVtRXyWROUCzBLhcz3p45Z794+HZ9vJcoNOfDSQ1YPrUODFQ6RQeOWoxQupyzb6BedawAEiw9FJWiHXQCpD6Y0NliKerMYZgQ1m/WjxWdlqt+kWKvF4fcNoVK0/AK/Jj39sqTCVynHxyIecj7irW3aMeZIYavg4gCx24v3MscWB3bwriJhhh8kohtJqwwdCisrq0UUH4kXnhon2WGJPZL0QNryQSaQVnykvAeJwFLKdcXNH9A+mK1uepqLsywIcac4uCy+wkL8GvKGUaOgpuUFHXzEMXu1ROCmKs4NR2pFoROX0hJqQMpL+1lacRVlXeX2ytTQBzzHut49GM/tRoBPhl+fjeiDb4bD/3miebuWoxR2sRwkSKg5/Wwnkohd9QsLPXU/Kzy+6yv9dPN7CxFjsIO3vNSuJmk5t0F85TSm2z9M7tjysMBvFbJdkbihtT3ZR38VWf9UkOei79fHhzvaI7OmYvQG5gFLre2OYzG7IvESOGuG0HVs7K1JRe0DBKCG0Bfhg+IZbvCiBtRkzg5qEDXsK/UrG7t0QYZDT+jjOdE5/BviTd3GwsKcx4+FK84L3OMZe4OP3LqEkyoiwy8QXTG1XqyRZTyNVX/XI5Bo9XuDa5DwW2vKx+xFEXgAnoZROQSADbzi9k440rjY9tM7lH42hOvkDCCW8PYICHbdjOw9nmHutE3h8d07lK3EpYO8BB143VVFRAHtt5AQ8oLyzQv38f4WTUFUIQSrQUY8eZST0Ar1UPZUXymOI7Nwhh6GdbNrU5f6h/96+m6YEL5D9EIYHtf6rpYZe6SuYQjCSQTpbaaHlbc8yPSZnzKsH+KcCCZw+5G86zhcpuCVBM5ahMc1cJi+mk2IQyqSs8L6EPxdPc2uk8DV8Pdw6asRy47WFaMC/LnxIr/MKQGWlgXOtDm5i5105bZENdSqMhslmvtUpd8P/ZaN7NVv3nkPlfHi46ruzq2cP1pWH/LipkoSOVQToYal5LYw/rfGt+is8pHE8uIhIUw9bvTP72YTr08M/Xdy99qTC0evdSQn+bHX0+3BenZfgAfXzw6d2n60vR0mz5lb168ND13YrHxLaYX9HUS8ApoRTgHIJdAseD86gWwztFUfENCydB6eT7xKZVK8MdXRYN8ocQVhaXJo7S1sv1eFFBqX42EMgHVU0fEEs0IAcMr7H32hEIrsHzl8soNTd4iIjkffqBzo+TxJCqMW0RqdyjIG1Er0o0X0dsbSEnSs69USpITsg85CeQLj0R6lG0YgRpC3HzJSdGoS9+61JgOaNNP5RLalMzsIXEixRI6QdqrJkpKsvqYJou8xcOmITzz+VXxUNFfdp2s/JD4HNouepFYFmXjP/dVF+m4fOX3w9MeucCsRjihyOwPrERk9h8aS2SO70Ow2CGHC1wSGq7hq9l/HhGm/UcyzJAgiK7MDwk6jtqrozY0zuHiMH4G0B7Dak+g9zEh5+O4AcjI37pYvmBunJYF4nCMpivmSL1OMeqVRKG6ls7C/mM0/heFD1u3JPqL9GZxfhfJ34dcRWL+LusM6YU8co8TU82Tzt2JuQN18qjhSdoR/womtFHWIcYBSvgyO7f8Qwawhih1f2I9bqZz9aToXdEeMKqLS0AAnOrGtWTZj/L/s/fmTW5c571w/iU/RfN1EgAigMEMh0MKY2qKmyzG3F6SMmOPRqwG0DMDD4CGuhuzkJwqLbYllxzLln1vbvnaVhzfSm5VKnUpijRH3FSlT0B+BX+S99nO1guAoSTn1psoMafRffr0WZ/zrL+HfKoeAGl7W1vBbEctAWVPKWiff0QgixSyeY/bio6ld43Ly0OKxzMeq99SuIo4KhrBi1r9uQ6EzJ9loQtp3E306NjvsvAytq4/2G66n04Md8nqpXlFFDLFbLpM+UlXeSB4QWGNuCZ+aYeI0vkyYVwmRrpqO56VSPg+u3ax2dpSgVTlTiGN16bGApLKC8Je+AIFWqQywlDTMApswbGiEIBVNKhl8lRWYln02c2UajuxrWjTseqfZqGdEg19nnfbSdRcKMJOaowiwm4eFnunFai/pYmFNXy9FC+rMzFkTzk9fCXC940QivzBEZ3bhPEb5znrev5MEZeZF2xpNNApE8YJFUzCKrgOe1aJCiPFk/5RnAZpH+yl/VbI5gp77zGpv97XMUpFfNg4a4rbjkW3OKZhRpGRQKHLg2DL4yv4zHCUaLApW3dJVECfOHRgTNV4nvdMYEFGNvzyUVqbpxLJscmf8kf+rHCIHPfufW8yjcyV1wEg9feE6MA/7xBA8kM6+gVk5CGRs6fkwfFjS8LWBM7O3s4aGg6j/lBoqc7xSMfTU06VZh1PtJM4TSQreh4S1vCnz//h2cOa9qnhibg7zW5S1LCgTLB9KtxWuh6kkGe3g/5QgMi1tpNKjcdYIrM4cYDB9hlYmgL9ij8xVtsT5wr8LQ7znuVvgR85+/c3vnPl0uuXr6JHNjYI2PkOgscM0DmafKNZ1WD76CA0HeEsIohB+BoO2Znwmgz2XRnXeyTeuc46WFL78cCYC9y0w8ExeIQdBySKIznbOJUBET3xCNvD9WW1PVmzmm65Buk2Xwt6wVrk970MXWenmIcIXeCd7oWjzmrPjwJ1iOdFuWZpu31aM4XPg0V0mzwINgmAVw/4JyqAD/4K++l45yiARklm+lQ8jAQfUnVU7SDGFc/yruIv7fgGsSMUrn/aV4ovzm0BXaS6Ags9Tvck5ThW0D5mqazt/PxHQC6ewHSQz0iOD5pkdc3y8mbL48q5DpuuFURRl0A9oa0rjt4LQ0jUDjTaD71lHNBleyNpDWFWUxtQdSXRK7h6WnXW5e5JUXFSoEukFLh6c0e20tImGgVKyuwnvNS7xeK4OyJEjPJYNn4wpZsw0qsaB1woXvunjGxqJEXkr3n3OLAvsD5oqu/luaZKKLQVlqeI9P6bp2Bk8xm/u9l8QAxSL26qT5tealFrowEd7RxAaEs2VAmQyaqnyZIDj2MoUlX9Gk8WCsCDJDhcwdLQWZ/dT8B3avlHYGf/5PSvAEWTK2TkI/hmTZEMPQ7CB3/BXsC2u6IlghTEVqgwhi080SSQpVyWXQE7ha/qcGbdgDIVlVktFyMQa1nurKjtq9R7+18nKR/2ScVNDL8+cl315JoDYIg9TXdweY18/pecn8rDqWmDvk8R/sSh9aRfWqunc3oqZ3xMVKN9ISWmTWyIjLypA+qrQtKoxdOmOcrFXNGsyyG+yiFZ2GwpxsY6Ky+PtVvZFGclC8+W0OEB6ejFQ9IVWErSDucYMHOYWWRrduSNhMk482flCKcvUQpeBXlr4/vva02uRcPSdEjeUFJnM7anXoAlrebkZHlFwqgQjNfqArVdnfhN1H1yoATW7qx7A9yZXbayV5dyauRUPFb03seGiXTZR+U5rlR4WViTCmbbbnKMrPGBdPEPzDlpswuLillfjYIA+fwx/HobHit7vnrlHCdpY6Ydb6TOa755NorowOVflzlHhNruWNWrV86evXHh5GkEPX1zuVF72a+trtya2y03rR+VW0d3/3rG4Xw6web1MOpQdKZHXoFYsfc33iw6VerrhrZbclQjuZ/5gm4O5KlFRq9ZQjrPg63DjeijqWQOS/sYuTlPINYt79ve7BwhMnmveLPzlYIaGG41DyuNJXXdIRwfNGx0yqpHfT4yvHJZjzd8WV3X8aL4wCCTUX95G1ZsG4+MbQPhWmIvdxmXfl47umvlvmVzutT6YdBOMGQshvv1OIxgASnf00xPcJW9CrXYLKm1QBxK4S4cPtfsdaNIKNdXwLLiCzfWgglMa84aLWRbrQUeLTIIhWkVF9ZlcUhdBLscQ7rN/Vp9yed981pqj8rkr7mjljLWY03aVo9mebTUZ31mP1FSSdpn9rQ/aGORTJvt7Z1uQb6/re328Zf013c9Rsihe4QDonsBk2ptyEXrVGTDrb0j4NWUvXbD2jsbSHduI90R9gOKL2+sKD8m4yJ0+43ojcEbyf/zxhsrM2tVisusx8BmBGWgaPPHLX/0Qi8b2gjsZMMGX2PFL9wWZvlHeV43UzoCuxtm/GJIKRC5pZa3+68VwqKjWkEtQDZlWDrzw7TugV6zCOzsHdGU3JmI/ZiHgJlWVKZwEr4JV+GM+GvTXnW458m/+hlZEUjzi4DFJ2wIvEMGKkynHB+Eg6C0aFP2bC2KJJySqAeFQugoqYmHtM+2QzblU7+B6FUoD5Q6VXJcDpBwdWT/yp6t5mxpKgaywVUpbu9iemY75UmcB4V4qKq7tH3ZU0bd4Bf1GyhcoUayCKvz00KQTtjyK3pYuY0VToVIQBIcNpzLCkSjAdI3BSnB+GIWNqLilbhOlaFHTVyRwQo/PaHsi5umZJOLg40oS6be5sU7u0irJlv3n599XMuYyFE9oayK+VZhUrwz1CnqFVzFyKMUTizJaucuX/uediPKiUCte4a3h5MhCCLdRlF52jUiNrikKBRPRSJxTe/74ejaqBXYepfvXb7o5cZJYkhyFhI6j+t1PQrUHL2rgn456WLJkjn1Pt3vQvGKcAxJDfqIwk733DBJctrMNJojolQ7zHZEH2iCbKl6G4OUGiZ3L8FmgTM3Hq+KMSJwBxlsLEu1L9PPFVcYtp/YutcD2Dbe28Cq+23EjIc/Fhg98QhAr4Bzb3pWEgaNoSF/MtxIptHa2+kQt2ZjBW+oa816Z1q0wa0xrbC5l6rnb/k7TXpXwemms3+Fa2u9wHAb/1GBmZY8Rb+nHLE+Dw532jBg2Iv+csQzKjG3FSCzvSAJPPVA5AZdDjgjPYORnt1FLZsIw2TJXycypwwhgfV6QN77RRKFWvjjsFwGYScwmW1p0jP9jzIwLDgKbp8NX4zY5HTqYc+qHhWblGoA3azruIJUcpAcCD2D/1+yU4ZMl6IRuzklPovR7OUDtAyjII6nB2hxMx6rPaDEoG8Us8X+GusbJ+jVcJQ4ewUr1kRMyS5WmtQplGZUoQGr99JIELRWVirVzAOBby7mkAQqa8VKkufQQSJwtJyVUnLtRTiWtajbqbXD3qg/aHqz3oxXm130BKZUsivYjCpF6BJRepxrvdCIarn8oEoU/OxziZX+MGUtgqMeD+sLJ0/XDDZFCpRBH8a55++aOQ67gyHTBXbncBLZYFiSk8YGVd5UrqYepSKDoE1Nz/ebrVaz3W52Os0gaHLokRttlGp7rprMnoDVXrDdxDEHvpHzW801GsQ6po4Xv9Mp23QKXY+hxY5HcZEzfI2k7KYdn3FIaSM5umcz7aPzMeHXyTHlTdGrrLNm/nAVnluSJn550zpnnCb9O6ekysu4ofy4XR77abHPkB45IyMeUOSEzoix0QhI8ZE4beI5udxY4TzNxEVsprkIi4M5KB8el7Z+KhpZSBFpkdjMSQGPOtZPrECimZ0XiWZZjWD1BZzJoIWexgm1cqdZiRT2lzIgRZ5ykgUocXoMMRuHBGl5L6btTyJdWzy1FuUdYRVvinhd0UzQV3HtpaSYY8TrHPaCczQwRykpcf6hIO+JZEEVmUREMpSQfkrOHPDxjHyVj5Krh+7LR03x92PMQBc1SLeNvXHuG3BeesKVPhXvIrW59xhp5Q77x2jYX8cWDYvtRp4GM727bSUmcZ/ECyuNno5fRPVC70a+MmVclSJIZCss3qOiUDK7+JTG1KBlVFWWJ6W1GYOdsczjMJ7f4JPYAIUpRQq+ylF+0ntKJG0Uh4U6BGV/VBXhyxVhagqY5QJsj/b6xrkXP8tx70ThKAlq6t19BxfTgxAdrRP7NtWHaVbw3ijqTRFPjPElIyBcRJoodDgbrvxr42MuWhLXn2TPNk/C2JxKBjw2U2bse6HcMjpAyOSltJ3fhIRbrbo0Gpd5kickHFn9R1kFHg7DXjcJ0l1E5BjLkMUr4hs8R1PdTaFUwOevBHEZhg03oJXve2sdkedJyw/Hf5gEFp5ua6ybKA8ISF5muRKeFXxisvcKl7cSnbD+1LRsXI47fhlbXuKMeH5igKJZe8SWoCIlEbFp02b44q+5eXDHtYsDt3rAY03uw6aUnZXYKjsokCdjf63EdxhnEl/munhl55kY5IkTcyH+w6lwC7W2VNg/cvI65t/Amm16TSF9zKnq0MdUHL4E6x+u11ZeKgzJX/pW08Tkp4In1RjJRnM0eiQqbI6VDYyrTo4IkEPuLAFAurcatkdxxthh910HhxtiwFo8pn91xQ+m7+MBcDqEvU6x5w67t//pHIcvarbtlt9Vul4lKeNO3lToJrbj8fMfUzqmImM/H1F5KAJKEESrT2QBR3PiXzkORNkQ1TshpoTFYpt2hL6ygQo5K0neJpPBiRBC9+B85zBf9YL4Pal0FRHhv3MICB2NpkY5KMdkdUIRbdnDvNTMgORFqWXD0qpO2FduGFVJ+73lN7SNjIfd1A3VUroYj7dit9ikLs+LdFRgqdaUQ8uqLKJMkz7GjXZTsKvK7VNCtJ/orH65Y6G0LBSrprWNuRAPbsiFybieP4gUOAFSWOEwSn4P8lQnxInU2Ckf17tuOB5lUazH4ShqB5JG8YkAnEvE0BiIIxheHthlskx+ImNERql05HpUb+3gdCwXh6xhIUb1WclbUn04ysZtoamWkBkG8tL9wMEi2V8PVadwfvTOX+J7Tf7DkPdi29cLOBXgho6ZK/pD+1cZOAlal6dOt17IgNqwF9gLw4f+0UqLxAtH93ESUEMqAS5N69c2lcUr+j/h9GlgN3fuxuS213Opcy2/cJ4tE5P+7EENVQqZbKhZ/xcNOMz0gKhuesHku7RNe5xO9m1j7CT36Fcnf1oqyuGE3AdpVigrvjketFlfGxGI+PvEmhR525iHxQHCmc9bR3pJM9vB1w2M8Ad1fha5K1j4vWN8HpY8uwNstqjqpaSyWBggBDdBhqrwQYqkfM78tIom/tyjHDBo+yWViqPaokiFiQKlimfg94Da5PDj/XZ9x0czYD0akTg+cH8zlnW8M+h0YbXDesBoc1Li5DniyuKEz6YnbUr1hNP2yfqIbUVMtl37WOHaKR4tI5GOGVHodF8KsoBSVToYlFCp41Wl/8hNtKOj7bkfY2B+036lWM1W5A+dHqkcSvSlzNNeuHa2V/BIYfjmP1Zayfyn47znSYVBF7U5UVwP/a7KK6djbasG4EINVOYzehLpsTVyzk+ELTA3LJQwh27hDZ2xilLorYbmXTeXVYWzB1/rZl7MuApC0SC51u0HsDoyVJpeA+G2D0S33go7O7B1Bgkc6XEZ+1qpoFSN8vClAcjpJBnfEBkwnXZKVMl+5zoUKqOQa5ydq958oyE9plJYOfzcPYgF/uq//pv439bW1kxv1O5S+vlueyYKmFWLZza7wdbMTX8II1vr+wN/LYhmkiACtt/v1X8Y7+MbDfhvYX6e/sJ/qb9zs8fmZ9U9vj832zg2+1de4y8xACPoeASf/086/6URcP5xEnXbCbAwpSh4a9SNAg8n3/7trgM8B/tomUeKB8UoUh+DJoyext+y9q6zn1Ucz8ko8nfqwyhMQjwU2Q0e2EqgcsDAEOWI4WDBvGu+8hyvUQq2VUy4+4oE95Tx5XDV85e7Kyybx6RRJHeazLPBqN9C9XdF7hlXGPxd8Va0Hzb0gCA3d8psVPUphxQQnvJWd9AJt+pnUTcuhXG46sBmAtnFIAu0u2YCIIDgdQdoPTsdx2WbZqF+EfYVZgkc8ZPdKpx4TMOtapD0clUdDrfuSAQgq8BwXJH8jWGN8LFjYNhfRBjq2c/2nBfMQxyC1EOLJxWP8Sa6lWs3G5CyPLGt62pAMCv8BJ3p/AxWY7a98NyuqmVJCWj/Rk8nFcuGhq1rUdeSFvSQDM7CEsH7Ms9wJjHzR0u1HfZ4Ja0nybCp4eo3gmBoXrnZvwYT+l28B9OjnOhMWFsUDl/F5khQjWkYL26srEJV1rFoWWKv8DtnLl3EjXbLg5M0ga3S5HTYwFQ/5pQqzx6JWVubjwmrBaVrUiHkv8BeuQzdvpsCJu90Ivsc5o7PzFDq4dQIrYdxQg5lh9HnRicZHoYR4dAcWzg+SylDZkrC1BkXUhgvTsRqfypJdjoq7vNFvpX+Cg3165FOZUirxKfcctxNYM3WjDSHc+HMKLyKJEcoRvpRRUMvYp3s2dlQNgUvXZq+kEQ7qOHBb64FIKT2h8Bpd67irjHsk7o42wvwT6UORS/DugiiZOd7aCMol2oIKh2jm6MFfeyRiO6Vg4r6BkUFauPGzJvf0uGXC7sa7ri1BtSRi3+r0ZmdnT1mUA1BIqe1ysJOy29vYE7AARC71hpssTAK1O/St4KFoLOKYm97FMVhZN/it3vwOt7lU59WKL3YOT4b0O814MQHeOdo4B9rzMGdnQAZV7zVXvW5UAsGAG/Mzx3zW/i5PpxQwGriveMvLxw9joSiDXIdf8o/5iMk99Z6N6HXOq1O0DmumhR119aTU6phC8cX/IUF/Abdv8LNWz06P3fkqL77HdXIl18Ojswf0fe/r5u62glaC7P6wSlp8PH5VgO/LLcvmGa32i/Pt47pJ6el8UeOwfiZF66rLqzOwv81SiQC0kxl1uwJXuWwU5ZES3I+8DeDkz1YQieQo/5bmtgTuI2CQTvsBK9fOYerEaj1ICn/3dVLF+t8qnZXd8pU1k1kmre408IfpeAuu4DfqaMvpfEhPAR11slBZ0uRi0TG4eXIgQpxdjxLOqzuU9idlhkNf1vk2MI80tIWHtxDqObvMP0tthYD7/AksuQUghflJZQy2FsxcOGGt+SVkYIvc3vYw/7Zrxg/iiKRK5KH6b4TG6EDJkjTSgpP0sF8ypnpGAfkrvfsT1D8bSbqBN9KX2Q/QKxXhZqJU7lMSKHyC/P9ckOrXmIAyv+DvPtlqYiFULWrVPqmch3ostj1bGoWd2F9o6kF9IQAKw5iueq6gxr/HzQpL7CV9juJ2Q2Vmtbxk6oNVmq4rO14jWfWTSHh7oq8GXVa9OLRnhYZy5tsi7RZ6WA024qYBNgO+Kv0OgQGQj+EOeRidEf8MR0PB5sH1jPIa6yEQrGE2mebhhm4ycWGt8bqwCXqk40lnNgKa7D9WVW68hxH1tUB6tCICBXpFV8D4UQNFQsqeQp6rc7SQ+QMibxYrLxPsc5KL53/3osr63/DSGOYKFZSiVrImnfS6fRQl//8IwQuZOuwnR4TVmEZ2egKZrKUYMg9A0d4h7AE3/WI02az4duEs/0UXt8Tt1UkEggxcx1Y67IQEDQpz3rPfvvslxXOe+1IFMavVQIKTT4/T0GuP6TuKEO9QVlUyv68Sf4eCJk28x6vU86ZQ+llj5rKQ/bCp+xrSrTDp7jY9IpggUsiDEiOzYRLWwHRzD3jp0VIW+92SE9NtIbuAHMO1ExLG1VbvnHi+y33eFPpLW98I3IDrDErsQbBYIkSvUbpOrsOsT019awUR23yJ9fSkYqBk3bkbCT1aBrdODFNUwQpUaNafpQ2vebbPql0J0xiY73osr6gWnBtopom1Gog4Ox5UybQ6jS9CDs70i6ejXQs08ExS61UaDthq7XGKkZdSREAfYsCYlPo2hbVk9NVws4TdLoyPrHDMO5SDF1VRTRpdYLK5OEcicgqlqTy1DsMF8uw4+TckaYV5JCvc++KsZGx7PY4Wkoy9D5UiWo/JFjNe+jHgGenrFUejf3CArfG7Uf36JSxglr94pOtYBDXgbHgGBDSMpTgeEUsG3j3BsjBA3IZitgNehAi9QgiOQp+b2UHZkeZJxom1gEzva9hsK05LTGwrcnKahPlzDTK4Q8ckDr+M7oiJ8WrjqqwJ6JgSbH6iReHBIHntUHx3p2uD0JW+ZYB6nTeyiyjJfTSx4CAiEOVFX88+U0V10nGp7gJO/YW6Y3hTUQDs7FC/5VhA9krnTBKMaAPw+6hFEjjfXxdKEzO0D3NbCRyo9EvfOIexzpYfi8fy5V8Tk0Ei8JzLQmd8na9FZXQ0OWutV84XNDOzc6Nygr1tW9W4asFfvgrbdn0DuVgIznkK15u5ZMQoDVAp5OWW8KCPFR9AtMq+apdHWrGj0a9INCSeqJsfAVk637OsKLy3WcPCAj/qeXeaXNJd/nuPSn8JIcMOPwTq9Tb+4B+yxw57SC2Tpx2ITa+PMrFmXE4M7qTxAVQM7n1OEy6CvPnPMdhh+ES1kPiZSiIva+dNN22jcu18mvenrDpvrCBNq753V7c9nuBx5V/zUlXSuL7c0cSNejPlRTH0FS9QUZnmq/rWLmpvk+aJ1xKwNSP+3oIJCT6RhpAINkMiZKiZlYrvuZ8NE6v1RQ4qWnI3tUljzGJWP+nLFCUnrm8BQMC1//AkLMcCFw8O4W01Et5s+xmMHFam7s2dTC5Ac7JEI/0l/SMutiUpr3Pf0RteMf78t+MfaW76rcFn4RMOV8+gn5+7GY4cZBlHML4yII0v1MtHDnV0jHDoCqhrz8xwRh37FPyaYZOEzgTHaxMo5WtzEjYrBX7CdRcSjHPW/7gRrsXxiJBoj5ZVghpbBX1buI+Xu1GwRbQH+cYwVOAz05GHs6ujDLxFIjYAx/z/vyTj6F3kizgI4pBvd+UGsl97glnZK/Ui8kcov9tXQm3yqRoM9ykdjbNmwDYOtizHM6MOUSBx4hv0KZr8uVAEcgcA6Oduys9jRToJ5P3/AM6Bz93AUHyOKk8Z/+C5SS6PUnwjmu3fMj2ZjLzWnEjaKPYlaGoNHDrN7rDCj/XEoEKObGto1ZxMlIeO3b8eCnNu8DI7aM2Kp1bGXeIq1G4GAXH3jgeaJkybrj7yVAScdO0cMybeCzSV5cbK+pqdsU9J7he5XlasoqtqLjY6f0F/Y5xEGR10GJaOl5M8S5iBm6nx4K1dvTlzDOWzfOfEWdZ4LdX6DgokzHJWzGlMc/12ytpxbZt/3oxJ7j9+X/1wwFm/dyf+9d4/6/Z+dm5Y0dS/l+NY0cb/+X/9V/+X//X+39R169+7zsXMUGNItewp+pbR+phtDYzB+t5Jt5ck0G6fu4ilDvSaFS9185dvXbjwsm/h9/zjcYi13T60gWV6kbSlfDAzxlQlR/oG+2wx24V/vGjR1fRXyDabnozb8yEw+QN2blzb8zcHqy+tRXPzRAulVNrulK7zmPto22KXMzWCVWW37z9xkyFKi57t/+6cjsZbsXOF1YZ+NB84lV9Q3/jSOv43OqC+kYMs1Brhdu3B0ESr3dXE6e+GNETTW1X5aeuqxH4R4OXVV3cPnrHqaXf3Q77oanmgvqt65mdbx33dZv6XRArw9t9f62LW2SjF9xeDzZrMWqKjtaSEYjBPecDrZ0Elk8rMJ84tRNc4xv6G8HqPPynvtHu+p1h93ZrJ+A/XIFTK2UMkvrchEG6ztXWy3NH2qrOZK22FdeGWEjmKl5K1lJTlMRWrRbrp+s8Pt9uzy64Y5qogp0lmnmnxk64bqp0UyvZ9c7NdY4EgaqXlCq1zkDa61Y4iN0Ky3Cn78dvVZy5X2gtdObddko5t8PsvCHVZWx59mgefTlotFI9T3Y6MpjrSTh0agZGJ+hZVTuKpD3v/Oj0OWdgW7C59MCOcARU1dGw3bntUtvb6GcFbMEb9Xjd+epWd7VrPnq9W3u163Ri/thcS38F/eV8+MzW0L8RjzCXfNsfuHtsI4jcbvwf9jPxzncHo2276oX5Y/PH1fhQ1L69VXdg41kDLaZD+/2X533Y/M77B1cWNQm8cer7N86dESRHoonZkJs2niWm8HKbklec8NqsZaS6Ll+5dO3s6WtnqSoPllcb2jdb9UYgCPAVDjffokmgS6A/3VW+BL5MvRFu00UXGCDEi0MvSQOLEfaHl1bLbEPE42lYHw67HTpyKH0A/LZ/lg8N6+0+iZEzb5Y3toA0wjRvxOFq0o3e6tzeSNYj4E07t/vdtYjcHW9H7dGN2/AQiO8WuiR0wrXb7eFofViZYbe9IUH5gQSjDjAzNnWeWGAJyWaKBzV/34jxZJHnKqAYDLZXJiQ5KNuAE9f7Nh9NCr3H6x4+XKGDmG7D0VmPtrE71k9uVuw2CJ8tHjyQbSIvmsWDu9awwrlZTvw1OHuTJIqr3ka3w24hlH4O3dq0j2QbxisJxEPy4tUyHclVD96u2P3ZgPnj2rj1dIkIRRp3Legh2NBJuN9tjZKgvCFfRzBVqKmMbSgEBKE1GbhK57ZSe0ufcR7sTg57o8jvldGhB0FVVoMtdGEc7OiOIq90wU/W636L8jNTxgtOf+HTD1O3j1kqGpLEwptrgBiGVYGM1ZJsGEv4Ffqt0l20ON3FEn4ZIUehPDZQtw84JkrDbbFzZWoOOXqWN72XuHVDEEwwLQetqgbM+kz+fYLgwANE+K5SNKpdeZ1E0j5srv6o/2rE2v4zXTh146a8iaOyXfyYoWlNs/ut8kbLRuinHs825o8fPbZACKt9KACNlFtVj12TvWe/evZL1DqoF+bm3dJz81XrWQPHuAHF1du/5bf5hSr6/9Lt38Btp33DdsJ2GJW5hId5EzOOYJ2zUAm//Dfui0APgnJraDZCq4sqKLgDM3F8kekP3sMWBi/r3bdMn8AHM3i/6s2R+vlXzz5Fpd3M83cYmNx5e6HgbRgtXea4HgCs7rfjqjtSUN0RHCd2e3HfTpdW5ZxS1tiMhmjyK8dBm0YH/qq9s9oLwwgf8CoUUtjJPp7xji9gTFnVW88+/Bt+CIWOLFCZfl4ZfAZFFhrWrkeYsg4vhXtEazl50fP3cbFgRgT1mx5yxntmTbCA89vpMcUy4sJBpXsV4Y+sNbWJww63UCeHkdhQE93CsniPFfUI67XBDvlfRzQLcKb9bhwgckR5WXz+RG1QznWn0xuAAeKq7jtQXTue6sWDAtuUHzyD5za3nAHDw2RCnAzaFKANdkBJPKDoGpYHETrL+gGtFARyfICtdkrijWth4uOh1eDyl9uJxqpmawPl4rrlwbHepJr6QZ8v4GQcyhX+8fQ7Q38UmxgWtFT3g8h82P25Cqw7FYYGYHafU+RsAl9Dp3k0o6FRgPN8Yvt0dh4VGTMcXSRvK8I0aGIt7TAKYm4YtCOie3CQ01/gVfhv2ETqrDNRdYJNFcSTb6WBQa9BITbJ/vntXxtwNURKG//ui5ngnMypRpv8kHAe71HC1zmPqE3FGfhc/Ln9YEPo6TvEVzoOGjqKakuyPfAjwpjmqFycVw3Qpg3X5PB3xwwWLcmv3EJ0RZEtqKErPmb4DfKCeP4TMrW8g7nq1JcTv3U1GIdMHsNTmWgoSyAcCqIbfovTRRoc8GN0MPAoO/MT7Zl4p8BqfQ15JbFZcHPyTNaEQiIrngFQKetsSXBxUMoj3x38i5giWYYvVHYR+cg0rgzQ+xr6ipBNjfcdsGYhgulOwC+HjxSDl8dBD6gxOdJmKt0PkDlwvxfg/TK+S2Dm3jeIY57+GC+xEIHs0mntCKEe5upaGPbGwT/gqkLFfk3F3TPVqOotWzVbY8UJbZzgIOFZlRsPxYnN6BlCZPkR/9Zexp5gbrz3/G3O4Y2zznRSvA2n7qweoapsw2mxhU3vekM3ceFvTEYSx/zt7MScDTv1e7nLENqCQMKG7CyVBJxxJYVJaZNM3o0843Xq5UV2hTWHA207IbxLGqENNoccj68ArV/S4DWSYweOE16PUjXUnNAuT4HLmHrJiEsoveSInf3AGAyc93mo2PY57eFEzVNrvLhZDN5yjzy4/yQeeJKHVB0hOZY4FNQE6ZN0OJYL9hVUaINMhMkd55QwePkcXF0xttQIuSEU50vtbtTusUNye7vpzc9hcB7/Bf7hCnApXYpqJacgcpSPwo2AAeJhjbxsbiGUZtsf4lojUdQq3fHjdR/NC0QiacpPw4aI/EGMKCb0BmK5lWsvN+DT8P+VNBIL7gVotkaQoYNtO1HdEOjdW570AbtwvMqQvDV/0F4PCQW33+10qLeZunFIoT6n/ljVjgYDrJxh8b3j85inCWP++Br581OojyphBPXxefh/VKWF5KTY7a9lNiP9NU7VX9dEpPsEA9zeYKYKhq5K47ViDR+lcjUIjdkKWt01i+2jLOyTOEWdDrtkIQRN9nZT5G7NH60p+Ju4OvZQoaK1ZBJfiUXbPie7VRC01HPuzopOS0xmZTgAkXvXnpkwCQEeoihgr8EbfR85995mz06AsKqkzr6/jXkD+bo7KM+iAgGVFA3tFB21XX1WdotUvfIq7NbTRg94uvBl7mjV3iFqJImuQkP5zCfaCXyAvkFEdol+N4WGyFdglaTIFQ/BIg9b6hkMyyIOZOo2DZSVbGfXjk7FkbbZiLXTwxHCh5L6iSmi4mP1mQRSEUzc2jWQvEzRf0anWB0d9y5FWxKgGQpoVP5C0LdqJizJj8TLuQTiHJV5FQZx3ZT6Xxis+fwDLLGKTwwjTStuEq/DhVS+ZOiZtJoboz+3YnIBX4caF8gECRezx+Di8knUkANluXrtLNsfUXKbw5SU8L8F+N9x+B8sK85dp8+FnUurjhIL64FV8JpXo6MAflbgT3kWfuevV2zFJukKcc0amIMh9OOkooZDKJ7fdz8KfKY3Q57SCeXxyFDrtVfDObak+yHP3b6qwCnl78tC2dfbtGqsFmBKmrPE3NI8uOlG7XGmrxCUNB1BsyRo78AfnpCqtz3X9K7DrTlzK7tw4Gu0aTeV3KHu1joie7BSlXwwEb+p7SflZTSCwBlxBNYGSEROE/tjm3gdlkIfZvooN7UhrbTuws/XChrqNG+zJA2zkNL9KEmfnu4xiV29rknca6SWiYNoMzgZD0FwuoJmFuu4y5D0dY6IGHPKlp79I2z4zwjQ7gHj9z4Qz3GCYbxPwXyIs3fUSttQknxRMvlmnGkPVGlZyvqSZS6ykcHOAPb5+3h0xKNVawacE0rHG2KgIc067uaX1A6e8V5Dxfyr3e2gU54TtTOSFARvxmrN1vS3z0+gSP62p69qPT1M68ALBQNqA4mju9VJy1x3DBrjzre/fWU/jYi+lkZ8eSfTir+f2Ira9rhvE501G6oKKyNnTx3Myz1vT2ovWE14Vvswp3MNawLZ2feoJK/QzrS0wf/8wcf00lGgz/2KrWNmqdv0dPs8Eq7xfd0WbHvz0pkwiY1GU8Xh5bzZCZMMWRb157RvaUrMutJpX1Mk2KhUt691h5N6mjA+o9LLxARf4ZwlvbH6ZawEi2g4RaAtVR7kKg9bvY0HOV/2kQDwZUJUgJpo6S7Iy+JEFmeoF6yhCl+HahcRh8wpFaylYipNGahMhpmZe00XVv3BtLrZ1VU1Aav+wFU2fEwQvhQuj4yTYsdycaTcVBkwhKen5/upvH0Ds5FNp9XBt6yME2PhrrDWRc/vddcGNY4PU7ztmj9szjaG8BTLkMWhKfBcjraoGNv3k/HHSqUqUyL5Iwr7A7MdWxG3smhKzn7UuLUOnwwVZ0r3yfPD5X3zytHGkwDDLE9d9b68c5oUPtNowGgyW+G2AtrcPl+lHVjFc6LqQInhrb93bxmtkrV1EMUpUd6KCa5rNM/Uk2X+Y/kjGo/B64rXLcMLNS/BY/X6uYuyR4xXA4x32Y9sHUpIKWPQjMLprHXaTSiWVTpjojUb4mRT5Vci15IuGvWlsd0VaIe6psaig8BRynhnfclzaqnkZKc7RAmx1UvL0GdoMrur4xNVFK755jINoG4FDLswGisOVK0MHNSlxDNjHwce2holxVWqsXMPyXjN5jzX3Idv8XBp54UunoXn6QC8QM4vby03VjTzM2vE4LeWZ+37BEktuU1L6V/p5qNkMq756aRZ6R7I+noF/V1383prxSz/hXrsHRazgXcey8Zry6aduLQK6nyNrtQrjfHFfqCguMcN7VroWPkP2HZ+W8JkBxUsZsIksOi3PeOI4DJFTnhhxjFgAS3+8RyKGWTnX2jYixhYryXHUO8pIQo4rJjcvg5hEbgkS/871nPOloVRYfdKmf52In/rNTzibeCLgaZIOkMb+mrVgJdsBWRHJh+PBGjghu48Mwoqzw6QiYE2XyWGwg2YUNSYltE7KMUDJVPIR5FX3mDHsA0YTCAUG8obTPspSV0bWE8ClPDb1CxCz+HmFZVcpH5sCEXRkfjogdYg0Bt8Hb2cyH4KRJ7V/JgIq85hzPqQoaZnIIuIV8GEVC6FQlqNx9QqNk6Eo9XtrFDEanb3u5h7Mv1RLEYMnQSySs34RyGSy8EqJyZzoiv5Oaqd3KfYaBgv9qTDzyBrCDcyobfmYFgSwZZW3KJ1clj5RlPV2A1OPwMh0ozSOBFSTaOlBDYLrYv+DL30wuORAw43z2JL99Po6mJUU3RBDl/Z9HlvOHFJxZKCJYrkcD8Yx2R9Hf25qB/wDq4nE0n6lVqgxRqHoyr6NpR2v027nkYXVheyA3q+v1KrlNRUyL+lGojuW3YztLOd4vKskTLbSrLS2lIXqRNg977i1Y8etV7K3WMOFaV9eTJhw7VajMjM0F5eC5JTeFp0B2une11g0a8E7aRs55uuk+HDBYsSuatIFY+m8TbV9vewIiNqHu4TVVdFINM0eVeNpiZlU/wN4UhEF3aGapAO0UvjX5C8gNO/0ENwyMJMglLo2s4wgOWEIcvhqL1ONn5HErUPLpOYV3vsTmqunrlwcCZsm3njeNx8aHnsFjG3+jkfCWM/RPVXckCVMsflIab76mswFgzjUpnU94OKBDqH+ul1C91NuSMS36sISQUz8Ilm+ZDeQPU47Af5yipN0DXUBmoMU0YctJR2zNOTOY+JfdWtkLIXgn5OUdNgoD6q6DVq5piy2A8FArJ9RfbvZjfutrq9boKHl3RcCTPQDsVswmEmqjRznGV2kdILoIfaqbEJKEmCxGKOq98QmjH5PSpmv7caBW9Ndm9LGS11Q6eD6RiXqiNfQWE5nnBIx52U+5Y4U1WqqgOU0kPGrmpGIyUl9wMUYsQxYNO2Uxo1U2Ez6eXS5ByfumxtPWt73XXyfNoH4mbF4H2Nq1rjjY1tLBrDM5ZONDf67Tb5aGktDdvsscxYk1dKBvobUkLayUd3XRU/HIRqnP2eq8grbDS+Ne2QUa0rKlSaZKCgf8qPJm2AxG9v2LrQfMOIzbsQMA5hCD4mnMEnovKDEvZOgs+fH+tFqD/P6kr7xYthErzAHoQ3/wI78DcMTPEOwygqHARO971HqI/3WX2nOrLC1zAZVTUqljUXePFTcAhyoxPCnXNA89HTd2p3zNgMZcq/6mpoziqpstClUmkMv9BgWTadef6ecrBUukIup5YIgj6Md7ZU39+3t6Xyep7gb5nvF6k8pvHNRWdU1K9rgtVf6MPovGTm7wWXK7y5D403lP669N3WYv5XtZgNTAvpMtgK+ifx+bN93civR9bkFLpddAgOjG4X1zjeGVPYPVISarol1CSR82s9lZftM3JYfEx4QEwhrSK/SRMtp0gqaZao6f/l2SdTlHLU5Zba+4Da3lNqwmGuVkNtWJK1Vf3LeIAjXk3KSZNUVUGGkULJMQ4Gcd59RGPO3ldr/uLZazc4iH4W3VMuXlfh9BfRmQWd47DEd89+X3w+cVAw29uiacxrEmexS5Gel6HLRL7o13l+xsSMkzOYMph6onc1CSN/LUCJ8RyQlbJ8riK+R6msC/YHjKkM7l4NFJNIbts509IdDEeJeHV7pidx0CvytYUd9nMBzpFjlrxEHxiwH5rkdURJLGUCeg6YtnL7OP+0labC6X/s9l+PZTrxxK6BAb868IfCntum0ivbk/1mBtG28rOZpnTipJQZnJ7OO+SicQ+5uG//kMGLOYjsKTy/O0g92WFkzjLjYTZT2sowTNx7Y/cdTOaPBineCCbpm+Vwis2Vf5B16SjcK1W1GZDJ4YmqUseqim6kRA7swSgqx5bYjDupHKOkGGNmR31R767GFY7VtRX1vYzxZdvip7frA+IPZDmjHI2cAroyTnivu4+y/I3SFpz29lvyV5n/dlMdv4b+teUY1kGm90UdR0MoxXvjw6EqNcyU6pCbOJon6olXgwIJxp+yy/uYdJdkvCQlWqbDO1aHd+oc/L5d70h3ObxSqPEy3KeOl50baGi0srYfCgnNPsF45YZcvgLE39HJHVhnA+QtjJSDvjDCgC2JlbfrbRznmhfSBWrkOgl6NOQVnFUFZ1VBjY29BXxn4JXXlVqCRh8Hb51MXNA2dVgd9uYr3nqdQE3KaZ7QnuCTpHapehvA6G+jctzSeenvfNubM+YrY7Iakq/NesoSaE3CMhI4x0L9Vp30kdLMCh2i6LkJz+lqAe0+b6FpZgbag9g4rt22dIFQA9BFpeijL2BpPK9NjWI2hA8s40cm2xovWsZGfKsxoeAPstY2PqouBkkOiSneZGJMV7RJTwrFQAE1cMYnTQoO41IjG+1LIoNYw1EtVSyY+h3SuAqjojah4VugwKI6vfMw2wu2snolJU+FQyzBVJ14AaDq2F5MOes0G1N0pcEMpScVC/RXmAz8UtpS1bMM3gW4sOKBYPMm6Co+iuoD3WcVYUB3aYbLlGkCflLwdaVkGQHXuSDm5FFkhwquCLyDx4GtGOqDG2t53V6AuEGRCWVDQHZYaQ9QEU1ScEe/VY/o32TbjIv2MKEvLdEfi/zCwZ+jSbWIRSlCF0P41kvebH2WqIbSwk56Myl4kw/izCzxaKUnB0/rolQbym+EyhRYm8bIutmMKhQfh8CiCIb5SMFE3iec6fs52KUYl5rW7RtPHMzbQN5xfhSFW0B306ZWmRLCXMBrRAHBdYERKv9C6VFQlTFka7icP/lrgcrotTAECv8WQYro4yTrmDfBA4/azBTN1eTh6aYI3SYeXHDYmv01J9iMfYbqZ8H2Cxi5h5x3Hrs63LAcMDREo7WL09NJI2kz6xjD85NflXh1qlU1/q1E3vpliVdmJXtErvqDc20jsdiu5vls/dw8/H8pHcvEITAoZ40ioPfJaQxHyYlxmhsfbFbo1FsYZDUrQVazHGQ1p+AODrgCDYIoXZid82Yb7UZt3putHfPma8fiI/DvnHfswizcmmvPQ/eOAbWEZzEUOlI7Vpujl+bbDSgID+Dusbh2BP7M1eCtBr4FPxpQEqqszcfztSPw+pyonguOwlf9QXnVtr2Rjzm5Fk6Xn4R4xAFFg2m6sFqPhn2EoiA3DsLsllvoVcJxdoQli5ZjemKgVGD3zyhojMNY1XCLq1JHEd7mu6xYZy8bFL+QSiikYsxaIC3UOaJMXVaz6FaqWanqx1asKyLHFbeekoIcJ3XSz6TpUPAw46WqzgCNHvMZnoz8cFfjaMuRr/xZQUho6vhX3qFcUQ4t5wdOlnS1FSsFBVLQTOiacRFDvaH3zjvqzM71/W1So9XKKVh0JTu2C9VK+xJxLWXmr0lLgvn2Hj7bK1k6Kt4copnKDDSOL+UQU1I2/vgLGBL+yVaqkgCtdGeW9g1topPtmOS0pGkXh5RNVDbi8WMua3Oztjs7J7o3Vk1RXoqJ5YXrFp13dYI1VwXdi76japaF0aOqWdLOv8QUkr510nBhKYT8I3QIfQAoozSf6Agxk0Ebzn8ic1TwGrcoFfTeHo5O+7122cd0GJYHQcLwLp0uLAbeM+itZ8G4HRfsNih5GGSaFjoFESQSSn2+/mVAqlnerjhoO2Rxx0rh/SPIbLSW51ekBvrt429bVBTMGPYYw0pr0EaWqBV2jDyDKhtc5ayqssFVokFF3iCQGXmhtTyHQroPf+QxqwwQf8bUeZTrXFB1HuU6F0ydqN7TVc5zlfNSJYeH7KZmAB0UHDExYTERnRsMSNxYRRBHZpMyKMfB3tINpapFG5Q1vMikHgZSK5nzMo2Fbfd6DCKwHaFn6zowhyGCE9Xgyt/0u71M6uRwQOrb2OYEqDGSc5H8WylWxdHHCEoSIictKvykeFEkQaPPglJmydE7qKWK0IFqOGKRGx1RLO4cPX7VJlAFq1LM6IyUh/CBAxq9qL1o36gTheJp40uZNldiF4dq7TNGH6Tiup34C7fPUqpZch9k5oqaHQ0xjKIFAmWRsKclAfal114v7GXPrYWyMDPK24Yf8ZpVMyxTMOPRBU+rSuaGK1TGTZau1EVeRVQZPtc+o/SnCe/oclwIlmJKB+YERSAoc2G0hAlIaGAwgqjHcNTdsq9ogGTYoPnOsvi30GNWeclqrZujhsgYJHIQRfiplWtQr2Ne/JmcNIM2xyDX6YL3rLOmpGvwi/UGBPGSDmSnjDY93llx2OYUwfZRb2AOerIUec3J+tCKgzXx/AIJt6qKoWNMu0fMMAuw1FSN/ylQlLSVSs8/YvTXkrm+o66F50CTeh09hmzWG1l2uUth3Q0bWvFXz3+CbCc8B8qjdUf3nj21X8VHha+iiZ61g5ahma0pbOOvI15d/jZO4S1uIwiirXrEHlCwEoLq4bBhcPzLDSsrRHr/KJpl9k2Fw+9p5BsCZVElD39JGmN4TB7Ot8foOMR8/m7Wx/b5e/iyYd1Z1ND7HKGB93kYzbxJCMICJytHUyUbfpIexcPAESvp7Ms7JUPHzDi43k9AT9glOLHfIzVE1slaVgUWtXyGq9RByyGQmk6l6YHM54ynBD/Kmkdoz5zZwjt+VCriycb6cbKPH3USNMJICkKbS1/hxMSTjEkvlXAILu8/8ZcsY8gm9gH/qtDcKgKUMq6bI+rBXZtw46BgRrgP3IdtIHcBajT5Z2u0uhogpC0t/4S9JumCU3HQwp7B+7oWflZRLi88CNhABHp4ec6OmKkTKgVXSZdkNLHQSMxIqAKzKzQeqrQsBwKioBFZlRFZTY+IqSBvXPTXddooRJai8Men2VJw0ljVqT7iJ48fhT7qieZMGlbr8nctXD55/uHzH0/cs3sqG9wDykP0trtPLcdfRoERJ8s8qbvsEnc+S5rjWRVrcxJLUSmMH9T+nY64wS6dBvqbaGoX/kF8182qARylhXK0IuguG5RICp0hoYHpMpYRQHmSFvqOSXJF7Ybz/EPEDecBQDlBXMdgvPc4ESJ56ugiIBhICarovs4RRKnOTTmQDlQ5zJC+JzO8x+Rhj7zzrGq7Yb5LGtFC3Sd7HMljc5ssndbZu602HZ6+1rCw122GFZCj1ZyoRgv2W3MeKna6YFhti5Z1A/V6UKk/sLd6OxwMhN2GK2qsxXLbG52eN3ifS9lFZY1Kj8V+vIBf2A0YPQyeUjD0Hntnwd/PS5VMHIpuuhlLRWSsx7P02MoY/E24EDObMdRsRnovzZnNZJWa5G08i6u2yL/YcxIQ73OuNjYLRv6PJm8fbcq7mAJNpfDyymdeO325kpoKQf9Gq64fMy1rWIFLonkrtCulGRuV8kq9t6+0n//0ghwYZXoT1vi+l8fhPYUCmGavD7I1jMT6Fgyjys95IMOcpalLkhZ4UcSvkjFaVoVmWnjvFfT+m998ST3tUp7jnEmrnmDocKO1M0Fg38hOWw/8pDRhx8yl/fPbln9+o2D/CNkUnXDhcfZbYlAoEwhankS6k6PnX2GRfEG3UdKTm3l4ZGVSbNzgl5c8+9dhJXmpYOKvJtKt8Cxw6+5wFkV0zqdWKqEtR2DLPZlUl35vdg5lAn9CCReNy7cam6DPh49mgDGk2uWIVb26lQY+LZdTVTUYztVqmMlMEtfRz3UrSlST06lPYkmiYX86lREUSikAenSsyZ/OZ3epssSPNzADriaDdEM1Lo/ViGzIh4iOZrX4pt3uFA9iwa3Ix7mynF0dMa+dpdoR62LTDu6uvpCdhiNbYchawqiu/NcOGJzxCKctEl2iHhe5QeMyBjCVbEYlZUc3rvh6vAjxF7MFVjx9WeeS5YL872kIdEEgJ2cQ6IHLdfsW233LG2IaHJ95P7lGfoLT4aCeGk3QfkI/jmAQdJcSj6O6GQY9psujeH89apKOWqnI/eVj6GzUpyqPr3A+Mt24zjUCHdL48zSgvI1eSYHQL+kntdQT7XaSQqg/gF3Prkozk5gTDhlEnQvHKB23/DjVLnW9TIlxhHMc1lmBRv2AQviaFX05rNM4cQID3DuirFf3a3ib1PX4vuqH6oh8CduBn7FpuAXYD331ijuabjZVRh834ZYprP/IUgioJAH4AYsRl6gR/nEh6JdtTfiEZevuOSxzHs9hPS0MIK9y/dBFHc1zJ5OyYjeXS9q2o/P/HNCJZ/gVknDIGUTyzqBbndycKVXqQ73b8IMzb5bj9dtAbm+36J9RvINp3UZtOK9u90b+7QFeDHeS9RD48NrL9ZWXKn8taqdWhbLXoAZB/lrtpWjjGrSX2zBb0AbpTYu7rLrkGm9gkV7z1zhhzzSQWIm/5nARtRo8gJvESLTrBGiKJLTNWZjS1hNrpi2nQiYmNLOc/bBcqWNojEVX2LyngWFM/BJpwmETtOpAMNBWRX+b8Bs3Ef4WJbRTgLR5/CkC9OQBkxiTQmabW6hYbFU6deqk4mo6Mo5hjwYVhmw+z20e+N9kh1g6RW85+fUXJIM/ffYwE0DGurz7HN/wCA4EcoVgRwFVh+tqT1FIzx4jVz+uWhLJ9Zk2gdyNHQRzwlpbD9eFy2nrMUoz2uEg1EOi9rPFHScmnkmtY6a+LhOdV73FPetYWYdiEW02sy1qiyFb35TeYsrPDGnlEf9Fl1LBr0uc1D3FSUusUhq5XGY0267UKmF+QGOlow/JO5iL210WmTookunZZ8LOOo9TLLT9LKOrztFe52q0Edpf62zySATRf9vEOvCHGUNTXyxRjAzY2pFopnjU136I3Nr8U0wOBZoR5anV2lnmNSRZ9MruDfYQOMxTukhfOnxC/bJYkJSyHBXlkYX3I9ZmKlXDWsybQz8iB/ZLLUwqhMkjYmhDSrnZ7Th8VrtpJwCEdmJmrib2Bdu8y8RuHD1t1TdaRBo3Wq47bneAg6qEkJe8eqNxpOox7A21dIJZnxOEYTWU0sgLUQkw/bvf1q/Cad8ZtS20h5gMyeZEgEnZ5uZXldsGxwqnqbmEDud6d1nQdJS1jI4zxnisor+prYfY0kpASoimLB60qrag5fUjuFnRSZWOaxNYXFuNgqDkRmtIU6cVYCjcm2KUD3vouEu2DTqBe7GO3s2R9LfSwESLXAOd2pQcq72xRn6dfJ7TfVWfouWEeHnY2Dklw9yuwjGX8Z3ay3kSyiYFFFr9mdxaA8yZbaaj94OFXKTLhhWA6wld/IWt4UvF1lgZ53FNV+gNuoSmfqvd6hwNZjmdDukO7lCE+xP2zs6q9k1tEcGDYWV4VeWuKym86j37FE76H7E+HzVpaM2ycOhxecU7cUkpD9fK4seiKvqDay1KvcorU22enGOoZOsqMh3x4FDjm3ts8sFPND1tD4Kufwp/Pn32CP59SrrEhxj5d/f5j7FBWCtqEnVOj/ee/7zkoJho5j8P5dUK0DUHhyU5pA6PtyTaFYkQXrIbOMy0SQbWCWIUhtCh2eSmCPyovc5+cRSaKozOzpAhcOmxw+GZIFZaknq4VcFhz28H62EPTj3BiHjKhpcmauRhrKsKJQItM/coWhJHkEy5xrSWQZqQWnI4PJ1sgxuRA0GkeuaY094ixD96g8JO6knUhVOaElluBdFpP6ZkXZuOcGYfJzjULwLBwGdRKw/dAZUDOmWRsN4E2TIaJPvGnznAeXfPM/L/MkxNlxzcL587IxslUhozJAOl/Gj5qtGrId9Qyg+YNxtvvdsJatuxegc1HIIcy7AYD4iRu0PbhbWnzpuxrQVUiBMYbJ9qccQJK9LJGOwiybr+Mqo7yftXiniZT1L/+h2re7I8i7tWEipEmj33xOX18hpMZVmLFjixueFbOEX5SWeZG+eIGzbP8/rIyCcayyAbFqO+nPuKWUPlNvpbWpmD1ZoCRovhF/hkJSm1PQZlg7OWwVt8ttnly0SB4D38GxAsG73n61/Kl07A82kVpEAOFGmagG9AboLW5yuK/B3Cv4ue+PAzgWwT9ocUMOtO1hiuI2+lTsnZLq2WubZXyPV215npLLEw/ThAQafZMdRj4v35vz+m0YALJU5YytgDtp9bOpaj29MgLgeEKuWuNKICfDKIjKTWssp0nrO38WT+QiU+JxQXekOnA9fqdnmg043rc34S8Itu876RX/i0exHcFzknbdQXHsbcSbRxX/JnYiMIhkaPQFEnqm1qRFjbKcIXs9HyRKvqKJHfYk4VMtpYhTP2kiu+1BnE9hrVn0GI1sbk6nn6C2tXHcj9wCsnir9w6C39RLMdGllXlCdKIC9KXo4p1s0v+ixxre5BrVv2luxNx9trk5msW5YpIYuUkaO+E5EOJ7dA5pTtTSkGSE0ubt90VsKK9E2LPVTvQwHYJjt5RVtO0ZYUjcSx+QAKmkj8wlX8Er44GPVbaOhdghs1D/OBi31lW0axTtgewWmo1o+CsjzdkadI4UbCKphpEXpUQ9lDfVu5/h0gViWXtPB0k3pNaxRbL6BPlDbSmSgVjdMvStsPpTRA5f9L1I746u+g1PuijeJvoYPr52Q+RpnFovGT1JMq+pwslicsYmKTGVIw4hK+fOXStbOnr509s8yLaoU1lrifvn3Cm1PzPmGa1PlVpBP00upNmUH6kNZvTtSMqmqGihUdo2vNU6CO/YBm3MZrVyfXEYsGlFzWZBdNGqAc3azWvU7z8Ula1+q0M2T1QM8R8DbkuL7/icJZSQ1v3qyVpPXq5zKTcUX5V6YfQFn2uBJwfS9NloWs9sjLSwxLx+KAp30lyA79Du5/2N6fYp4K+Pf+swckqUpO4qfPPvdcW7WIrZo3YnSm+5L1FZUkhPXjJADlxJw6F6Lq+oHmFFhenrmsMQCumoCNbq9XAEt0l5QrH3BKUM8MfhFfhFWh2gEtvQoXLFOPggOz9f3WKSHiakrZYp0NRK/SBom/lJLeIGjRxLGJwG6c4zxof9qK49nVAjZmd1GieS7D2umt2Znna0PKB2Nha3a6fi80sFL9sOP3dOR5Tsbs/DzdeRPqADwzqDENPbe54rV7ISs5difjtSqUQegO/NniZuo+4ShN63E2Nvq1KAt5dfrM0LL8vhI8njsyvAUeopYyC+U3tq/DBLM2q0ykpG2qasXRVDUopEQ91BYa4vS4iV4GM5EVTegIxKqoVI/Gu1b+y7NPWDtKGYfR6euutrjlQRAXpsyjtx4C3X2CSY/rngMpS1+gXUqB4+xcllJQIVkuX7l6tVL3vvy3LKX6ksBEnjAOG3xZIySjo/m7Wd31e/xBPdWUlRkpCiqEFj3sk1JW3reKYs1QVJr8mJzPn6ixIMw3cj8XnRc+qmtzqcEGtt2svhvsFGVjj9v+EC0uZo0678ptSxI9lK82PpCnf7ag3HNB1lXS+Cq3UQUMgvQVbuW/se7H64JOWOXGWR5cTInqKJ4MCEig4mVuSbXMmwrpssQ7lNapWpSp8K+xlErfsIjlmaOUNeOk/oP2QGQYZLsRY5Dvc8dKhipbumic4iC51u0H4Shxw0EYvVE02KvQCoHytFEaLfPhED2a8tyLrBOf18zNfp2PpLJoLpGHyucnvvw3dUZqByUM+3q0VJJo7UESIbzi5XNnUtK8mLEsgd6oAJac5+iopF1bMAmiTq8D5OK/yX58/g8KsdZm4p5yunbej+TFLfwZ7dwvgDtDPm0vs9GRDqWNWo4SzGNZEcaB3BWF26PheUSusHfYokSf33v+Y6CPiPCBmYCQ9Xj+47oMULiBnqW5g4t4/b1EPf6kiJB45e+eO38eE513cO1ETdK0SLolIPKDAl/TQ5FLDGDW4czoJmF0kkuXhKtUc1aOmP5AoyiSoYnfVXhg6S8FsaO+ht/K5fMWHGT1JPTjxNyFI4X+lrLKa6ew3+sC0wvf5nWHt5QgAYQeBu+nz3/JQVqW/26GJj/ILONiMk39y/+aVc3zXz57UiKfCNPELT8aKAU3wYgo7tjaiDRHtF/dra07nRPEkPKOtYduN+O3q7EvRjGqnEg7V6U7lwbu76vBW8rLRL10PhTb1jDKYTCQZU1jiq+fg47asWplwgZAz230a8FKCVsP/THdNC6X/UFQlnzq7J/QSgZx1YPLyJelJJAZeeon9WgaBbINl71uAFsmZhRY77aZYSzO+qos/rvMruZc27kLNNdL/Tb3x7FelO9zcvaDdRw9egEvJBKFGA2ViJgGVh7kQHKtn0oGZe0oAizrwHWpnMRXj/Pk0Az3QPcovRxgOl+PehYZIS+kiIzZ60kybM7McFAwnaWo5cT36uthnKgt2lR7dhhGibr0UX5s4bIufavRmZ2dPVaykJAVPByISagyHSVB5yp6aRjQI3VxthfgnwriRcPZOQyiZOd7aEQul2o1GOEYRbuKWJTZiWbmzW+hV6xfW125tbD71zNd9ozFfBbUoM18hGUacOw5dGmp042RpT+PiXxO9uCjJ3Dx/e0qyNhXuzeDE7NH/hbocD84gX0PBuiZ+/qVc9iXcADNLf/d1UsX6zHpfrqrO+VbnuVzAq2AaQ6jQP0ufStYCDqruEjboygOI+uWco/JzNrVxDjDClk5fNi4nDLlcdMtOcRo8WDuUYSFbhBPRAbXPKK5W9Cg9XDL9qDA6Bq2veDTUsaPAn0hhIyZVFtCQQl/giiVxMalD31SDFO9KCT9O7EkdE58DhzELzmK7KkDA133KJRISQvCnXxOAXbEPYBQ83s4zR6gHAWnDp5lwrbcEZ/Ih1qoYWkM416hauBngMkgrMtlTc5X8hIiHVoHkhonFMSxXk+SnY46u6Wz+LZE0LmffkRwZVUeSz5nCbwBRUIU8UAw+lwF3n5BQNHv80GWUc3U3xhAP5/w6faQOnOfO0GFobrHrD6/I6weVmzzVPfrJZXJsiy9QOID1VIug2efMgenNT987ovEehcdkTCOCSEnaArYNYnCp97N7TVOzD9TWZpNFC6/fFR3kCwOLDMZtRcLObHSt9UysZR6fluQWfHZOZgSxIVBq6pMn6NQW7KnlUBNCyJeSMxKEUrUoIZogJKdABS1lDvpOdPBoAvkeJWeA+2RofWh8j4K06IA8PBrcKLAT7Wu7jiKVVxmaRZOv8iLzJksy4DDnlb0gppZ2Whvo4zA0awcNP4T2Hul9Dz93rRWZmhid/OmL2tY1C6WMhHo3FUu+S0Q6pqtnj+gXDs3+Eob5PhQoukDqZjesVKRZQ8LRXIT37ZTwtlRsasxh2UUrEJt8Fy8Iey2wV3ToioiQPLnic2sZl0tqGqjkDAqYa9oWSpC+o9KEqPZUwRUcFif/Y40LnZKHVtjxASuos+R3K4bRIuIwf2QG6PrLO+EefhqXM7ChFOFS3HUhoI8Njq5OW1k3eUxTOqLc6nYrGm0q+lyYwuaqFvLAJNvUKHinTCJ98/nTqyWx5HUirThRPAvYu2M2aE6VR/RtY4bzdOq7BZT6V7dvCsHJ3QHmXQ9Zfq10qsLfGpzliRUN7ytzu2q9+pRpUflk/8uesW++rJRfeYIqvrgrHoz4qOqvCOBnfgFx61jxh7xihXUkqeEM/o5utlm6CsdkTppFdo+iJd4DFT2AyLmn+u4/0U8Dj9gpcs7LkHco9YUUvV8RYk6WOqliTOqJRs9ykBy48wa3ocZTZNss521Son7Yat497zyq5ihWCx/iFUDjMkDOudoON+mDokuuNC2YPjilCS+aHGs2vLwSZHGyrKcKjaD4E4eFTMYrEgVBuMK/TD76aD9V/uVVxn9qoDZR3IbbsB5gNiCFqYaKRMOH5aejmPq8VgRnr5QhcQZvt8iZkXpKoBZTbHyxL+S+qVcUceSQPmh7BduVLwXFSwYRZj6iP+WM2oqVqgx3oWt6zIaMOdtvp3hrt055lAnRAmweiEVp9Hj8lRDdDgqzga9b1lG+FT533LSFuZt7ozjRHFBmnPcPsgVpqFaxcbHK9wo20K8UkzlDO/B4hFS837CmncYB5r3E5YIp1iJKXRl4wf7mxmyAsn0SrAKQ7NexmVvNO+yPsvp7RCrJR1rLAV9h4LJtIaNIIbwQtg6DfEpJMVd2/wZakNuK0UMsUVoIw5bS6Fga3X59Wl2+AvriC0FJy3AXHHJ5cKExirF9zDs9f4ubHGbS1ressYq1DkEDqT1qbb/mxAZUd4Wys2y3MzhfU/W2RM5I/dI7vgTZd0m2ZKFDTUApiFqEWUYck0InSMl5cH69Sufc1Y5njLTLJ98m1P2TEvblpwi7ygAkofE1/DBcBg+yiodrRdALgivq5ZJl0VGmai76pB3OKN7ZOymeS0LX6PFf7H2OBJirpZAhvKuxnynxlc01AvPbklUQ0/IIIGgieJYhBhF4rmY0fo4nB2OGMnZbN6w42gfCZLWnmvVoo6xEUw3kuKeUHnlrFgzSrYixRBHx+AyVmuTtoM5E/6VrVpGJ1lk5SIypRmjsVTqK5qy9kmntIQsIwKspqNenEY0Tun+tEltXwSviOIZ21y4Qdm7afW8J61Fk5j4v94n9xA0zb2nJhf+99Q4TExPAvlLZE/Dyl2C+BUo4oHdv4BBzgnJTS5g2oS+rZompqZPThDWGmZ2x+vb2CJ+K5YVLSDzdbZHYTlmiQn6f5HyBFxDF6SiAkonkX5MC2PRbZrit3g8c1FMtArIGWQraYa1Ib0CXYknBlJPWUqpApNo1/R+Ol8Ky6vmNbjPaX8LnCqIhlhCxNSOLVw3tDVOrHTBRxoNvQwKGzv01wJ0oS3l6NWUwcQett1U0gAgaMruatmMYMmiCfqMfapudMmwQ9sHBLvw9HrQ3mDSiltL+xrgsUMuVxRT6x7IlJM0R0P72D6r5KVe4OP3sueY8241dciKJpePjDsptS0eLY5SGY7Jf3RkdKjyl6xxSSFLpdzw6RD9lNQx0gVx6+LPsZhtH17OAWzUxxiMFDeVBkIBiD1A8jWX8m/LgsyqLKFoHIJK36eDVlKVmLObND4qFgtaSW4pz3/Exeg9GlzphqMd5+RLj3RUJTXwV+Z99sw7ahmlqJE/1iNutP4pE0nT8udzHWsMeHdW6U5OOZ545Bm+QjnjogKMmvzBF26TPzZcAzrpOdzFfaU/+5Ptd/P8H8hyQdwNHZif2b3Osk4SznFHeQNVGR/4T1i95hFVNxXrZnyHmPu7R13/jGK9sRvv/8jtxicyguyh/JC6/AWtduAU9UPkEcW73PEbgkJICPBxvtPRz8ndXLk4Ugve/u9uC1J78V32jZqY3ltQk2HgscmfUSA8c8Mqvp1v53CZ6FhlL/rsxtM4zDxTf/7pB9Bm1kMp6jNsosubIkJ/oPrh3WaJPQjQgf99bejTTqbCnZLzqQsrn3bnZ38xbe1CC+z9FFGjTcAbVvsHZRja9Da54+V4i6KWUL4AxAoomA05KA/u6sWU60BGxAHWwM85hP6BMbs69RN75S58204GpPd9tlLzfkDwZQIvYA6t0G3Xphf1Eh/weXCBcpIa1xHXp7INTK/fHcRlTI9TMZm0gYvgjNWjXo/SH/W6a+uJzX6SbYyAtlXRYMu7HkYbcKC+fuW8ZKdi1Bn4XcbHp3rA8WJ8Y5CcA2Y72vR77uE/DOPkQhDHcB5z8tKqN9fAE5xCW29R9B06/MB6m/mhv+nH7ag7TMgZQlC/sTH1cNDnSrDBjsemYmc4WbadUdzuccoZJrZcKtpwokaKcUngbwTVOTeHclfn18SKjbsotxBNI90BpgTMeoxmW3JgIrd3MCNpOT3gfhf3QDsiWIyXYqMy3gpDn3CGHP0v8bKafZMuU+WE8ZCY77U31Jxma1brzOG+rcWntZuT1HSowyTAJKOrA6mlAQKLPDnszS46erkU58fF0ECwy+r41Feoq+ldIf7M52kIF1OcrBpOnRNv2lHKkV2GhfM5/GoTqomDCCP5czzMafKQ2zyfM7NmsgRNhcdSgExTA6/gTdnmMW70bYFyTIuMG/oSCgO4BubdgYV/ZCV0oZW4YPAvYgws0iNukPNslp852W68QtRJd10cdBzKuZGz1CL3ibR/9mj2UfFAiMxxadAOyiRl3JChxzQQLKXwal+QWlXGJCD/8HP3IA7KX/3Xf1/9v62trZneqN1FbC2YyZkoiMNR1A7iGYxzmLnpD2Hoa31/AMdUNCMgyfUfxvv5BqyaxsL8PP2F/9y/s/NzC8dm1T2+P9c4tjD3V17jLzEAI+h4BJ//Tzr/iLuDCXG77aS0eLAUBW+NulFAQS72b3cdYCxGH7k2NLBDMWTFziJqoFGG+lsWM+cQAgUtezKK/B12MEN+iWM36m20IfnRGtH3GHNaItarlUGMD6wuYjfMUqoxgTqg3IUMgUF+q2TmzTwTJAQgQXzPW1Yhzvi74q2Y5Gz+Fvrf9HbKzFz6xI8BNVY+cmdRu4KduXDuypVLVwg86eABIHSiOYl8zC6E0S7w+xz+9jQACuIRSMlW5N/s9qyip/iGXaa9DkyYVeQ0/bZLQO1AS60ir/INu0w38Xs7dpvot12iH8IZ0g6tMhfkjl1qFNttef3qSefpGmY7GOzciLYIOUgV+w7fdop2glV/1EusUnLHm7GG6uCKjPPpS69fvHbl3FkZaWDQr7xeUvkb3qFAvY8Utsyp79OTX5K94g6KR+RpIU+/+wNBsGEPzx8rEVk9f/0kPf+j6AXIIKOf/UCePaDQ74eSh8Z6+7vfkdpRcP0MnWRUy6jR1/6OHv8ziWh/YtVMuoprF7gMKbUfItiZJLCR5yf5+S84o1XqGTfwFyJXfioYEn+y6//OWSrzK5FyrbcvEOQXCf+PSFS/y13npl8xzXr+E/u1M1KhmLDuuE169Rw9/V80kih7PiGRWz+/fN5G/nr+gRnt89+jJ/+T1Gx37XfOX5Mne/REv3H2rPhUU+oC0w7qwDn+0P949kAm9pFZFCf5xd/DyP27nofX9FztkVANDVfPvndR0JF+Rip91Bo8Vs9OX9RLgCR1vXiuChrh/372Cz0Xp7geNq2RxgE1A3uitbGbf/mk5ThLAWiqkkZDr/cHlirt+YdeGQXw529XUFGywqT61fOXrjvUCtNTmU0IXXLSTJOiLR61KJEaKTZ/plSfrCpgZ23+9I9Io/A2ucE+cnZ7vGV/I40fhyqS++Y7X+Q99sT78yl9TMUF0497nHeGSu/l0tl15/O/ePYFGjRFf+t+nPp2n9y6lUsxLFelOHyoDKRPafPIFhH1FT4jpAjYcmwRvSMUDMf98qXrZ6/QmSNt6oVOo35HtAK1NujNAwUWkAVWtJkw+XTZP3C3Sf0upY9YpddB4ktNKSPQmMobINBLw85cuq6x/xi9U8F6GQ0WTLRabHNU5K7gXTiPjpBSWM3Je+o2YX/TMnlXxuUz9eioQDCwFQFVv/qtBansPRhtUnqZR7zc75K+6SGr2zmFOiGVWf26cfW1S1euMVobGheld09UF1R7uYH8G1oj9599WlJ1Xbh08cZ3zl7kmoiE3aWD5SMq+SN0yaSJf8R3yCXybcmcUiIPordpLM1Tvtp7/nOcRH2tSqC29jPlDiKtYdX+R0gfpBTMaOoOmkXt3/fokLojd7A3B7WA3h1eHPXLXY7nVcjSM2+W3+jcmq0e2a28UZ9w+dcz9WA7aCvAqO5QsG5QZiO5XmcD9mqY85SyUVOKdEQRpozUJ7x5SUmNLxzuI1v2ijd39Kj7pooTxBKzK95LUGLBO+zBL0z7bP084v6chw7vmh63/M5aADK9smLB39VVvkjCQUADMSkfANXBSGRQ4xJwoPAmdRwehhsMHoKXmPQvk1clhflBzr+IEI01cZvgdWkUmeJB8pcWUeQ53AYxHe10mOc0A04GknV3gMrM07HYPuXly1HY78YBpogtL4u+IwRZ7irIfRgRnmfN1kjbZKhuTnYlLDGLXJX6GSBumi84r/W7+LmpX1MJ3IHYH8xitnX8ROJCyeEU1WB4C2EAQXo4JNc68Yx61hSdMnThDNxSb82ucFhq1eNG2s/m5JkKjSUsl2K4FwX1AmdAOjx2OErKG1UvoIAMLOdEAnBWVvlIi90t2BfEQDuQFEXXILlEa5RwJkosH4KWhKlZDgu/JguPxDXTKU8HBpp43zcn3BdC2z8koOKfKkPpPYpGe0dzaVUT2KwVbXoNopKhtxlo7Rk2SjrCjTYpCbnZupX026nbtWTTig4S3XclAEZrrmy4RLeaXirQEW5WCt2GnKG2MxpFOX4+ZTuh0XR+uKWsS5CtXNc6MOVv7ewI07gX9UFxv5jV5kYBEpyyv5oEUcaDwKEk2fFjH2vacNZgcS4lFuilWvojXhHjgjcPqvwIak1ndsm4eJlcQKHfcboztuqREVWxkdNFXJctsuJQlelmny1wVgYLMsulrOLv1S0UQBl97LkTx//DUX8c3Qm3alhCEZ3MwOHDiqJh/qC9HkaYmGF5xaEw/KBMDKZQKmyTlOc88VMA8jrNaq93h0XBEAdNoFvQq8ftKOz1zg2SEFXmGJ+MRgoUMpA+QB2tYN3f7NKZFffDMFmn7romrJyKFDEinxxOaWgW3MxLXk3/5wFLjYTwMdBE6+5LMzJwP7h0USkqDigR5OwII8Bnvuv3uki8IgJZaneTHeUu84gEZPwfSz73SsSfoJbl2unDcyWLwZe6LoRxm4QIVc1vmSUWv3Pz8hEFgum+f9Xv+6SoUu//geVKyQxo3p+3P34y7voz3w82fNis3UFrFK1ZNfw3EjLYVo5d+ZSUGJ85tR1NtYYqvNSPN6x6fg9jCz1x3lvItOK7kR8Pwh0/ct79DQl27zAzTG6wbj3H8r5/LtoYJU41/wO1LxQWmq7geHY4/PTb/6fg3ZfzPv69ng+7NYyT0K7iY7Hk77Gow3CETmWzjUxLLvhrfoeYTbMo0Oh/h90n3Ndn8xrzXb/fXveTDT+1Ph8zMqHkRrZqcZYm3DHv8Q8u+uWnDXYBWFHk5fqZk9+/qoSzXGGuWBjNyqCW6CkikytxpgRNJVYZ+ZL0KaptIPBde+3q/w/kPZXTph+cxljR4pNBjkZEeoPCpxRHwT+F0xV+GO7dxOPRYMP4oyTEzBmaQ9L+GdfGfDK5WcPK+atU+sz40nCy2qVP+QTn1ZCfJxOFTWN8OVmU0iDiIZQQcTWkg/kw2pysRAgI7HA4FCip2ap3BL7Vt+8dqXpHnROYFjkFD5AlGgU5K2vdYQ+RIst9gkLCYk494ssvuyPLdd0E2ZLab0XN3YTW0PkyIZOQ4P2q2atjXcjaIZS5YrBvajH7Zh23rI25pYZOVzBK2jfgZhwkTv/Lzhegn85v4PYp1Ud55s36S2/MzLDvvL55YwakE0wt6GSypVwMH2HcKEcXgLjxKfNBVKQyReucYRyEW+cR4tpJrqVXUMVhfnVwIuPEySKTfMGEeVIuwweD+oAQQ2pq6WHuSW0hpxqgNWa15bTTXn8goiG6CzxIZ2isobhSm4VhmUWxc4DtgrIvoTIEi1srFVUfCw1cbtYTWmcuz4heTtiFchkTSFGd+CK+rnvgunL4wOaexn7aCxGJiRnZqje0HZlsIKDywPs21IxboGFlKhYPJ56NjnZvupYOdEAI3EUhD6lnelTx4gZlmiEVVMq5I7feYbmDuDywe18LR1GMjgkKD8g8utAdjJKg4OHVoB0OOvjQuHWlW0hn3LJ644y/U65gfgck1vDH3EcnK41ny4ePfusC1LYu7zmvvQoL9vuBH01wpuIBznep46GpOM5M9nSnsQVTriCpb8JshGVKk1P1toCHENwm0wx1tDjfs84bfEk7qcBtaYAWahlrKqUA0LomfAPlf2pBoSTvHG9GmheRHZ+yF54+9aJF57jhMovWmWPogRvp+82pB6zxyYkxpv4LDB8czCX+Gl46OQyob3S76q2HW2Rqj3cGbTGWJ5RuoEScDos6aGUFpuTHJCU/Edvm29oGwk753sVrl3GX23UhJku6MnjpAbFjGJHE4WSfE4t71ytDFR76b3+ha/9cTDB3HORVjoabsoXK5/u+CTCi4CIVSGXzMJi0XHjJ++Kg/JTh/uWYAyLr85GJYYJlfqKOUBOkh3laMMbgXQqHcKf02Z5UuAkfjV08ab++FnIiNwJUeJtUAhTOt0jPcboQ2lK13eXHFlOgiDIVSyqtuwGq+UIdtE/t/mJUVtXbx8TzNOynblotX3Heqp7pmI71ckkDyPIcUZSdYjsjxcybyc2mJCFm4lHxcoeUC8PWiKPN9AvW9q5zCV78XVn6f5CJlDR20nm2ZeoAN+/c5RrKaiIIkVW5Oc3L2tH/nogi7CdfIUhOPUz7n9XsXOnIGxUfU1yJminMBDpxqjj2S4+iRcSEFKl+pEjKx9OQFByiaakKj/jH049TZdzyLwJDs9E+d+3k9ebY43OphYJbRYj+laAVhkl5XGS2e769uELYPmNyNcKmAO8vJWTmoRrpZyktLatgbWCV31FsyRMTR82g4c9/7IlaRwJwaCY+dyKTmx4K0jTjbLb/VHDFlSKVMFvRKQejpjIgv2TuuFstiE1RH37IQdV7xcFMtI+zjX3+c4FFtxZsFv+mJNxkhgkrGsEiNS+xJxbqDXN640FB1Ws6R+Cy8N3VcVI5HohU2oirDoLp+E9pDFKDWrUPaJ5hGHcpjxdmt2Lcyw6ma1V7YAlTiyhznrXK/smNNKJQduec4jj59wuOtC84jhpv32c8+MeSzoOX3iOOl+Jp98pUFEn3RzzpeSHZ9iFf8Rg4KIfsiF8Kqb7eF88YQ5wL0YSEN2d+sOrpvy6jI8Hjhd3esz+lolcNvTEM51J+zYjX5jUz7JXEX6m9+1jCKt+XcdorWShcU6RqmLwOCJs32B76QMKoGJ/1SwqmF30q8dQvHk7FHBziqwy9pIHRtcLxbQAD1XBKRhl4prz47Kcp4H8TLaF4mIpXRBHG2an026ZCR4hGUUHrB9wnoh1A2dMIniDZzzXm5l+sMaU//+afvPHkkHaLwpegxa7xQ/9Evm3vMnzG/hbUl4+qHjt24r08Wv2R4m4cqIyfYxybPXQ0wzZ6oOSFYwUda2Css9xVlaFBlDLKxGHfSvJ901Kd3CxU41WsVGCjQbzeXU3KrIJ3iipV/Asp5UR1P07XBkW2BhwbrlES9nVSrUVdQjCEcwQvaV1Qp5zc7zcdwTXEnVcwNDb6VPGh1e0FnlJAS9ZS8sGZOjOkQElQKmwKQbpZh4Egr/M8FYeMClJgkDTwe9h8PJFusk+oRpMppL4sfrKeVsNRZJKGyfOq7XREt1EbaXr55QNHrVoyeUQVvoWVMXz3YA6h0Po60Yo4D8cpR9JcLrq7lMgMUNVEZEIAkpifLU7KfTdrrv1jjusos7259tvVXrg1tbkECztCZTrvas9gS1PlqMFN6viadidi8I7VOl2gPgjdxzjZizQlj6nWz3KZaloapXFdL2PTvEurq+jbAZJYxROwAnaUs6LqyEXYQlTb4iP+To4jrVfowStGu6x7MSVs3a6xRKQ9HIp6V3SiIPIq4rDjvb4frXUHtSQcNmsLw+2SAkkUxCcM/n6PAtrzpDMUnVHceIe4u3t0UNxX4sYeeT69y5HNiDbtOj3DASaJJMiGyak/3JjyOwICkEmARML5h/SKnjOy+z7/mT51igaliMfGOYudoQHuCOj8ThOp7SL+U0uCPtxJglo77I36g7gJJ0HgJ+W5ar876Pvb5UZ1djUC6nCo20eYfH+Q8IvITNSicCtuwvPFNX/YnJ0bbi/6ve7aoMaAF3ECVLC9ThOAnucuWe8m9tlJZL2bKLqOTXdSwU70KDHTD3O/1e0k683G4tY6tKQGtLAdNAdh1Pd7ixgkigNJXnhNf7CztR5EweJ6gJGyTSAzf7PIb9MlryWoqRVu1+LuTdgozVYYwc6uwZ3FH47ipLu6g3j+qPNvtgOMGk87uKgTR6ZkwolD/OkwCuKY2NOwgDW1GN1WlsktPrb41EodUDgDaMIh78HSKnun02xUrUkhUiBqlw8taDISGzIO+qJJSZXDzkON5GHjpudljWe2GgMqaQiqypNSpOY3SF+3HEKcAdw6oIgxasMVVZZ76vC2aHwEh1kSiJ0pDXFlHpbzxixLi3PoIYyZGp2C8bBR4SQ7bFW1a1xOGXGhkhA2JASoPSKcIYI+OA1LOezzb1i0TYYt6lC2+Fwg8Zz50AhZGdZEdcplTqxdO/1OtfY3URaoOh61LChNi0dXU1fx9nmg0MZs1XA06SO6ohc7nvgI+jWptIxQASfRxVf/3+tX5zwBjHkq0uA9FvQZNCYNpJe7JFILCfW/j9W5YRgvM1nEeMk+V51x2ati1sF9JcNvXe/WXu3mclaYK3xqzmqro9E98L1LUXdNfFLw51V/E1a58UGJ18Oty5S/e9fhwpJtZFE1YSC/afToiOrJdhSs4WZtGEN0i8JK8dmQN2+JrXj8m2GOsQi93h5FGIp6tGJqhFu2rb1FzzFtN+zGRtZkuv0qjHQEIs9mL9U+3Wy2rFP40HQuH1BX2tHjEMVmHBrWO9rbQaiXbueSclUgTwc89mercLvm4UsVOVZyOnA+2Ax6enRJYz1+8NT3KUppsaDLm2o8h9bUmHcxX55+sIlj3MqrGJ9SdxALDvtyBP63WcG4k1lTHoOr8osv5BXHHeM4AKnG7FprHBZn0GGHJF6t14l6pv2T8MmZyF91PHy2WEDAZyam4ABthluctjQCiX6rLpd8FMEBADx8GDe98ladLyVvk8ty6fNRh3egziCiYz4ESf7QoaiOvvNxzPfxr/rCRrCDtzDHpNzBE2KAQWZRXS7piWgXYfaaMvtSHpZm014zu0Kv5cLa5Snf/K1O1gKhh5URxvOgRnQR45YzUJNwoJzrLXHAnq0CPAsLy7fAr0LRuUqKyxI/+jG5P5yZh1nFjQEzGvZ6mIZp0eJtIqJVUavuJ6Kcw41gr74aQmiA0Kw/ciC1NlV1hoMpMe022VIoylCQiNkli1MEPJbcQ67bPN0WY6aV4EUBxL5nkqveJysPHCqUzlWDaEMRgbZSuFakBHkoUa8a8oz8igneC+UsVpZ/JhCgd7IoyAd2baaQtl03SnbQUmHtwUWHr7kOD8w9yl9SXxvh4YX0//CAdJ8Vz07UJ0ZMTqZjRho1ffIuw0W6k+ClRz+beWGqgbfMioq51exY1UMh4jiDy8w2tKfabqWcv7NkfMz5kt2RpBxQezaFR6X6aDshWac2nkbOLKQSbFGyYZfedTTBg+G0fmEjyrJrXJpYgR5bBZsOmYQHfOnSx04ufexo+tixqGOHqKPkb8PwMaaWTUMsO0gsLTLZUWRSiGOHiGOKCjpxkg2Kk6TxUO2VNOMcN2nEZyQUVrHl7gpFMXjW6OgnTF0qImVYsgwftHWUDpGWdQcKql8eYAdTkWP/KL7lsm33lM2cdUyUNt1v5UWEqUWKjQ/Qrj+mofg81czyzJvlYbxxO/aDirhiQClyp2rhsBObBmVuD8JBcBtK1l/CsvWXMHDVFIdCVFyhjHzbO57q4Cek4SJrneqO9uxhOql0NWhMOM606LHogzCh/JjO7x40RJm5WQZ9zlAgFsuxJAa4wDQzlMBThcEppjuiH6VC37cs37x4ME9Ulg/n+JYBR+Cz9tcaIUYeIBMlSy+iLrMJkk1mx37FqtfqHwu6NOZyQuXZ702eGM/NMKZ8Pu4zuIJGNNTr1D7rCJJDQNHtVN6SJVbl/3Vwz1OHWpZC76WdPiYyO+nT2tKkHxS9BW0WPpPsvBrZ8yvNKxUhTq92AxBjJbCrOwAZ0c3oSU9yNY30ZikT8axDqaQ6Si7oOpLgXj8VbqMY1LGFoHB7fCAbvUiaNCTKSvtVEjWbBGBzT1tT5tNStdYw7X0po8KIDMFEjtm4OBQPSxvBk62EWDgGrv6SSkADSWWI16TQs7ukFHqMIm1p9Dj1OxU94QWbdZjbtSCpSy3pbbZLQrWqOKVDuqNcKT9M314xKnnmeOl0uOXljOn0qnlR3LBjGxlrM19m+nrXBtHFjIsWgKuzx/a0nlwtV9TOGgBBFGskBpWSL+Nl2WG2K4pDm75nlo5Ill1HLZx03YoLIbm40eBERAWFaFktOaPjjo3yynuSlwYxi2qNWNem7AOFJQ1E8g9awXNfHK2Q4ybr+IMa4bo6eDKc47pc1DfyZNYotozXe6ck2d6bYnJUNJjVSRj49XP7I+8ZKwg7wTy1YaYxFwSNTvMvMTq5cokRRb78t2e/YBcDgmLOaeyie4DwKWMSzYuglHUjk+GxmqktQBScgmzmiQJ6gj7yjvkBvWOoXE096vvbzO3g4yNzyiGoHfaHvSChWtjkB2Q86PWYhtmWB3LOLCkOWFFZ4oazyPWqjY4Hjbx5gvpSp/oWPXTvPOVHVsoFskpsFfWVVX7LSItXyESC/UM6NoSub4VRZ8w44H6NgzYC23UHmUFZmM8blEGwVbOrnjg6qCqRngy3ph8afO0E9Hv8uAQ7kqdyyjhr10sq16/JGdAT3iH79yI2CKvHSZs48IvYvFQwTPot2y1KB37ZqXdL4km1/xfNKOGpiUFTZVZROVox1nias02LZ2z21sET9GK9C4fp9qVVhXejC1fQC6pRkVLKGSdbymoSz1sc9IJ2kuPLxqtUPx5z8qv22sd/zqKRMN8DxIOEQ8lBdsssVe0QyB8VFkTX7nj2KZaED3ChgHQuHIYxRpW41+CQE3XQRgU1kWckQoeQywsJV1yDFUQB3IfKRs8D7Ijrba3bMjxqXv/abtcyk0MNa6d71067w6Q5A2aXEVPOFnpLrCAY+05EIi1JqCCUikBKNyu0wm2h88sH3vXLJ+dm4J8jarlnntYuX/1uqVoMNgS8yXBLGNHhVpWox8qkfv1GnXWk67WWcLIt5tBOvbcp04p6cNmdeKr/ErkAcbFjoagp0Wuo86Bwl3sgOT4WPi/NGjj6PZfte0Dyl+UzSUyLpNXeL79fLLdgRwj4L61dnODaHAdrwgzCFUEviPXGWblDx6Vtk8wfYgwakmwhAaQcRaJjUyf6tsE3yfdCBCM1O1hnrrsBeSLAl5a05NTpxsYVIQp7qfMk8VtECfEuIbGRt4LliyC1KX8Fkl5EO5p/6pA/AryE4N5Og7VaUN2nu4uyhGBsckQcHD6WOPXelewQvGSXxm6RZBut6DRnXB4tX2fLyysZ5BWULlJGn1PJwDFYyhZRc2ew+hVltuIz5f2MIrSDClLvhK2S1aYSKF9X4+6d8FLqVXrTKeuexlbxpTxdknbW/oPL1cKGYy2Trhv7maqcm73EiXJ1BJfNIGMgGAcpZRRHor5RWWMctlrHY7xntCsK/tHw0qzM0W4ndlo6RrXCtBWzjVQuNOrtH/dfr5XhJretk75bEFvDi3qiXVAsTXkOgvgW4fe4JkEg/oPTNE1RPMGkHKJariK6UfTM3QymfhNPt23iAZw6tlpGl7BVRy8nWDIVuE1MkUrUblIQUFvlOTsmisG/lOdQWEq9rs0uUv9YWD/LD3Fa6D72ddwThz+zcdLd0CMHpC3bI86tZZeZpc3DubnvCGeBdq6UOEtrVisx087qnKrQNGTKMdAuL9MMgGr0EiWtcmVt0pbLcye+lddf0yvLQlQd1v3Mld3dzmaKUI+1E5DeF2OcY1mTjP4kLVfHpdclG6o68se1wChT3v69gH5nUl0+zgt4gKETJbfkd5JsWCm18n28e1chlbHuyz2HUrp1pAcbA3RUP2EAtVPhB21rF7cR0Qwnx1jRHAm0HX9NgoxlpZtSkilzP5aAnMGqKJRrTMWuAFCimbA+m7YUckJKS43FVPwhB3LfTSP93qeFpwQVM7YvJqzAsLvNzZmIjKyC8JSHVTA6vUBSVFqEKVqxucxkFG5NIgSs+hZlrsarQyYZl8fKhK/u05lbaY1/z4nwjGKSZori5zAAWDR5FET9gc1oaN2dpMh7DFvvpyqZ6POfAdvxe6G4kqYXqY1HPuB3yKPhASFifiiaO0qYC0WEdymwSSFdkvR4VJ2iYE4o0VZWQeyaudXtyn5pTtqP0Zkm1GGOwQ3/8pFyZ+d8bnsprSTFojuk7D6h2j8WQubkL6a8cw5dI7lKcqSxxEdDxwnqrLmqe+RuPIXqOF9j7Iyz4ge+6ih+YkyKfO5ro6I2UL6I9wxwDx4yzWqArPOQxiaTUlOSr1GeAyvhWtV1wXlBo6UeO4uhUr5ItED1L9sLyXMQkmaPEr4QOSJ99VHPZJnLSg+e48Nk2DNedTqhcGpwbQPwHTEA7+3Djylv9Pbl2lRNr+XJjk56evZF1ZWVM1aHYK4jTNXrWqyAttJu2f4lHdJIVxyRNKuT3kcMt9IPKMu3MhLmS6AVRwQdx9tOMENa+mK/nRDiqeakjBet7RZFLl1agq7Qa7nAp/tRv4/xkdjVB5+t+lLTb76uBuMFlgXDJseiBcIqOWQYLuQzhhETiTXlO5f2OyAXc/FZ0R6Rtos5T6PzMBu8Z8XqN8W/qOqdu7y5UPVevzy4nOtnHiVTe5mPKO85lQSmP4fBCddUQRf0cD2ME+p8no5H4DrCEUEaGyE+SliKj+iJ8vLcXECROql3h3Al90ZDvjcaDoaWvM89y5P25UmRvOOAHthHotUP5aNtdw2agD8Hft+OeiGwxO7ga7NCLhwZY1ArME4qftm01pJN1ltfkRRZGk17hNCSlB4RdjrbRwiWUvnCCLKQI06EljfWzJvLJ2s/8Gs3G7WXV8rmurZyq1FdmN21nlaWlEfbZiXlmcWGCeLhHnEUvII/hdMGk/j8iJm4PU6O/CM8HuHc+5QduvQt4htUPuY7nMt5j24xRPxPOLqz0MWPvdfUoEHRzXz3NeU96KTcLXZn035rro+1NT0Yr6V+LLrL2tw3dUlo1M3+1plgs9sOKl76jn6rbCqopAG3tEHI6UdTDFzqtZQ/2AGXZCixbVFDUuecg/IuLqMpjcv2EOjVt0i7xdYlpxfmuIV/6BAufa0YyG/MRrDTQQNRNS3647CDxE8mbxRxzlL4JCF0b6IWBqs5w5nBdMJSp7UVbjztNeXmZOxUF3kVFFpLtgUBQAPQjCnpOoXlMxpUYSI15q+DkoOOM15T9M+kb3D9VRAm4J5S/li4RPdzlOKyTc+PTp8DZvR/TksC6qXJ8D3amgjNrTK5VWglFsfk7h6Cx3cjJrBSXCYmdgLq36rhQzT+GnrZ6ZPRIrUdMZpWbRaa7Gk54Ljb+f/au7betq7s7FfrVxwHKERBNGXJjjIjQzUSjyeZtpZd2zMparvGoQ5jcUTxsCQl2TMQ0CRwk4GLNJMWGKBokM7MQx+CAnZqj2XZpgH/AusvzC/pXrd9PySPzMw8lOdBInlu+7L22uv6rYaHOzREdGTkJuCMZMjX4AwafcpGqSnyzPGIXYdqexlGDFK1NQa3lgJHsMhmC8kHShy5svodk+FRyju4hUvuDtiKCjKRx3D/DYHHoKAK8xYfE+N4MJ29Rr9yR8raukz1jtjAaHgoCXnYhNC2F91RKC959M3Pzdz4j/C5d5x/M+u+I9V4yRLH0D4CsSHMamcZXMeryVACmqfyLTJhMKHwXby5Ql80WSb3GqxgQl4sPvml3oYRls7Pt6ZBvYL2hRMndpZrXLelFAEWZ8C/Ed0ZVJZ6CMTi5rmDwD1bReKkvyOz3EHx8MwHgdUP0YbY5sfGxBjkl3gA42ny38eLhokaZVLp9Z1BMj1SAoSOYR5hJEEe0gdwaAuTBhJIGiTSwDEwNkQi4hX9u0e/wZKMdtPJUDcLc8+KbtlZRuPTaoK90dG4Ba5hGOtPtYHTRu/EOVT77n+zYehfXFBKKxIUcUUkD4GmXiOM/D2W34UN+meX1wRPFqyxj8hEfd8Nka7h0lLv3U3by2inUJ+VMgkrTRstNfYlvcsJwzKo6xIJy+tSB95GB2LfFVN8zxw1WqhSunnGZFQ8xWx4Bno9vAecF235MFBgPcNfvMHQo1Wz0oGXa51OJ1eyO0/j/Cr0/LcBmsvj5PLly/kFsePr1WXHEu/bJ1zvPy+8mtGH+z9b/vOJmjAKwDrJocwsuWrH+ePqibrMx5VHaUBHhT/dOflRs9UimwluaSIUyjhtdy4Ri9juSFA+fFSyX18x5UZWTQBmBqxw6lf6iHELZ80D/rqZ9aTAzmTHEUxKWpSjwYT2gj2m1t1utyVeJmRK7k9VY7NHXv0rZlF2RxkS29uFVziIvgA51m0HVR3kooNoJy+hXcTWMTsK9gkcFsNsEYUZedsLAmclZ9pLrIKqFu0KLyGNUoGujKRyuZXehbpgWIzt7+q5kiZCcCQ2jmP3noOPZO3da7jm9wk/6vBeldAu/4lwKA4/OQnDBesXvuCb8KkPdQFhJ5L/CzXy+4f3Rmo0NtmOulBJK1ZyUMS8hBR+rsjK1G1s5SzslDJDlQL5wYihFHcxaQ1KNSsouPFeSEIQWBjBCKuurvI9I4QgXCTJSkjMXxVc6ELcodkWGT96DmmRPFWCOvqkHsEv2o91eH+I/SduAJJERUh1a2SWOiJ18rDDWm5HA7CliKZZVsGJ3sh3Zx1FhOQJdXUF71Hjv7r6l0nQtZE6ATyrk7daf5XXK7NQPW+WzdCWdSTftBrulx90ZKp8E4YexzTGMsgEEHArvD7GZ/bZXSmQ5CjOMCQySZy8JR8YQeE73BmxLtSmg/HtZeFrAAR7XMzZPXvg7Am1oJrIcE5WcbDiiXl8uxMImyEpU6djHJfP+HtlWXlSlpqzZvYlT2HIctk3uQy/d6eDRP99LxUObH9ib9GiD7xdqIb2yFqvgyCkS1UAIilbk6/VbG8WOqu0O+QEfTob6AY6WOc4buKSYX0OGxqFxtVbDqx7Z49h3ODC82Rctd8zF95xeE/fgQJ4IPZCAJllhOdmKgHFfbA7tqdlbAstZXAzbhj0mII48EBz9tNPlTDUzfu5rgNDwhGoy8kf//kr/qkJsfUVpcvlmMRC1+jyU/i7jvvu1LJGb10QQek8/kJXRNFASdL9aWdMSZeGam6Ig6roEYIMqwYQPp7mHReNfFWQtavYDB2WHT4cWaqHf2UvXnRPEj8BYIh+iIBle8ysK0If5TdSoQ+LxbGAZGuCMSdl1tgZ20uprr2QNfsIb1VNwALPX0kQgB/ErO+hkMKp8w21z9vJ1f202cLsjbytFjlFxUOQ+8rQ6PitbQhHQ9kRIWSJ/5u8F2P41Q0EGswUxa97uBpDlgu6iIoR4UdyLbgfYOU5A6LNBgc7Obyd40vmHEz4b1jNk2gRXX1EJzlQrNvQa4kPyWsxowE6/waC3HFrsvFhZ53ZNm+iuldA5GRM7VWKcYKtu4whhgMLZudGpBE12npENppZpr6uSLoHonr/5xeWEnI846R5MP3XcgA80J8M5vT1G71bJ28i8DSIew4oJJEQtHe868+NQcPOxP8HOVnCjIIBYbc+IRWIkXjUID2kZC/QkwZmOVByE/RLJ43wEMBqY5uvy0eb7c5RPeiJReyRBFbK6i3nT8ex3chbioIIgQAmC0nka65piTSCSLW/48JI36EBb4D8UTvkNX2GC4c9GrHsDRo/ReDiwNMsLMvbCCTk872Q3skOaTJtLAQi7XRXY8i+TU1ON3rzAnoeeOIpAasiZHxO1s6K+D8BEkGTuL5aD56SKDBXE/sQd4x3mkSreQeSjMlDrsZhhYaDuPuKevQek3sZb7gSmTMaHhSX5TNhnPI333+9g5KZTmr0QFiIxe0kK/Y1D9H497lgmM7rITgnNbA+FjbJKAJ8HrEBjOHfEbh5zBxPOO4wagbH9HfbrFJPvPZVxx9U5KvWJFHCX00UKNOtoyidJ/TWU7XkCx8hlLNnMFuOFwDTJYTwCt36KF/fxhUBXyiUvBLguAJFnXLS2oY6fG2e01DL0Nql1Vu02eTNA26GbJC94qhAy8RTIgIPhtcPrnswa3myndQstWKAUOyQLhCkEBLDWlsIrgW1IDjb3C4F0ar1lEhu5i2tAnqloa601oHorgw3vjp/0fiT+qyUBXXcbs3O2vYWPeFWE/XiVGkEEIVLZ+rWmTqcsYCA5Bkhyqe6B+NBRVeR9JCQedEXm3c11c/NjvCwisUq7QinRO3m8xLFRAx2zma1sq8iQ6XZ+g1V7EK7vFSuMSJ3MZuMccnxmWTWgE1TxPHr2ElSwA37DKQ/LB5qNY4gsDkJ+onTDzTPIPdU51FQUv+BEJodw0qjkopxREHpIsqJtlMTC9wYHDMd58AxcbKwFpi+zKoR26NoR2dlVKVKil5L1YRpepVqf/iZhZkViJwx/Vs5hdgsVqZigZFyaliZhFCBe+rW4oM0Mb3y7Ky9WXcG7T2Srq9ykWc3jbigUUevbvDrw/u6ztm/RpILmBbsPh7e8+oNoldSyq6pB3wOpvMIvdWScPkponMHjOCDIrRqUiUon99kt0kW5TM/r3Y48ToZHlRTx6TolRxonWagaxyC1B+OgIU0ZWXXQTUEoeI4riTmzW13UXPT9FRx+Yla8JTXdc5jNMgJiYPP4ecmWz3xqQ3YKNP1vpFdM717WF6BN1c6mh1b2le9QbahLsLaBlBkorHe3EpbEcX5SyGPAkVZVxEioCPY7CcUxIuDvrqqB7BszG5MgbB1BRpx2mZ3GBLGicXVXScm/hlVIsGkT2TaHxPWxGcS5CFF3g4OP62SImqpYDx6PbWdSmdmF3+4VFtc/kFtsbZo13O6UbuRqb1V9a22uITFxosDdY8f571+x7EdFIeelhLGPWJ2JHKYajsC1R/kYO68sNOywvyRAk+dRs5Rm8PAU6XWqaU4HLxQR0+C4Ex0riPE1BIei+jfxD0Y0zy32774ZuTio0hahf65MkrpUJGrnNTluIiNd94Vvori+nybmnFW7YWj5KwQtwaxIQ0LagalPFjCUOy+LBmMq08hKEiN5MgRNCISf4YqgiQf2Vu+20PPstvvimSlLbj9rNDWe7IvIRq2qfqmFU5LN1M9Uhi+8Fxo5kvX8aFsfh11uWoxNcHalIcIeUIpRq7DjZcdctrMN1TSK+IMfcAC1QbbPkxh/Do840QT9THcxfIcmYnAbxs6FSiM/Biw2de66EuzxL1TF9897/xWNJ6elmYK+hCqqFbX+xjuzSCrSoRi7fuowrJGWbCKRFJ8JGeP2dLnyyJTflR2hZROdpgPDNy1m1QLgTD3GLtjgAD3ZCbzUnAeKxWjgmmhB+CStqPxq1Ys/pwX/o8BRerE5xw4qDNznNTT5EcfnOcYi08jbI7zuQcFODoDAtDEEaIys1yHEIIKSNgnCX1fsBAwn3WfyqZJQsID8beyDK9V0nFE+SNNOVul1cBRmr5i+q++hddTgKYaGiyLkyj6ddWe54DgSYoPZ7M/tbChX5ia1H6Q4L5kEMf0K/UQ9aboBMHYMNj/J3ajBWjCVCeNqJf7sn+59UmhuWHFH2fjQpcnb7CzVdGNXKfnl5bbMiQP566YIzRWFPtBcVHsePpmfUzHqJtzia7cNSq3KPaCdr77N7kSdio+7nRb6TNY17RbtywWENBgPcdolRhP3uytpWuVNtTApQqWaJHq1mumNiLhTrtFdjAfEdJXGHdQ3YAldWHHP3Vm5bQSyjGYQM3NCvBVwIec39jCoPQt/rxowh/R/SFFejHV/qfXzlOr1AdTnLeayG8X83Z/w/4Bb4U3qRfYBW2h1k17zn1D33RXiVQ/WD7TeNvc4fR9t9HYbN1FGVoAq+bVBUr+Tv4ieaeabFJBg90NqIZHz8W23GUv3y5YvDbn55Xy9M44jTB6d5beBVESq/eo6WtnFTMw/cjA9P2B6TsDAwbTNxlY9YAFe6RwNDYwWoZaqjp7SgCPEAgAkQdAKtPnCQHqCVUxlqyVH1368NbVDy5duXbdGT3EeqmiTuh2RMeKXLy0duv9C2vXvY7fdCoZKS0PkRXUqoewyQdkg4kvaOBS8GDsFhoyv6P8RqZthKLBVS81w4l1eXk0czH4s/rVRr/S7tbVtKgFaq1Ok7jRbdTzHBRMvEwS+DnGA8/x4u2MsgPrnAa5y1OJIeYMT6Gqwh/VylUv9uy+0NioAdVpUKH9VK6yksXrnCyuX/pLLIupXbYw0ivCQxRjznfVt8VZLiRCXDSaKl4fwyAan3d3+oDqSE4WRmAVjHV4Q5Y2FWtAmj5AwewR7o+UycihbxS2y/ulVI7/Ilo39kFh3dh4345uV/0tgwlpRI7CraxmgFs0Ko6mfpSWVKdRQuRwSl1xlnFMEO/jE6wICyUqHLHvEeaK4P0kerE0NeAU7M+kcrmLFD65hDJOGvvaxzki4vgDh8pwihnNdpWDK8LJpqt4vyBsgtjMD8lIK5NnZhPi95bt6O+G+KJ4DhoxOFnLlHxGSzmUDHhV8zaKZr5ZylwKktXKy16xeg8r1qOtRftfNjGC0vKI9I9CUiAqja112SpichBGFRztXQXcY3S6VxeLv14/EpR6GNfPNvJuvY2lNSMBZh7Sv5db6kSlRknOBCNI3afGDsBmq22kfw2R86jLddueaqrDYCA7bCgSC+ntkBh5TvZO+Og8hWoGYTlU21wUvcaBLijs+6hos2691+gUx5upu4HH3QwE0hNGGDf7fVxaVfOvoXuKK7k02y02y8wC/VZLAR+OMNPGYRFjzMLwTIdhMJfwoBOl5iyvurgo50KmoWXLXjJK4rwaurKS4QiGWYBgaDQf1VA25jMntlEMM1yggCml93NSeYZBzTQxYEpNXfs2fO9uj/ZgyT3S4BjfHTZp2tTfj6Jd8IRWC7aJEwv/cCO7ka3AHwl66AviBqqU+huOFLdu6C7CpC10oR9QtH9AioIWTAoog3x0pmVOJNbxIy4bmMqbdkB5XGArRC6rCyil+m8x8Tapi0anN7HISoMoJxTC09Vdfui4JcVT6LjoIPR014pSsBnbV0fMJ7/Buw4QY2cgyK6oRz3mMsyPcXtAWxSg6b76FlDq0TQDc3n/1bO5qEVlqwmZOO93m8OsKlbIPV3fExuLecR52mcuhE4MOq/0zlQ2I+/W9yiJieGz6LcP8t0LrqsMWDqdu6z2vff6bcfGo++SFWU9JqbpAAFYDaOPtzZgx9elKObstpQzOLrzRVUM2Es6SEh1x4o/aPdF1+7HtLDQKkoqwAuyNopJlKr/DNDV+1STAFr4wMqM+EuIJQnhlvtKkWDgSADJFHhCqywCKuqvvs3Ik5ksyBNfPQuxHYcMVAdkkMkNFNl+B/ZgHeBAvER15inQ9Tf2NdSjJ/ZToKSURGGDUvJQB8AMODUI/oAh9X/Bg2451rHoFY0xXmrUMYMQKWCtsWnZt62sHmle2W5XoFgoZh9eQ4tAvnnNmDHMOL+HioETIvDvpOSRy4KaEeh3CY4Sat/gMMD92xuZ18+HoXE5i1GLhaZdvOygac4PgTTpnXYrAHAxciIcVk9gPh8CsCxlh+oKA6NmepZbrkfKGlyrm6ZzIxM6nWROfU81bDUmeAYt99sHvaArfVDYJIYsgM+wMCcxBHXVFalDlnk2KTdHfNOwSRpv6NmcpMaMngViRzML3P6NniNqN3o1zP60g98NDoictSo1h3VAdY4sc6NeA3Zba7pi2bJ20LjV5n7ah3josNFLJlzB8D+w9alTIC+ZH886l+mN0BvTcBuU+97tdtO7lMMHsmvto7x7IV3fqKFF02zQtXVgqepGO2SlRXCsEpPQaFn03c9v3241KrPGolFNLv7kypVLV65eb97kgFsg64Id2k29tXbYIKMWs3uJnVUiDwNE/4J1rwE9fkW1Bp+4+4HGtv8cvmuIXnaoPdCGsoENuqseNKux2tFK8EDfXeSoc4l7bkTCMtQ2hHB5N8jey7x+/W+0m6ATvaA9xZnRWpMQfTn6ymABeUYSHD8REcDF/MyugZ4YmzPThdCeecuWI08hHcYl8hku5GO2eUr2nE8iJEFkp1NnIla3mcK6QEZf+vPul4EQGemb167/EVgDm8jRXPXYExLtEsneW408sYXlx41O4WIshGtJUmxk4CnHxrPZaKdPIJqFMDhDnmoR8AwVmpchIZrDvx5Pcbak0jFOhFM8zBhrRo7YUDUmffjjNhyPwgfWglAHA1Jhj62iDmd4v3J1AvelNKJc8s4azT0Thjx0d/Y0rLGQjD19bixHOwcZ+U6iuLo6rAzdkQvt+NqnCSCydJKqy8GqM0NwXBjumhvgkiQ/eaRWQzF/yOkDG+4Bxm/s68xRRBc8oKBfXbNlPD0nqF+uK1OgkjPQqo3ihFWB6aUIEiw7oLUk9BjZehIX+7Xr71mWdojVfzxhzSlxFsQLesx3YCCBQCPwPBNS2B8MOJAWp+06Xi+IpWPsy2ckUzAciaBnPMYiCAP7O6cV2BKEAAPpBTQj8Xto46GftdQZ2nmiS8C/Xt/QCzfeFLjFz7e3Os5+m+pdmxnJbjeFWP+9Gfj12GSO7V53obeRdhsLre315sJWo71dy/DzSdWWk79ArLWTW2k7vd3o1n7ey9vl3wF1H5bPnMH/6vD/v720fFo+0++L75w+fepYcurYn+DYBkVSvf7Y/8/jlzNJ8laabTXbC71GF4PCFtxJf2slgYvUZejGUl/fYgS+i3xBlU7n3QyvXj7FPxB71ffDE5TOAw9IW820x/epnztpfwN/HtaOhSztbdRztZrewvv21N+96sjmW7eFHVHSI+gbD5E1PfI7sji6IzvNxm7Yj8k0HDBue5FGf4C/e209M6G20ktLtTPN6q18fTM2vL9G0foAJa4BocIlIlnCfnR4P+jH25PphzSqXE92b0d68e5Wu/GLZvrh+35b316aUFvVa0u1E8AkeuspNi8Y89+T0qlrXqHTnapbffr6ZdCHM5Ppg2lSuZ40uup02op15He4rT4nKeb1s6DlpyfUcmlCuYbf7nTzO3cj7b72fvLh1eQynvWbPCHilpeXanHvbq/f2IoNtOU9ev3gCNx8rDbz60s1OVfC0G63H2vz10FuK8tdQfsnRCbSllId2MrbzX4e20IR8/2FiMUJRVtDoSdKwQ16MSFWIw0qR+sbaXuzF6eclxhSBD6oAdu5QZNBXGElXh+E9PTDCdETN6pUR5TgvZl3Ih35MZ34nvZ/fi01lR+ZNUDQ79nPTNeBDV7nr+oHvv8k4PSkTHlJcrNUl9sf/eNubynS5bUf/+2HV5f8Li9NiEPxayff5Zm9mWPTY3pMj+kxPabH9Jge02N6TI/pMT2mx/SYHtNjekyP6TE9psf0mB7TY3pMj+kxPabH9Jge08Mc/wdMOkKTAEAGAA==
+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
 ZM_INSTALLER_EOF
 chmod 0644 /opt/zapret-manager-luci/pages.b64
 
@@ -21744,6 +23204,8 @@ for dir in $(sed -n 's/^conf-dir=\([^,]*\).*/\1/p' /var/etc/dnsmasq.conf.* 2>/de
  done
 done
 nft delete table inet zm_adblock_free >/dev/null 2>&1 || true
+nft delete table inet zm_adblock_ip >/dev/null 2>&1 || true
+nft delete table inet zm_parental >/dev/null 2>&1 || true
 stop_owned() {
  local pid
  pid="$(cat "$1" 2>/dev/null)"
@@ -22072,6 +23534,7 @@ list_methods() {
 	json_add_object "zm_cleanup";                  json_close_object
 	json_add_object "zm_autoclean";                json_add_string "mode" "string"; json_close_object
 	json_add_object "gh_proxy";                    json_add_string "action" "string"; json_add_string "value" "string"; json_close_object
+	json_add_object "webui";                       json_add_string "action" "string"; json_add_string "value" "string"; json_close_object
 	json_add_object "sysinfo_run";                 json_close_object
 	json_add_object "sysinfo_get";                 json_close_object
 	json_add_object "mirror_status";               json_close_object
@@ -22261,6 +23724,7 @@ call_method() {
 		zm_cleanup)                    "$BACKEND" zm_cleanup ;;
 		zm_autoclean)                  json_get_var mode mode; "$BACKEND" zm_autoclean "$mode" ;;
 		gh_proxy)                      json_get_var action action; json_get_var value value; "$BACKEND" gh_proxy "$action" "$value" ;;
+		webui)                         json_get_var action action; json_get_var value value; "$BACKEND" webui "$action" "$value" ;;
 		sysinfo_run)                   "$BACKEND" sysinfo_run ;;
 		sysinfo_get)                   "$BACKEND" sysinfo_get ;;
 		mirror_status)                 "$BACKEND" mirror_status ;;
@@ -22382,7 +23846,7 @@ case "$1" in
 	call)
 		t="/tmp/zm-rpc.$$"
 		call_method "$2" > "$t"
-		sz="$(wc -c < "$t" 2>/dev/null | tr -d ' ')"
+		sz="$(wc -c 2>/dev/null < "$t" | tr -d ' ')"
 		if [ "${sz:-0}" -gt 400000 ]; then
 			echo '{"error":"ответ роутера слишком большой — отменено, чтобы не перегрузить службу входа (rpcd)"}'
 		else
@@ -22735,7 +24199,7 @@ chmod 0644 /www/luci-static/resources/view/zapret-manager/nfqws2.js
 
 mkdir -p /www/luci-static/resources/zapret-manager
 cat > /www/luci-static/resources/zapret-manager/build.txt << 'ZM_INSTALLER_EOF'
-2831987345784290
+842146273571514
 view/zapret-manager/adblock.js
 view/zapret-manager/awg.js
 view/zapret-manager/dashboard.js
@@ -22858,6 +24322,7 @@ list_methods() {
 	json_add_object "zm_cleanup";                  json_close_object
 	json_add_object "zm_autoclean";                json_add_string "mode" "string"; json_close_object
 	json_add_object "gh_proxy";                    json_add_string "action" "string"; json_add_string "value" "string"; json_close_object
+	json_add_object "webui";                       json_add_string "action" "string"; json_add_string "value" "string"; json_close_object
 	json_add_object "sysinfo_run";                 json_close_object
 	json_add_object "sysinfo_get";                 json_close_object
 	json_add_object "mirror_status";               json_close_object
@@ -23047,6 +24512,7 @@ call_method() {
 		zm_cleanup)                    "$BACKEND" zm_cleanup ;;
 		zm_autoclean)                  json_get_var mode mode; "$BACKEND" zm_autoclean "$mode" ;;
 		gh_proxy)                      json_get_var action action; json_get_var value value; "$BACKEND" gh_proxy "$action" "$value" ;;
+		webui)                         json_get_var action action; json_get_var value value; "$BACKEND" webui "$action" "$value" ;;
 		sysinfo_run)                   "$BACKEND" sysinfo_run ;;
 		sysinfo_get)                   "$BACKEND" sysinfo_get ;;
 		mirror_status)                 "$BACKEND" mirror_status ;;
@@ -23168,7 +24634,7 @@ case "$1" in
 	call)
 		t="/tmp/zm-rpc.$$"
 		call_method "$2" > "$t"
-		sz="$(wc -c < "$t" 2>/dev/null | tr -d ' ')"
+		sz="$(wc -c 2>/dev/null < "$t" | tr -d ' ')"
 		if [ "${sz:-0}" -gt 400000 ]; then
 			echo '{"error":"ответ роутера слишком большой — отменено, чтобы не перегрузить службу входа (rpcd)"}'
 		else
@@ -23304,6 +24770,7 @@ cat > '/usr/share/rpcd/acl.d/luci-app-zapret-manager.json' << 'ZM_INSTALLER_EOF'
 					"zm_cleanup",
 					"zm_autoclean",
 					"gh_proxy",
+					"webui",
 					"purge_run",
 					"backup_action",
 					"backup_up",
@@ -23636,6 +25103,7 @@ var callSystemUninstallPanel = zmDeclare({ object: 'zapret-manager', method: 'sy
 var callZmCleanup = zmDeclare({ object: 'zapret-manager', method: 'zm_cleanup', expect: {} });
 var callZmAutoclean = zmDeclare({ object: 'zapret-manager', method: 'zm_autoclean', params: ['mode'], expect: {} });
 var callGhProxy = zmDeclare({ object: 'zapret-manager', method: 'gh_proxy', params: ['action', 'value'], expect: {} });
+var callWebui = zmDeclare({ object: 'zapret-manager', method: 'webui', params: ['action', 'value'], expect: {} });
 var callPurgeScan = zmDeclare({ object: 'zapret-manager', method: 'purge_scan', expect: {} });
 var callPurgeRun = zmDeclare({ object: 'zapret-manager', method: 'purge_run', params: ['value'], expect: {} });
 var callBackupList = zmDeclare({ object: 'zapret-manager', method: 'backup_list', expect: {} });
@@ -23834,7 +25302,7 @@ function detectMissingThemeVar() {
 	} catch (e) {  }
 }
 
-var ZM_BUILD = '2831987345784290';
+var ZM_BUILD = '842146273571514';
 
 function cssUrl(path) {
 	return L.resource(path) + (/^[0-9]{6,}$/.test(ZM_BUILD) ? '?v=' + ZM_BUILD : '');
@@ -25015,6 +26483,218 @@ function svcGrid(list) {
 	return E('div', { 'class': 'zm-svc-grid' }, list);
 }
 
+var tchPoll = null;
+function tachyonBlock(t, o) {
+	t = t || {};
+	var box = E('div', { 'class': 'zm-cat-src' });
+	function ago(sec) {
+		if (sec < 0) return '';
+		if (sec < 3600) return 'обновлён ' + Math.max(1, Math.round(sec / 60)) + ' мин назад';
+		if (sec < 86400) return 'обновлён ' + Math.round(sec / 3600) + ' ч назад';
+		return 'обновлён ' + Math.round(sec / 86400) + ' дн. назад';
+	}
+	var on = t.on !== false, have = (+t.lists || 0) > 0, busy = on && (!!t.busy || !!(tchPoll && tchPoll.user));
+	var state = !on ? 'выключен — его списков нет в «Дополнительных списках»'
+		: busy ? (have ? 'обновляется — Steer и Forkozz тем временем работают со списками, что уже есть' : 'скачиваем каталог — это может занять до пары минут')
+		: have ? [ 'списков: ' + ((+t.lists || 0) + (+t.direct || 0) + (+t.plus || 0) + (+t.block || 0)), ago(+t.age), t.error ? 'последнее обновление не удалось' : '' ].filter(Boolean).join(' · ')
+		: t.error ? 'не скачался — проверьте доступ к GitHub' : 'скачиваем каталог…';
+	var cls = !on ? 'zm-off' : busy ? 'zm-warn zm-busy' : t.error && !have ? 'zm-warn' : have ? 'zm-ok' : 'zm-off';
+	box.appendChild(E('div', { 'class': 'zm-cat-src-info' }, [
+		E('div', { 'class': 'zm-cat-src-title' }, [ 'Tachyon Lists ', E('span', { 'class': 'zm-badge ' + cls }, [ busy ? E('span', { 'class': 'zm-dot' }) : E([]), !on ? 'выключен' : busy ? 'обновляется' : have ? 'работает' : t.error ? 'ошибка' : 'скачивается' ]) ]),
+		E('div', { 'class': 'zm-cat-src-state', 'title': on && have && !busy ? (+t.lists || 0) + ' — отдельными сервисами в «Дополнительных списках», ' + (+t.plus || 0) + ' — добавлены к встроенным (YouTube, TikTok, Telegram и другим), ' + (+t.direct || 0) + ' — для «Мимо Steer»' + (+t.block ? ', ' + t.block + ' — в «Блокировке рекламы»' : '') + (+t.big ? '. Огромные (больше 100 тыс. записей) не используются: ' + t.big : '') : '' }, state),
+		E('div', { 'class': 'zm-cat-src-url' }, [ E('a', { 'href': t.url || 'https://github.com/Dushnilin/tachyon-lists', 'target': '_blank', 'rel': 'noopener' }, 'github.com/Dushnilin/tachyon-lists') ])
+	]));
+	function start(m) {
+		if (tchPoll) { toast('Каталог уже обновляется — дождитесь окончания', 'warning'); return; }
+		tchPoll = { user: true, mode: m, t0: Date.now(), o: o, box: box };
+		box.replaceWith(tachyonBlock(t, o));
+		callSteerAction('tachyon', m).then(function(res) {
+			if (!res || res.error) { tchPoll = null; toast((res && res.error) || 'Роутер не ответил', 'error'); o.reload(); return; }
+			toast(m === 'on' ? 'Включаем Tachyon Lists — скачиваем каталог' : 'Обновляем каталог Tachyon Lists — это может занять до пары минут', 'info');
+			tchTick();
+		}).catch(function() { tchPoll = null; toast('Роутер не ответил', 'error'); o.reload(); });
+	}
+	var b = [];
+	if (on) b.push(E('button', { 'class': 'cbi-button', 'disabled': busy ? '' : null, 'click': function() { start('refresh'); } }, busy ? 'Обновляется…' : 'Обновить каталог'));
+	b.push(E('button', { 'class': 'cbi-button', 'disabled': busy ? '' : null, 'click': function() {
+		if (!on) { start('on'); return; }
+		callSteerAction('tachyon', 'off').then(function(res) {
+			if (!res || res.error) { toast((res && res.error) || 'Роутер не ответил', 'error'); o.reload(); return; }
+			toast('Tachyon Lists выключен', 'info');
+			o.reload();
+		}).catch(function() { toast('Роутер не ответил', 'error'); });
+	} }, on ? 'Выключить каталог' : 'Включить каталог'));
+	box.appendChild(E('div', { 'class': 'zm-actions zm-cat-src-actions' }, b));
+	if (busy && !tchPoll) { tchPoll = { user: false, t0: Date.now(), o: o, box: box }; setTimeout(tchTick, 2500); }
+	else if (tchPoll) { tchPoll.box = box; tchPoll.o = o; }
+	return box;
+}
+
+function tchTick() {
+	var p = tchPoll;
+	if (!p) return;
+	if (!document.body.contains(p.box)) { tchPoll = null; return; }
+	callSteerAction('tachyon', 'state').then(function(st) {
+		if (tchPoll !== p) return;
+		if (st && !st.error && st.busy && Date.now() - p.t0 < 360000) {
+			var was = p.box;
+			if (document.body.contains(was)) was.replaceWith(tachyonBlock(st, p.o));
+			setTimeout(tchTick, 2500);
+			return;
+		}
+		tchPoll = null;
+		if (p.user) {
+			if (!st || typeof st.error === 'string' || st.busy) toast('Роутер не сообщил, чем закончилось обновление каталога — обновите страницу', 'warning');
+			else if (st.error) toast('Каталог Tachyon Lists не скачался — проверьте доступ к GitHub и попробуйте позже', 'error');
+			else toast(p.mode === 'on' ? 'Tachyon Lists включён' : 'Каталог Tachyon Lists обновлён', 'info');
+		}
+		p.o.reload();
+	}).catch(function() {
+		if (tchPoll !== p) return;
+		if (Date.now() - p.t0 < 360000) { setTimeout(tchTick, 4000); return; }
+		tchPoll = null; p.o.reload();
+	});
+}
+
+function catalogBlock(c, o) {
+	c = c || {};
+	var box = E('div', { 'class': 'zm-cat-src' }), busy = !c.off && !!c.busy;
+	var state = c.off ? 'выключен — показаны только встроенные сервисы'
+		: busy ? 'обновляется…'
+		: c.version ? 'версия ' + c.version + ' · пунктов: ' + c.services + (c.error ? ' · последнее обновление не удалось' : '')
+		: c.error ? 'не скачался — проверьте доступ к GitHub' : 'ещё не скачан';
+	var cls = c.off ? 'zm-off' : busy ? 'zm-warn zm-busy' : c.error ? 'zm-warn' : c.version ? 'zm-ok' : 'zm-off';
+	box.appendChild(E('div', { 'class': 'zm-cat-src-info' }, [
+		E('div', { 'class': 'zm-cat-src-title' }, [ 'Каталог списков ', E('span', { 'class': 'zm-badge ' + cls }, [ busy ? E('span', { 'class': 'zm-dot' }) : E([]),
+			c.off ? 'выключен' : busy ? 'обновляется' : c.error ? (c.version ? 'не обновился' : 'не скачан') : c.version ? 'работает' : 'нет' ]) ]),
+		E('div', { 'class': 'zm-cat-src-state' }, state),
+		E('div', { 'class': 'zm-cat-src-url' }, [ String(c.url || '') ])
+	]));
+	function act(arg, okText) {
+		return callSteerAction('catalog_src', arg).then(function(res) {
+			if (!res || res.error) { toast((res && res.error) || 'Роутер не ответил', 'error'); return; }
+			toast(okText, 'info');
+			o.reload();
+		}).catch(function() { toast('Роутер не ответил', 'error'); });
+	}
+	var b = [];
+	if (!c.off) b.push(E('button', { 'class': 'cbi-button', 'disabled': busy ? '' : null, 'click': function() {
+		callSteerAction('catalog_refresh', '').then(function(res) {
+			if (!res || res.error) { toast((res && res.error) || 'Роутер не ответил', 'error'); return; }
+			toast('Обновляем каталог списков…', 'info');
+			setTimeout(o.reload, 1200);
+			catalogWatch(c, o.reload);
+		}).catch(function() { toast('Роутер не ответил', 'error'); });
+	} }, busy ? 'Обновляется…' : 'Обновить каталог'));
+	b.push(E('button', { 'class': 'cbi-button', 'disabled': busy ? '' : null, 'click': function() {
+		if (c.off) { toast('Включаем каталог списков — скачиваем его…', 'info'); act('on', 'Каталог списков включён'); }
+		else act('off', 'Каталог списков выключен — остались только встроенные сервисы');
+	} }, c.off ? 'Включить каталог' : 'Выключить каталог'));
+	if (c.custom && !c.off) b.push(E('button', { 'class': 'cbi-button', 'disabled': busy ? '' : null, 'title': 'Сейчас каталог берётся по вашей ссылке', 'click': function() {
+		toast('Скачиваем стандартный каталог…', 'info');
+		act('', 'Вернули стандартный каталог списков');
+	} }, 'Вернуть стандартный'));
+	box.appendChild(E('div', { 'class': 'zm-actions zm-cat-src-actions' }, b));
+	return box;
+}
+
+var OWN_GROUP = 'Мои списки (добавлены вами)', ownBusy = '';
+function ownWord(n, a, b, c) { var m = n % 10, h = n % 100; return m === 1 && h !== 11 ? a : m >= 2 && m <= 4 && (h < 12 || h > 14) ? b : c; }
+function ownCounts(r) {
+	if (r.kind === 'catalog') return 'каталог: ' + (+r.svcs || 0) + ' ' + ownWord(+r.svcs || 0, 'список', 'списка', 'списков') + (r.version ? ' · версия ' + r.version : '');
+	var d = +r.dom || 0, p = +r.pfx || 0, o = [];
+	if (d) o.push(d.toLocaleString('ru-RU') + ' ' + ownWord(d, 'домен', 'домена', 'доменов'));
+	if (p) o.push(p.toLocaleString('ru-RU') + ' ' + ownWord(p, 'подсеть', 'подсети', 'подсетей'));
+	return o.length ? o.join(' · ') : 'набор правил sing-box (.srs)';
+}
+function ownBlock(c, o) {
+	c = c || {};
+	var own = c.own || [], max = +c.own_max || 30, box = E('div', { 'class': 'zm-cat-src zm-own' });
+	function redraw() { if (document.body.contains(box)) box.replaceWith(ownBlock(c, o)); }
+	box.appendChild(E('div', { 'class': 'zm-cat-src-info' }, [
+		E('div', { 'class': 'zm-cat-src-title' }, [ 'Мои списки ', E('span', { 'class': 'zm-badge ' + (ownBusy ? 'zm-warn zm-busy' : own.length ? 'zm-ok' : 'zm-off') },
+			[ ownBusy ? E('span', { 'class': 'zm-dot' }) : E([]), ownBusy ? 'проверяем' : own.length ? own.length + ' ' + ownWord(own.length, 'список', 'списка', 'списков') : 'нет' ]) ]),
+		E('div', { 'class': 'zm-cat-src-state' }, ownBusy ? 'скачиваем и проверяем список по ссылке…'
+			: own.length ? (own.some(function(r) { return r.kind === 'catalog'; }) ? 'Отмечаются в «Дополнительных списках»: свои списки — в группе «Мои списки», каталоги — в группах со своим названием. Работают и в Steer, и в Forkozz.' : 'Отмечаются в «Дополнительных списках» → «Мои списки», работают и в Steer, и в Forkozz.')
+			: 'Свой список доменов и подсетей по ссылке — например, файл на GitHub, или целый каталог lists.json. Каталоги выше при этом не меняются.')
+	]));
+	box.appendChild(E('div', { 'class': 'zm-actions zm-cat-src-actions' }, [
+		E('button', { 'class': 'cbi-button cbi-button-action', 'disabled': ownBusy || own.length >= max ? '' : null,
+			'title': own.length >= max ? 'Своих списков уже ' + max + ' — удалите ненужный' : '', 'click': function() { add({}); } }, ownBusy === 'add' ? 'Проверяем…' : 'Добавить список')
+	]));
+	if (own.length) box.appendChild(E('div', { 'class': 'zm-own-list' }, own.map(function(r) {
+		return E('div', { 'class': 'zm-own-row' }, [
+			E('div', { 'class': 'zm-own-text' }, [
+				E('div', { 'class': 'zm-own-name' }, [ String(r.name), r.used ? E('span', { 'class': 'zm-badge zm-ok', 'title': 'Список отмечен и работает' }, 'в ' + r.used) : E([]) ]),
+				E('div', { 'class': 'zm-own-meta' }, ownCounts(r)),
+				E('div', { 'class': 'zm-cat-src-url' }, [ E('a', { 'href': r.url, 'target': '_blank', 'rel': 'noopener' }, String(r.url).replace(/^https:\/\//, '')) ])
+			]),
+			E('div', { 'class': 'zm-own-btns' }, [
+				r.kind === 'catalog' ? E('button', { 'class': 'cbi-button', 'disabled': ownBusy ? '' : null, 'click': function() { refresh(r); } }, ownBusy === r.id ? 'Обновляется…' : 'Обновить') : E([]),
+				E('button', { 'class': 'cbi-button', 'disabled': ownBusy ? '' : null, 'click': function() { ren(r); } }, 'Переименовать'),
+				E('button', { 'class': 'cbi-button cbi-button-remove', 'disabled': ownBusy ? '' : null, 'click': function() { del(r); } }, 'Удалить')
+			])
+		]);
+	})));
+	function add(v, err) {
+		dialog({
+			title: 'Добавить свой список',
+			intro: 'Список скачивается по ссылке и обновляется вместе с остальными списками сервисов.',
+			okText: 'Добавить',
+			canOk: function(x) { return /^\s*https?:\/\/\S+\s*$/.test(x.url || ''); },
+			blocks: [
+				err ? { type: 'note', kind: 'warn', text: err } : null,
+				{ type: 'input', id: 'url', title: 'Ссылка на список', value: v.url || '', placeholder: 'https://raw.githubusercontent.com/…/list.txt',
+					hint: 'Текстовый файл: на строке домен (example.com) или подсеть IPv4 (203.0.113.0/24), # — комментарий. Подойдёт и набор правил sing-box .srs, и целый каталог lists.json (как у splify2-lists и Tachyon) — его списки появятся отдельными группами. Ссылку со страницы GitHub панель сама превратит в прямую.' },
+				{ type: 'input', id: 'name', title: 'Название', value: v.name || '', placeholder: 'например, Рабочие сайты', hint: 'Можно не заполнять — возьмём имя файла.' }
+			]
+		}).then(function(x) {
+			if (!x) return;
+			var q = { url: String(x.url || '').trim(), name: String(x.name || '').trim() };
+			ownBusy = 'add'; redraw();
+			callSteerAction('own_add', JSON.stringify(q)).then(function(res) {
+				ownBusy = '';
+				if (!res || res.error) { redraw(); add(q, (res && res.error) ? res.error.charAt(0).toUpperCase() + res.error.slice(1) : 'Роутер не ответил'); return; }
+				if (res.kind === 'catalog') toast('Каталог «' + res.name + '» добавлен: ' + (+res.svcs || 0) + ' ' + ownWord(+res.svcs || 0, 'список', 'списка', 'списков') + '. Они в «Дополнительных списках», в группах «' + res.name + '»', 'info');
+				else toast('Список «' + res.name + '» добавлен: ' + ownCounts(res) + '. Отметьте его в «Мои списки» и сохраните', 'info');
+				if (o.added && res.kind !== 'catalog') o.added(OWN_GROUP, res.id);
+				o.reload();
+			}).catch(function() { ownBusy = ''; redraw(); add(q, 'Роутер не ответил — попробуйте ещё раз'); });
+		});
+	}
+	function refresh(r) {
+		ownBusy = r.id; redraw();
+		callSteerAction('own_refresh', r.id).then(function(res) {
+			ownBusy = '';
+			if (!res || res.error) { toast((res && res.error) || 'Роутер не ответил', 'error'); redraw(); return; }
+			toast('Каталог «' + r.name + '» обновлён: ' + (+res.svcs || 0) + ' ' + ownWord(+res.svcs || 0, 'список', 'списка', 'списков'), 'info');
+			o.reload();
+		}).catch(function() { ownBusy = ''; toast('Роутер не ответил', 'error'); redraw(); });
+	}
+	function ren(r) {
+		askText({ title: r.kind === 'catalog' ? 'Название каталога' : 'Название списка', value: r.name, okText: 'Сохранить' }).then(function(nm) {
+			if (nm === null || !nm.trim() || nm.trim() === r.name) return;
+			callSteerAction('own_ren', JSON.stringify({ id: r.id, name: nm.trim() })).then(function(res) {
+				if (!res || res.error) { toast((res && res.error) || 'Роутер не ответил', 'error'); return; }
+				toast('Список переименован', 'info');
+				o.reload();
+			}).catch(function() { toast('Роутер не ответил', 'error'); });
+		});
+	}
+	function del(r) {
+		if (r.used) { toast((r.kind === 'catalog' ? 'Списки каталога «' + r.name + '» включены в ' : 'Список «' + r.name + '» включён в ') + r.used + ' — снимите отметки, сохраните и удалите снова', 'warning'); return; }
+		ask(r.kind === 'catalog' ? 'Удалить каталог «' + r.name + '»?\n\nЕго списки пропадут из «Дополнительных списков» в Steer и Forkozz.' : 'Удалить список «' + r.name + '»?\n\nОн пропадёт из «Моих списков» в Steer и Forkozz. Сам файл по ссылке не трогается.').then(function(yes) {
+			if (!yes) return;
+			callSteerAction('own_del', r.id).then(function(res) {
+				if (!res || res.error) { toast((res && res.error) || 'Роутер не ответил', 'error'); o.reload(); return; }
+				toast((r.kind === 'catalog' ? 'Каталог «' : 'Список «') + r.name + '» удалён', 'info');
+				o.reload();
+			}).catch(function() { toast('Роутер не ответил', 'error'); });
+		});
+	}
+	return box;
+}
+
 function svcGroup(o) {
 	var body = E('div', { 'style': o.open ? '' : 'display:none' }, [ o.body ]);
 	var head = svcCard({ name: o.name, sub: o.sub, key: o.key, color: o.color, ico: o.ico, on: false, cls: 'zm-svc-group' + (o.open ? ' zm-svc-open' : ''),
@@ -25396,6 +27076,11 @@ function hideTokens(names, exact) {
 	var lim = { flag: 40, pic: 12, word: 24 }, used = { flag: 0, pic: 0, word: 0 };
 	return out.filter(function(t) { return used[t.kind]++ < lim[t.kind]; });
 }
+
+var NOAUTO_WORDS = { hide: 'Убрать из «Авто»', hidden: 'Не в «Авто»', on: 'не в Авто', off: 'в Авто',
+	desc: 'На эти серверы «Авто» не переключается. Вручную их можно выбрать как обычно.',
+	hint: 'Отметьте серверы, на которые «Авто» не должен переключаться, и нажмите «Сохранить». Вручную их по-прежнему можно выбрать.',
+	edit: 'Изменить, что не брать в «Авто»', reset: 'Вернуть все в «Авто»' };
 
 function hidePicker(o) {
 	o = o || {};
@@ -26094,14 +27779,41 @@ function qrSvg(text, size) {
 	return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + (n + 8) + ' ' + (n + 8) + '" width="' + (size || 240) + '" height="' + (size || 240) + '" shape-rendering="crispEdges" role="img" aria-label="QR-код"><rect width="100%" height="100%" fill="#fff"/><path fill="#000" d="' + d + '"/></svg>';
 }
 
+function settle(fetch, done, onStep, maxMs) {
+	var t0 = Date.now(), lim = maxMs || 15000, waits = [ 700, 1000, 1500, 2000, 2500, 3000 ], n = 0;
+	return new Promise(function(resolve) {
+		(function next(last) {
+			if (Date.now() - t0 >= lim) { resolve({ ok: false, r: last }); return; }
+			setTimeout(function() {
+				Promise.resolve().then(fetch).then(function(r) {
+					if (r && !r.error) {
+						last = r;
+						if (onStep) { try { onStep(r); } catch (e) {} }
+						if (done(r)) { resolve({ ok: true, r: r }); return; }
+					}
+					next(last);
+				}, function() { next(last); });
+			}, waits[Math.min(n++, waits.length - 1)]);
+		})(null);
+	});
+}
+function changed(detail) { try { window.dispatchEvent(new CustomEvent('zm:changed', { detail: detail || {} })); } catch (e) {} }
+
 return baseclass.extend({
 	injectCss: injectCss,
 	badge: badge,
 	pollJob: pollJob,
+	settle: settle,
+	changed: changed,
 	alertBanners: alertBanners,
 	svcCard: svcCard,
 	svcGrid: svcGrid,
 	svcGroup: svcGroup,
+	tachyonBlock: tachyonBlock,
+	catalogBlock: catalogBlock,
+	ownBlock: ownBlock,
+	OWN_GROUP: OWN_GROUP,
+	NOAUTO_WORDS: NOAUTO_WORDS,
 	renderLog: renderLog,
 	refreshBanner: refreshBanner,
 	floatBanner: floatBanner,
@@ -26135,6 +27847,7 @@ return baseclass.extend({
 	zmCleanup: callZmCleanup,
 	zmAutoclean: callZmAutoclean,
 	ghProxy: callGhProxy,
+	webui: callWebui,
 	purgeScan: callPurgeScan,
 	purgeRun: callPurgeRun,
 	backupList: callBackupList,
@@ -26473,6 +28186,7 @@ return view.extend(managerAdapt({
 			var items = [];
 			if (zrSt !== 0) items.push(row('Zapret', zm.stateBadge(zrSt)));
 			if (zrSt !== 0 && d.strategy) items.push(row('Стратегия', E('span', { 'style': 'display:inline-flex; gap:8px; flex-wrap:wrap; align-items:center' }, [ E('span', {}, [ String(d.strategy) ]),
+				d.main_off ? E('span', { 'class': 'zm-badge zm-warn', 'title': 'Основной блок убран — обход работает только для YouTube, Discord, игр и других включённых блоков' }, [ E('span', { 'class': 'zm-dot' }), 'основная выключена' ]) : '',
 				d.rkn_on ? E('span', { 'class': 'zm-badge zm-ok' }, [ E('span', { 'class': 'zm-dot' }), 'по спискам РКН' ]) : d.ulist_on ? E('span', { 'class': 'zm-badge zm-ok' }, [ E('span', { 'class': 'zm-dot' }), 'по вашему списку' ]) : '',
 				d.s2 ? E('span', { 'class': 'zm-badge zm-sx-info', 'title': 'Часть устройств работает по своей стратегии — вкладка «Доп. секция»' }, [ E('span', { 'class': 'zm-dot' }), 'доп. секция' ]) : '',
 				d.testing ? E('span', { 'class': 'zm-badge zm-warn', 'title': 'Пока идёт тест, роутер по очереди пробует стратегии. Потом вернётся ваша' }, [ E('span', { 'class': 'zm-dot' }), 'идёт тест' + (d.test_now ? ': сейчас ' + d.test_now : '') ]) : '' ])));
@@ -26540,6 +28254,9 @@ return view.extend(managerAdapt({
 			var ramAvail = mem.available != null ? mem.available : ((mem.free || 0) + (mem.buffered || 0) + (mem.cached || 0));
 			var ru = zm.parseSize(sysInfo.root_used), rf = zm.parseSize(sysInfo.root_free);
 			var tu = zm.parseSize(sysInfo.tmp_used), tf = zm.parseSize(sysInfo.tmp_free);
+			var rt = zm.parseSize(sysInfo.root_total), tt = zm.parseSize(sysInfo.tmp_total);
+			if (!(rt > 0)) rt = ru + rf;
+			if (!(tt > 0)) tt = tu + tf;
 
 			var rows = [
 				row('Модель', E('span', {}, [ String(sysInfo.model || '—') ])),
@@ -26564,8 +28281,8 @@ return view.extend(managerAdapt({
 			var t = parseFloat(sysInfo.cpu_temp);
 			if (!isNaN(t)) memRows.push(meter('Температура ЦП', sysInfo.cpu_temp + ' °C', t, 65, 80));
 			memRows.push(usage('ОЗУ', mem.total - ramAvail, mem.total));
-			memRows.push(usage('Флеш', ru, ru + rf));
-			memRows.push(usage('/tmp', tu, tu + tf));
+			memRows.push(usage('Флеш', ru, rt));
+			memRows.push(usage('/tmp', tu, tt));
 			memRows = memRows.filter(Boolean);
 			var up = parseInt(boardInfo.uptime, 10), extras = [];
 			if (up > 0) {
@@ -26679,11 +28396,11 @@ return view.extend(managerAdapt({
 		if (!document.body.classList.contains('zmw-body')) wrap.appendChild(zm.alertBanners(healthData, function() { location.reload(); }));
 		if (!document.body.classList.contains('zmw-body')) wrap.appendChild(E('div', { 'class': 'zm-header' }, [
 			E('h2', {}, 'Zapret Manager для LuCI и Web'),
-			E('span', { 'class': 'zm-header-by' }, 'На основе версии 5.050 · StressOzz'),
+			E('span', { 'class': 'zm-header-by' }, 'На основе версии 5.064 · StressOzz'),
 			E('div', { 'class': 'zm-header-links' }, [
 				E('a', { 'href': 'http://stresskvn.lol/', 'target': '_blank', 'rel': 'noreferrer' }, 'StressKVN — обход белых списков!'),
 				E('a', { 'href': 'https://t.me/stressozz_manager', 'target': '_blank', 'rel': 'noreferrer' }, 'Сообщество Telegram'),
-				E('a', { 'href': 'http://' + window.location.hostname + ':7788/', 'target': '_blank', 'rel': 'noreferrer', 'class': 'zm-webui-link' }, 'Web UI ↗')
+				healthData && +healthData.zmw > 0 ? E('a', { 'href': 'http://' + window.location.hostname + ':' + healthData.zmw + '/', 'target': '_blank', 'rel': 'noreferrer', 'class': 'zm-webui-link' }, 'Web UI ↗') : E([])
 			])
 		]));
 		wrap.appendChild(overviewEl);
@@ -27527,9 +29244,9 @@ return view.extend({
 			accCard.appendChild(zm.swRow(on, 'Открывать через Tailscale', hint, function() {
 				quick(on ? 'ts_off' : 'ts_on', on ? 'Терминал теперь только для домашней сети' : 'Терминал открывается и через Tailscale');
 			}, busy || (!on && !data.wan_closed)));
-			var addrs = [];
-			if (data.lan_ip) addrs.push(E('b', {}, 'http://' + data.lan_ip + ':7788'));
-			if (data.ts_ip) addrs.push(E('b', {}, 'http://' + data.ts_ip + ':7788'));
+			var addrs = [], wp = +data.zmw || 0;
+			if (wp && data.lan_ip) addrs.push(E('b', {}, 'http://' + data.lan_ip + ':' + wp));
+			if (wp && data.ts_ip) addrs.push(E('b', {}, 'http://' + data.ts_ip + ':' + wp));
 			if (on && addrs.length) accCard.appendChild(E('p', { 'class': 'zm-hint' }, [ 'Вне дома откройте панель: ', addrs[0], addrs[1] ? E('span', {}, [ ' или ', addrs[1] ]) : '' ]));
 		}
 
@@ -28399,7 +30116,7 @@ return view.extend({
 						[ 'Адреса в списках устаревают', 'сегодня работает, завтра может перестать' ]
 					],
 					tip: { title: 'Сервис не открывается?', text: 'Снимите его галочку на этой странице или нажмите «Восстановить hosts».' },
-					note: replace ? 'Замена удалит весь текущий hosts — отмеченные сервисы и ваши записи.' : '',
+					note: replace ? 'Замена удалит ваши собственные записи в hosts. Отмеченные сервисы останутся поверх списка.' : '',
 					noteKind: 'bad',
 					check: 'Понимаю: с неработающим адресом в hosts сервис не откроется даже с VPN или DoH',
 					okText: info ? '' : replace ? 'Заменить hosts' : 'Применить'
@@ -28477,7 +30194,7 @@ return view.extend({
 			geoAutoEl.innerHTML = '';
 			var src = HOSTS_SRC[data.geohide] ? data.geohide : '', on = !!data.auto;
 			var sub = on
-				? 'Каждую ночь около 4:00 панель скачивает свежий ' + HOSTS_SRC[data.auto] + ' и обновляет hosts. Записи, добавленные поверх списка, сохраняются. ' + (data.auto_last > 0 ? 'Последнее обновление: ' + agoText(data.auto_last) + '.' : 'Первое обновление — этой ночью.')
+				? 'Каждую ночь около 4:00 панель скачивает свежий ' + HOSTS_SRC[data.auto] + ' и обновляет hosts. Отмеченные выше сервисы и ваши записи поверх списка сохраняются. ' + (data.auto_last > 0 ? 'Последнее обновление: ' + agoText(data.auto_last) + '.' : 'Первое обновление — этой ночью.')
 				: src ? 'Сейчас стоит ' + HOSTS_SRC[src] + ' — включите, чтобы адреса в нём не устаревали.' : 'Сначала выберите список выше.';
 			geoAutoEl.appendChild(zm.swRow(on, autoBusy ? 'Обновлять раз в сутки — применяем…' : 'Обновлять раз в сутки', sub, function() { setAuto(!on); }, autoBusy || (!on && !src)));
 			if (on && data.auto_err) geoAutoEl.appendChild(E('p', { 'class': 'zm-hint zm-ab-warn' }, 'Прошлое обновление не удалось: ' + data.auto_err + '. Остался прежний список — панель попробует снова следующей ночью.'));
@@ -28504,7 +30221,7 @@ return view.extend({
 
 		var geoCard = E('div', { 'class': 'zm-card' }, [
 			E('h3', {}, 'Заменить весь hosts'),
-			E('p', { 'class': 'zm-hint' }, 'Внимание: это ПОЛНОСТЬЮ заменит файл /etc/hosts на готовый список (GeoHide DNS или dns.malw.link) — все блоки выше и любые ваши собственные записи будут удалены.'),
+			E('p', { 'class': 'zm-hint' }, 'Заменит файл /etc/hosts на готовый список (GeoHide DNS или dns.malw.link). Сервисы, отмеченные выше, останутся — панель добавит их поверх списка, в том числе после ежедневного обновления. Ваши собственные записи будут удалены.'),
 			geoGrid,
 			geoAutoEl,
 			geoLogEl
@@ -28551,7 +30268,7 @@ return view.extend({
 			zm.hostsReplaceGeohide(region).then(function(res) {
 				busy = false;
 				if (res.error) { zm.renderLog(geoLogEl, '==> ОШИБКА: ' + res.error); zm.toast(res.error, 'error'); return; }
-				zm.renderLog(geoLogEl, '==> Готово — hosts заменён на ' + HOSTS_SRC[region] + '.');
+				zm.renderLog(geoLogEl, '==> Готово — hosts заменён на ' + HOSTS_SRC[region] + (res.kept > 0 ? ', отмеченные сервисы (' + res.kept + ') добавлены поверх.' : '.'));
 				zm.toast('hosts заменён на ' + HOSTS_SRC[region], 'info');
 				refreshAll();
 			}).catch(function() { busy = false; zm.renderLog(geoLogEl, '==> ОШИБКА: роутер не ответил — проверьте hosts и попробуйте ещё раз'); zm.toast('Роутер не ответил', 'error'); refreshAll(); });
@@ -28670,6 +30387,22 @@ var LISTS = [
 var LIST_BY_ID = {};
 LISTS.forEach(function(l) { LIST_BY_ID[l.id] = l; });
 
+var TCH_DOM = [
+	{ id: 'gambling_block', name: 'Казино и букмекеры', approx: '90 тыс. доменов', text: 'Онлайн-казино, букмекеры, слоты и тысячи их зеркал.' },
+	{ id: 'android_ads_block', name: 'Реклама в играх и приложениях Android', approx: '5 тыс. доменов', text: 'AdMob, Unity Ads, AppLovin, IronSource, Яндекс и MyTarget — ролики между уровнями и баннеры в бесплатных приложениях.' },
+	{ id: 'xiaomi_smarttv_ads', name: 'Реклама Xiaomi и Smart TV', approx: '60 доменов', text: 'Встроенная реклама MIUI и HyperOS на Xiaomi, Poco, Redmi и рекламные блоки в телевизорах Samsung и LG.' },
+	{ id: 'telemetry_mobile_block', name: 'Телеметрия смартфонов', approx: '1,6 тыс. доменов', text: 'Сбор данных iOS, Android, Huawei и Realme и SDK AppsFlyer, Adjust, Branch.' },
+	{ id: 'win_spy', name: 'Телеметрия Windows', approx: '330 доменов', text: 'Диагностика, отчёты об ошибках и рекламный идентификатор Windows 10 и 11. Изредка мешает Магазину Microsoft — тогда выключите.' }
+];
+var TCH_IP = [
+	{ id: 'et_spamhaus_block', name: 'Ботнеты и угнанные сети', approx: '2,3 тыс. сетей', text: 'Spamhaus DROP, Emerging Threats и серверы управления ботнетами Feodo. Без ложных срабатываний.' },
+	{ id: 'hagezi_tif_ip_block', name: 'IP вредоносных серверов', approx: '31 тыс. адресов', text: 'HaGeZi Threat Intelligence и FireHOL: серверы вирусов, управления ботнетами и фишинга.' },
+	{ id: 'botnet_attackers_ip_block', name: 'Атакующие узлы и сканеры', approx: '21 тыс. адресов', text: 'IPsum, CINS Army и Binary Defense: те, кто прямо сейчас сканирует порты и подбирает пароли.' }
+];
+var TCH_ORDER = TCH_DOM.concat(TCH_IP).map(function(x) { return x.id; });
+function tchNorm(list) { var on = {}; (list || []).forEach(function(x) { on[x] = true; }); return TCH_ORDER.filter(function(x) { return on[x]; }); }
+function tchStr(list) { return tchNorm(list).join(','); }
+
 function num(n) { return String(Math.round(+n || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ' '); }
 function doms(n) { var a = Math.abs(Math.round(+n || 0)), t = a % 100, o = a % 10; return num(n) + ' ' + (t >= 11 && t <= 14 ? 'доменов' : o === 1 ? 'домен' : o >= 2 && o <= 4 ? 'домена' : 'доменов'); }
 function badge(cls, text) { return E('span', { 'class': 'zm-badge ' + cls }, [ E('span', { 'class': 'zm-dot' }), text ]); }
@@ -28703,7 +30436,8 @@ return view.extend({
 		var logEl = E('pre', { 'class': 'zm-log' });
 		var busy = false, pick = null;
 
-		function cur() { return { list: LIST_BY_ID[data.list] ? data.list : 'pro', tif: !!data.tif, doh: !!data.doh }; }
+		var tchCard = E('div', { 'class': 'zm-card' });
+		function cur() { return { list: LIST_BY_ID[data.list] ? data.list : 'pro', tif: !!data.tif, doh: !!data.doh, tch: tchStr(String(data.tch || '').split(',')) }; }
 		function sel() { return pick || cur(); }
 		function changed() {
 			if (!pick || !data.on) return [];
@@ -28711,16 +30445,17 @@ return view.extend({
 			if (pick.list !== c.list) out.push('список ' + LIST_BY_ID[c.list].name + ' → ' + LIST_BY_ID[pick.list].name);
 			if (pick.tif !== c.tif) out.push(pick.tif ? 'защита от фишинга включается' : 'защита от фишинга выключается');
 			if (pick.doh !== c.doh) out.push(pick.doh ? 'запрет чужих DoH включается' : 'запрет чужих DoH выключается');
+			if (pick.tch !== c.tch) out.push('списки Tachyon: ' + (pick.tch ? pick.tch.split(',').length : 0) + ' вместо ' + (c.tch ? c.tch.split(',').length : 0));
 			return out;
 		}
-		function modeStr(s) { return 'list=' + s.list + ' tif=' + (s.tif ? 1 : 0) + ' doh=' + (s.doh ? 1 : 0) + ' auto=' + (data.auto === false ? 0 : 1); }
+		function modeStr(s) { return 'list=' + s.list + ' tif=' + (s.tif ? 1 : 0) + ' doh=' + (s.doh ? 1 : 0) + ' auto=' + (data.auto === false ? 0 : 1) + ' tch=' + (s.tch || ''); }
 		function edit(fn) {
 			if (busy) { zm.toast('Дождитесь окончания текущей операции', 'warning'); return; }
-			var s = sel(), p = { list: s.list, tif: s.tif, doh: s.doh };
+			var s = sel(), p = { list: s.list, tif: s.tif, doh: s.doh, tch: s.tch };
 			fn(p);
 			pick = p;
 			var c = cur();
-			if (data.on && p.list === c.list && p.tif === c.tif && p.doh === c.doh) pick = null;
+			if (data.on && p.list === c.list && p.tif === c.tif && p.doh === c.doh && p.tch === c.tch) pick = null;
 			renderHero(); renderLevel();
 			if (data.on && pick) job('apply', modeStr(pick), 'Применяем новый список — ход работы виден в окне вывода');
 		}
@@ -28811,7 +30546,7 @@ return view.extend({
 		}
 
 		function listTitle(s) {
-			return LIST_BY_ID[s.list].name + (s.tif ? ' + защита от фишинга' : '') + (s.doh ? ' + запрет чужих DoH' : '');
+			return LIST_BY_ID[s.list].name + (s.tif ? ' + защита от фишинга' : '') + (s.doh ? ' + запрет чужих DoH' : '') + (s.tch ? ' + Tachyon: ' + s.tch.split(',').length : '');
 		}
 
 		var stats = null, statsPer = 'all', statsBusy = false, statsLoading = false, statsTimer = 0;
@@ -28843,6 +30578,20 @@ return view.extend({
 				renderHero();
 				if (on) statsTick();
 			}).catch(function() { statsBusy = false; zm.toast('Роутер не ответил', 'error'); renderHero(); });
+		}
+		function statsReset() {
+			if (statsBusy || busy) { zm.toast('Дождитесь окончания текущей операции', 'warning'); return; }
+			zm.ask('Сбросить статистику?\n\nСчётчики запросов, «Чаще всего блокируется», «Кто спрашивает больше всего», журнал запросов и счётчик отброшенных соединений начнутся с нуля. Блокировка и сама статистика продолжат работать.', { okText: 'Сбросить' }).then(function(yes) {
+				if (!yes) return;
+				statsBusy = 'reset'; renderHero();
+				zm.adblockAction('stats_reset', String(statsPer)).then(function(r) {
+					statsBusy = false;
+					if (!r || r.error) { zm.toast((r && r.error) || 'Роутер не ответил', 'error'); renderHero(); return; }
+					if (r.on) stats = r;
+					zm.toast('Статистика сброшена — считаем заново', 'info');
+					refresh();
+				}).catch(function() { statsBusy = false; zm.toast('Роутер не ответил', 'error'); renderHero(); });
+			});
 		}
 		function pct(b, t) { if (!t) return '0'; var v = b * 100 / t; return (v >= 10 ? v.toFixed(0) : v.toFixed(1)).replace('.', ','); }
 		var JSIZES = [ [ 0, 'Выкл' ], [ 800, 'Малый', 'около 100 КБ памяти' ], [ 2500, 'Средний', 'около 300 КБ памяти' ], [ 8000, 'Большой', 'около 1 МБ памяти' ] ];
@@ -29104,7 +30853,8 @@ return view.extend({
 					: 'Устройства из «Без блокировки» и служебные запросы самого роутера в статистику не входят.'),
 				E('div', { 'class': 'zm-actions zm-abj-open' }, [
 					E('button', { 'class': 'cbi-button cbi-button-action', 'click': function() { journalOpen({ mode: 'log' }); } }, st.journal === 0 ? 'Журнал запросов (выключен)' : 'Журнал запросов'),
-					E('button', { 'class': 'cbi-button', 'disabled': statsBusy || busy ? '' : null, 'click': function() { statsSet(false); } }, statsBusy ? 'Выключаем…' : 'Выключить статистику')
+					E('button', { 'class': 'cbi-button', 'disabled': statsBusy || busy ? '' : null, 'title': 'Начать подсчёт с нуля', 'click': statsReset }, statsBusy === 'reset' ? 'Сбрасываем…' : 'Сбросить статистику'),
+					E('button', { 'class': 'cbi-button', 'disabled': statsBusy || busy ? '' : null, 'click': function() { statsSet(false); } }, statsBusy && statsBusy !== 'reset' ? 'Выключаем…' : 'Выключить статистику')
 				])
 			]));
 			return box;
@@ -29200,7 +30950,7 @@ return view.extend({
 				'Добавляет список TIF mini: ещё ' + tifN + ' мошенников, фишинга и вредоносных сайтов. Нужна свободная память роутера.',
 				function() { edit(function(p) { p.tif = !p.tif; }); }, busy));
 			levelCard.appendChild(zm.swRow(s.doh, 'Не давать устройствам обходить блокировку',
-				E('span', {}, [ 'Закрывает чужие серверы зашифрованного DNS (DoH/DoT), чтобы браузеры и приложения не спрашивали адреса в обход роутера. Серверы самой панели (Forkozz, DNS over HTTPS) и TG WS Proxy остаются открытыми — они нужны роутеру. ',
+				E('span', {}, [ 'Закрывает чужие серверы зашифрованного DNS (DoH/DoT), чтобы браузеры и приложения не спрашивали адреса в обход роутера. DNS-серверы из исключений и TG WS Proxy остаются доступными. ',
 					E('span', { 'class': 'zm-ab-warn' }, 'Если на телефоне вручную задан «Частный DNS» (например, dns.google), выключите его — иначе на телефоне пропадёт интернет.') ]),
 				function() { edit(function(p) { p.doh = !p.doh; }); }, busy));
 			var autoOn = data.auto !== false;
@@ -29219,6 +30969,32 @@ return view.extend({
 			var ch = changed();
 			levelCard.appendChild(bar);
 			bar.set(ch.length > 0, busy && ch.length > 0, ch.length ? 'Изменения: ' + ch.join(', ') : '');
+			renderTch();
+		}
+
+		function renderTch() {
+			tchCard.innerHTML = '';
+			var s = sel(), on = {}, src = data.src || {}, ip = data.ip || {};
+			(s.tch ? s.tch.split(',') : []).forEach(function(x) { on[x] = true; });
+			function toggle(id) { edit(function(p) { var l = p.tch ? p.tch.split(',') : [], i = l.indexOf(id); if (i >= 0) l.splice(i, 1); else l.push(id); p.tch = tchStr(l); }); }
+			function size(it, ipl) { var x = src[it.id] || src['t_' + it.id]; return x && x.n ? num(x.n) + (ipl ? ' адресов и сетей' : ' доменов') : '≈ ' + it.approx; }
+			var nOn = Object.keys(on).length;
+			tchCard.appendChild(E('h3', {}, [ 'Ещё списки из Tachyon Lists ', nOn ? badge('zm-ok', 'включено: ' + nOn) : E([]) ]));
+			tchCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin-top:-6px' }, 'Готовые списки блокировки из каталога Tachyon Lists. Каждый включается отдельно и берёт ещё немного памяти роутера.'));
+			tchCard.appendChild(E('div', { 'class': 'zm-ab-sub' }, 'Сайты — блокируются через DNS, как реклама'));
+			TCH_DOM.forEach(function(it) {
+				tchCard.appendChild(zm.swRow(!!on[it.id], it.name, it.text + ' · ' + size(it), function() { toggle(it.id); }, busy));
+			});
+			tchCard.appendChild(E('div', { 'class': 'zm-ab-sub' }, 'Опасные IP — блокируются в файрволе'));
+			tchCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin-top:0' }, 'Соединения с этими адресами отбрасываются для всех устройств и самого роутера — даже если адрес вшит в программу и DNS не нужен. Шлюз провайдера, DNS роутера, домашние и служебные сети не блокируются никогда.'));
+			TCH_IP.forEach(function(it) {
+				tchCard.appendChild(zm.swRow(!!on[it.id], it.name, it.text + ' · ' + size(it, true), function() { toggle(it.id); }, busy));
+			});
+			if (data.on && TCH_IP.some(function(it) { return on[it.id]; })) {
+				tchCard.appendChild(E('div', { 'class': 'zm-hint zm-ab-ipstate' }, ip.live
+					? [ badge('zm-ok', 'работает'), ' В файрволе ' + num(ip.n) + ' адресов и сетей · отброшено соединений: ' + num(ip.hits) ]
+					: [ badge('zm-warn', 'не загружено'), ' Опасные IP применятся вместе со списком — нажмите «Обновить сейчас», если это не произошло само' ]));
+			}
 		}
 
 		var allowTa = E('textarea', { 'class': 'zm-config-editor zm-ab-editor', 'spellcheck': 'false', 'autocapitalize': 'off', 'rows': '9', 'aria-label': 'Белый список' });
@@ -29317,7 +31093,7 @@ return view.extend({
 
 		var exBox = E('div', { 'class': 'zm-ab-auto' }), exData = null, exOpen = false, exLoading = false;
 		var EX_GROUPS = [
-			{ id: 'dns', title: 'Серверы DNS', sub: 'DoH и DoT из вкладки DNS over HTTPS и Forkozz, плюс выбранные сейчас — в том числе свои' },
+			{ id: 'dns', title: 'Серверы DNS', sub: 'DNS-серверы из списка исключений' },
 			{ id: 'tg', title: 'TG WS Proxy', sub: 'Telegram и домены прокси Cloudflare — обновляются вместе со списками блокировки' },
 			{ id: 'never', title: 'Проверка интернета и точное время', sub: 'без них телевизоры и телефоны решают, что интернета нет' },
 			{ id: 'apps', title: 'Приложения', sub: 'без них ломаются функции приложений — например, поиск в Wildberries' }
@@ -29351,7 +31127,7 @@ return view.extend({
 				exBox.appendChild(E('div', { 'class': 'zm-ab-grp' }, [
 					E('div', { 'class': 'zm-ab-grp-h' }, [ g.title + ' · ' + list.length + ' ', E('span', {}, '— ' + g.sub) ]),
 					E('div', { 'class': 'zm-ab-doms' }, list.map(function(d) {
-						return E('span', own[d] ? { 'class': 'zm-ab-own', 'title': 'Выбран сейчас (Forkozz или DNS роутера)' } : {}, d);
+						return E('span', own[d] ? { 'class': 'zm-ab-own', 'title': 'Сервер добавлен в исключения' } : {}, d);
 					}))
 				]));
 			});
@@ -29397,7 +31173,7 @@ return view.extend({
 			var head = [ 'Устройства без блокировки ' ];
 			if (nSaved) head.push(badge(freeInfo && freeInfo.running ? 'zm-ok' : 'zm-warn', devWord(nSaved)));
 			freeCard.appendChild(E('h3', {}, head));
-			freeCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin-top:-6px' }, 'Для отмеченных устройств реклама не блокируется — например, для ТВ-приставки, если с блокировкой у неё перестали работать IPTV или приложения. Forkozz и Steer для них работают как раньше: YouTube через VPN не пропадёт. Нажмите на устройство, чтобы отметить его.'));
+			freeCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin-top:-6px' }, 'Для отмеченных устройств реклама не блокируется — например, для ТВ-приставки, если с блокировкой у неё перестали работать IPTV или приложения. Нажмите на устройство, чтобы отметить его.'));
 			if (freeErr) freeCard.appendChild(E('p', { 'class': 'zm-hint' }, 'Не удалось получить список устройств: ' + freeErr));
 			var rows = [], known = {};
 			((freeInfo && freeInfo.devices) || []).forEach(function(d) {
@@ -29513,6 +31289,7 @@ return view.extend({
 		wrap.appendChild(heroCard);
 		wrap.appendChild(logEl);
 		wrap.appendChild(levelCard);
+		wrap.appendChild(tchCard);
 		wrap.appendChild(freeCard);
 		wrap.appendChild(E('div', { 'class': 'zm-cards zm-cards-2 zm-ab-pair' }, [ allowCard, blockCard ]));
 		wrap.appendChild(checkCard);
@@ -29651,6 +31428,8 @@ html.zm-theme-dark body:not(.zmw-body) .zm-meter-bar { background: rgba(255,255,
 .zm-vcard { container: zmv / inline-size; }
 .zm-grid.zm-vgrid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .zm-grid.zm-vgrid > .zm-tile { min-width: 0; padding-left: 6px; padding-right: 6px; }
+.zm-grid > .zm-tile-mainoff { flex: 1 0 100%; }
+.zm-grid.zm-vgrid > .zm-tile-mainoff { grid-column: 1 / -1; }
 @container zmv (min-width: 760px) { .zm-grid.zm-vgrid { grid-template-columns: repeat(10, minmax(0, 1fr)); } }
 
 .zm-sp-who { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
@@ -29978,6 +31757,30 @@ html.zm-theme-dark .zm-list-dirty { color: #d29922; }
 .zm-cat-src-url { margin-top: 2px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; opacity: .55; overflow-wrap: anywhere; }
 .zm-cat-src-actions { margin: 0 !important; flex: 0 0 auto; }
 @media (max-width: 600px) { .zm-cat-src-actions { flex: 1 1 100%; } }
+.zm-own-list { flex: 1 1 100%; display: flex; flex-direction: column; gap: 8px; margin-top: -4px; }
+.zm-own-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 12px; border-radius: 10px; background: rgba(127,127,127,.07); }
+.zm-own-text { flex: 1 1 240px; min-width: 0; }
+.zm-own-name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 600; font-size: 13.5px; overflow-wrap: anywhere; }
+.zm-own-meta { margin-top: 2px; font-size: 12.5px; opacity: .75; }
+.zm-own-btns { display: flex; gap: 6px; flex: 0 0 auto; }
+.zm-own-btns .cbi-button { padding: 4px 10px !important; font-size: 12.5px !important; min-height: 0 !important; }
+@media (max-width: 600px) { .zm-own-btns { flex: 1 1 100%; } .zm-own-btns .cbi-button { flex: 1 1 0; } }
+.zm-pc-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 12px; margin: 8px 0 0; border-radius: 10px; background: rgba(127,127,127,.07); }
+.zm-pc-row.zm-pc-off { background: rgba(207,34,46,.07); }
+.zm-pc-text { flex: 1 1 240px; min-width: 0; }
+.zm-pc-name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; overflow-wrap: anywhere; }
+.zm-pc-meta { margin-top: 3px; font-size: 12.5px; opacity: .75; overflow-wrap: anywhere; }
+.zm-pc-btns { display: flex; gap: 6px; flex: 0 0 auto; flex-wrap: wrap; }
+.zm-pc-btns .cbi-button { padding: 4px 10px !important; font-size: 12.5px !important; min-height: 0 !important; }
+.zm-pc-ed { margin: 8px 0 0; padding: 12px 14px; border: 1px dashed rgba(127,127,127,.35); border-radius: 12px; }
+.zm-pc-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.zm-pc-line > .zm-label { min-width: 110px; font-weight: 600; }
+.zm-pc-sel { max-width: 100%; min-width: 0; flex: 1 1 260px; }
+.zm-pc-time { width: 136px !important; min-width: 0; }
+.zm-pc-days .zm-seg-item { min-width: 40px; text-align: center; }
+.zm-pc-presets { margin-top: -2px; gap: 14px; font-size: 12.5px; }
+.zm-pc-presets .zm-pc-on { font-weight: 700; text-decoration: none; }
+@media (max-width: 600px) { .zm-pc-btns { flex: 1 1 100%; } .zm-pc-btns .cbi-button { flex: 1 1 0; } .zm-pc-line > .zm-label { min-width: 0; flex: 1 1 100%; } .zm-pc-presets > .zm-label { display: none; } .zm-pc-days { width: 100%; } .zm-pc-days .zm-seg-item { flex: 1 1 0; min-width: 0; padding-left: 0 !important; padding-right: 0 !important; overflow: visible; text-overflow: clip; } .zm-pc-time { width: 0 !important; flex: 1 1 0; } }
 @media (max-width: 600px) {
 	.zm-list-head { padding: 12px 14px; gap: 10px; }
 	.zm-list-body { padding: 4px 14px 14px; }
@@ -30558,6 +32361,13 @@ html.zm-theme-dark .zm-tt-tile { border-color: rgba(255,255,255,.12); background
 .zm-tt-run-t { display: inline-flex; align-items: center; gap: 9px; font-weight: 700; }
 .zm-tt-run-t::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: #2d5bff; background: var(--a1, #2d5bff); flex: 0 0 auto; animation: zm-tt-pulse 1.4s ease-in-out infinite; }
 @keyframes zm-tt-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.7); } }
+.zm-badge.zm-busy .zm-dot { animation: zm-tt-pulse 1.1s ease-in-out infinite; }
+.zm-ab-sub { font-size: 13px; font-weight: 650; margin: 16px 0 6px; opacity: .8; }
+.zm-ab-ipstate { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.zm-rkn-src { margin: -2px 0 12px 52px; }
+.zm-rkn-src .zm-seg { max-width: 420px; }
+.zm-rkn-src .zm-hint { margin: 6px 0 0; }
+@media (prefers-reduced-motion: reduce) { html .zm-badge.zm-busy .zm-dot { animation-duration: 1.4s !important; animation-iteration-count: infinite !important; } }
 .zm-tt-nowbox { display: flex; flex-direction: column; gap: 7px; font-size: 13px; font-weight: 400; min-width: 0; }
 .zm-tt-now-o { font-size: 12px; font-weight: 600; opacity: .7; }
 .zm-tt-now-l { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; min-width: 0; }
@@ -30694,6 +32504,22 @@ html.zm-theme-dark .zm-dock .zm-refresh-banner { background: #2f2a1c; color: #e3
 .zm-ow-seg3 .zm-seg-item { text-align: center; padding: 5px 6px; }
 .zm-seg-item.zm-ow-dis { opacity: .35; cursor: not-allowed; }
 .zm-ow-txnote { font-size: 12px; opacity: .65; line-height: 1.4; }
+.zm-ow-txnote.zm-ow-warnnote { opacity: 1; color: #b45309; }
+.zm-devmap { display: flex; flex-direction: column; gap: 8px; }
+.zm-devmap-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 14px; padding: 10px 14px; border: 1px solid rgba(0,0,0,.08); border-radius: 12px; background: rgba(0,0,0,.02); }
+.zm-devmap-dev { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.zm-devmap-dev b { font-size: 14px; overflow-wrap: anywhere; }
+.zm-devmap-dev span { font-size: 12px; opacity: .65; overflow-wrap: anywhere; }
+.zm-devmap-chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.zm-devmap-chip { appearance: none; font: inherit; font-size: 12px; font-weight: 600; line-height: 1.3; padding: 4px 10px; border-radius: 999px; border: 1px solid transparent; cursor: pointer; transition: filter .15s, opacity .15s; }
+.zm-devmap-chip:hover { filter: brightness(.95); }
+.zm-devmap-all { background: rgba(26,127,55,.12); color: #1a7f37; border-color: rgba(26,127,55,.25); }
+.zm-devmap-only { background: rgba(37,99,235,.10); color: #1d4ed8; border-color: rgba(37,99,235,.25); }
+.zm-devmap-byp { background: rgba(217,119,6,.12); color: #b45309; border-color: rgba(217,119,6,.25); }
+.zm-devmap-dead { opacity: .5; text-decoration: line-through; }
+.zm-fk-pin { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 14px; margin: 10px 0 2px; padding: 10px 14px; border: 1px solid rgba(217,119,6,.3); border-radius: 12px; background: rgba(217,119,6,.06); }
+.zm-fk-pin .zm-hint { flex: 1 1 320px; }
+.zm-fk-pin .cbi-button { margin: 0; flex: 0 0 auto; }
 .zm-ow-acts { align-items: center; margin-top: 14px; }
 .zm-sx-grid.zm-ow-grid3 { display: flex; flex-wrap: wrap; align-items: stretch; }
 .zm-ow-grid3 > .zm-sx-tile { flex: 1 1 280px; }
@@ -30703,6 +32529,7 @@ html.zm-theme-dark .zm-dock .zm-refresh-banner { background: #2f2a1c; color: #e3
 .zm-ow-grid3 .zm-ow-pw .cbi-button { flex: 1 0 auto; }
 .zm-ow-grid3 .zm-seg { display: flex; flex-wrap: nowrap; width: 100%; align-self: stretch; }
 .zm-ow-grid3 .zm-seg-item { flex: 1 1 0; min-width: 0; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 8px; padding-right: 8px; }
+.zm-ow-grid3 .zm-seg.zm-seg-fit .zm-seg-item { flex: 1 1 auto; }
 .zm-ow-grid3 .zm-ow-side { flex-direction: column; align-items: stretch; gap: 6px; }
 .zm-ow-link { appearance: none; background: none; border: 0; padding: 0; margin: 8px 0 0; font: inherit; font-size: 13px; color: #2563eb; cursor: pointer; text-align: left; align-self: flex-start; }
 .zm-ow-link:hover { text-decoration: underline; }
@@ -30757,6 +32584,12 @@ html.zm-theme-dark .zm-ow-radio { border-color: rgba(255,255,255,.12); backgroun
 html.zm-theme-dark .zm-ow-table th { border-color: rgba(255,255,255,.12); }
 html.zm-theme-dark .zm-ow-table td { border-color: rgba(255,255,255,.07); }
 html.zm-theme-dark .zm-ow-link { color: #79c0ff; }
+html.zm-theme-dark .zm-ow-txnote.zm-ow-warnnote { color: #e3b341; }
+html.zm-theme-dark .zm-devmap-row { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.03); }
+html.zm-theme-dark .zm-devmap-all { background: rgba(63,185,80,.14); color: #3fb950; border-color: rgba(63,185,80,.3); }
+html.zm-theme-dark .zm-devmap-only { background: rgba(88,166,255,.14); color: #79c0ff; border-color: rgba(88,166,255,.3); }
+html.zm-theme-dark .zm-devmap-byp { background: rgba(210,153,34,.14); color: #e3b341; border-color: rgba(210,153,34,.3); }
+html.zm-theme-dark .zm-fk-pin { border-color: rgba(210,153,34,.35); background: rgba(210,153,34,.08); }
 @media (max-width: 720px) {
 	.zm-ow-modes, .zm-ow-radios { grid-template-columns: minmax(0, 1fr); }
 	.zm-ow-table thead { display: none; }
@@ -32463,7 +34296,7 @@ return view.extend({
 		put('watch', watchCard);
 
 
-		var ghCard = E('div', { 'class': 'zm-card' }), ghD = null, ghBusy = false;
+		var ghCard = E('div', { 'class': 'zm-card' }), ghD = null, ghBusy = false, ghChk = false;
 		function ghWhen(ts) {
 			var d = new Date(ts * 1000), p2 = function(n) { return (n < 10 ? '0' : '') + n; };
 			var now = new Date(((ghD && ghD.now) || Math.floor(Date.now() / 1000)) * 1000);
@@ -32477,14 +34310,23 @@ return view.extend({
 				ghBusy = false;
 				if (!r || r.error) { zm.toast((r && r.error) || 'Роутер не ответил', 'error'); renderGh(); return; }
 				ghD = r;
-				zm.toast(mode === 'auto' ? 'GitHub: напрямую, а если не ответит — через зеркала' : 'GitHub: только напрямую', 'info');
+				zm.toast(mode === 'auto' ? 'GitHub: напрямую, а если не открывается — сразу через зеркала' : 'GitHub: только напрямую', 'info');
 				renderGh();
 			}).catch(function() { ghBusy = false; zm.toast('Роутер не ответил', 'error'); renderGh(); });
+		}
+		function ghCheck() {
+			if (ghBusy || ghChk) return;
+			ghChk = true; renderGh();
+			zm.ghProxy('check', '').then(function(r) {
+				ghChk = false;
+				if (!r || r.error) { zm.toast((r && r.error) || 'Роутер не ответил', 'error'); renderGh(); return; }
+				ghD = r; renderGh();
+			}).catch(function() { ghChk = false; zm.toast('Роутер не ответил', 'error'); renderGh(); });
 		}
 		function renderGh() {
 			ghCard.innerHTML = '';
 			ghCard.appendChild(E('h3', {}, 'Доступ к GitHub'));
-			ghCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin-top:-6px' }, 'Панель качает с GitHub списки, стратегии, программы и свои обновления. Если GitHub у провайдера не открывается, загрузки можно повторять через зеркала.'));
+			ghCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin-top:-6px' }, 'Панель качает с GitHub списки, стратегии, программы и свои обновления. Если GitHub у провайдера не открывается, загрузки идут через зеркала.'));
 			if (!ghD) { ghCard.appendChild(E('p', { 'class': 'zm-hint' }, 'Загружаем…')); return; }
 			var mode = ghD.mode === 'auto' ? 'auto' : 'off';
 			ghCard.appendChild(E('div', { 'class': 'zm-row' }, [ E('span', { 'class': 'zm-label' }, 'Как качать'),
@@ -32498,7 +34340,18 @@ return view.extend({
 			var list = String(ghD.list || '').split(' ').filter(Boolean).join(' → ');
 			ghCard.appendChild(E('p', { 'class': 'zm-hint' }, mode === 'off'
 				? 'Все загрузки идут на GitHub напрямую, как раньше.' + (ghD.fail_at > 0 ? ' GitHub не отвечал в ' + ghWhen(ghD.fail_at) + ' — попробуйте «Авто».' : '')
-				: 'Каждая загрузка сначала идёт напрямую. Если GitHub не ответил, она повторяется через зеркала по очереди (' + list + '), пока одно не отдаст файл. Следующая загрузка снова начинается напрямую. Что происходит, видно в журнале операции и ниже.'));
+				: 'Перед загрузкой панель проверяет, открываются ли github.com и raw.githubusercontent.com. Если адрес не открывается — файл сразу качается через зеркало, без ожидания. На каждый файл не больше 3 попыток: напрямую и через зеркала (' + list + '). Недоступный адрес проверяется снова через 10 минут. Что происходит, видно в журнале операции и ниже.'));
+			var net = ghD.net || [];
+			if (net.length) {
+				var nb = E('div', { 'class': 'zm-row', 'style': 'flex-wrap:wrap;gap:8px' }, [ E('span', { 'class': 'zm-label' }, 'Сейчас') ]);
+				net.forEach(function(x) {
+					var cls = x.s === 'up' ? 'zm-ok' : x.s === 'down' ? 'zm-bad' : 'zm-off';
+					var tx = x.h + (x.s === 'up' ? ' — открывается' : x.s === 'down' ? ' — не открывается' : ' — ещё не проверяли');
+					nb.appendChild(E('span', { 'class': 'zm-badge ' + cls, 'title': x.t > 0 ? 'Проверено в ' + ghWhen(x.t) : '' }, [ E('span', { 'class': 'zm-dot' }), tx ]));
+				});
+				nb.appendChild(E('button', { 'class': 'cbi-button', 'disabled': ghChk || ghBusy ? '' : null, 'click': ghCheck }, ghChk ? 'Проверяем…' : 'Проверить сейчас'));
+				ghCard.appendChild(nb);
+			}
 			var lg = ghD.log || [];
 			if (lg.length) {
 				var box = E('pre', { 'class': 'zm-log zm-show', 'style': 'max-height:220px' });
@@ -32506,11 +34359,74 @@ return view.extend({
 				ghCard.appendChild(E('div', { 'class': 'zm-row' }, [ E('span', { 'class': 'zm-label' }, 'Последние обращения к зеркалам') ]));
 				ghCard.appendChild(box);
 			} else if (mode === 'auto') ghCard.appendChild(E('p', { 'class': 'zm-hint' }, 'Зеркала ещё не понадобились — GitHub отвечает напрямую.'));
-			if (mode === 'auto') ghCard.appendChild(E('p', { 'class': 'zm-hint' }, '⚠ Зеркала — чужие серверы: они видят, что качает роутер, и могут подменить файл. Панель обращается к ним, только когда GitHub не ответил сам.'));
+			if (mode === 'auto') ghCard.appendChild(E('p', { 'class': 'zm-hint' }, '⚠ Зеркала — чужие серверы: они видят, что качает роутер, и могут подменить файл. Панель обращается к ним, только когда GitHub не открывается.'));
 		}
 		if (on('ghmirror')) zm.ghProxy('get', '').then(function(r) { ghD = r && !r.error ? r : { mode: 'off' }; renderGh(); }).catch(function() { ghD = { mode: 'off' }; renderGh(); });
 		renderGh();
 		put('ghmirror', ghCard);
+
+		var zwCard = E('div', { 'class': 'zm-card' }), zwD = null, zwBusy = false, zwErr = '';
+		var zwPort = E('input', { 'class': 'cbi-input-text', 'type': 'text', 'inputmode': 'numeric', 'maxlength': '5', 'aria-label': 'Порт Web UI', 'style': 'width:96px;min-width:0' });
+		zwPort.addEventListener('input', function() { zwPort.value = zwPort.value.replace(/[^0-9]/g, '').slice(0, 5); renderZwBtn(); });
+		zwPort.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); zwSave(); } });
+		var zwBtn = E('button', { 'class': 'cbi-button cbi-button-action', 'click': function() { zwSave(); } }, 'Сменить порт');
+		function zwOk(v) { var n = +v; return /^[0-9]{1,5}$/.test(v) && n >= 1 && n <= 65535; }
+		function renderZwBtn() {
+			var v = zwPort.value, cur = zwD ? String(zwD.on ? zwD.port : zwD.saved) : '';
+			zwBtn.disabled = zwBusy || !zwD || !zwD.avail || !zwOk(v) || v.replace(/^0+/, '') === cur;
+			zwBtn.textContent = zwBusy ? 'Применяем…' : (zwD && zwD.on ? 'Сменить порт' : 'Запомнить порт');
+		}
+		function zwCall(val, msg) {
+			if (zwBusy) return;
+			zwBusy = true; zwErr = ''; renderZw();
+			zm.webui('set', val).then(function(r) {
+				zwBusy = false;
+				if (!r || r.error) { zwErr = (r && r.error) || 'Роутер не ответил'; zm.toast(zwErr, 'error'); renderZw(); return; }
+				zwD = r; zwPort.value = String(r.on ? r.port : r.saved);
+				zm.toast(msg(r), 'info');
+				renderZw();
+			}).catch(function() { zwBusy = false; zwErr = 'Роутер не ответил'; zm.toast(zwErr, 'error'); renderZw(); });
+		}
+		function zwSave() {
+			if (!zwD || zwBtn.disabled) return;
+			var v = zwPort.value.replace(/^0+/, '');
+			if (zwD.on) zwCall('on|' + v, function(r) { return 'Web UI теперь на порту ' + r.port + '. Откройте его заново по новому адресу'; });
+			else zwCall('off|' + v, function() { return 'Порт ' + v + ' запомнен — Web UI включится на нём'; });
+		}
+		function zwToggle() {
+			if (!zwD || zwBusy || !zwD.avail) return;
+			if (zwD.on) {
+				zm.dialog({ title: 'Выключить Web UI?', danger: true, okText: 'Выключить', intro: 'Страница http://' + window.location.hostname + ':' + zwD.port + ' перестанет открываться, порт ' + zwD.port + ' закроется. Панель в LuCI продолжит работать, Web UI можно снова включить здесь.' }).then(function(ok) {
+					if (ok) zwCall('off', function() { return 'Web UI выключен — порт закрыт'; });
+				});
+				return;
+			}
+			var v = zwOk(zwPort.value) ? zwPort.value.replace(/^0+/, '') : String(zwD.saved || 7788);
+			zwCall('on|' + v, function(r) { return 'Web UI включён на порту ' + r.port; });
+		}
+		function renderZw() {
+			zwCard.innerHTML = '';
+			zwCard.appendChild(E('h3', {}, [ 'Web UI ', !zwD ? E([]) : zwD.on ? E('span', { 'class': 'zm-badge zm-ok' }, [ E('span', { 'class': 'zm-dot' }), 'включён · порт ' + zwD.port ]) : E('span', { 'class': 'zm-badge zm-off' }, [ E('span', { 'class': 'zm-dot' }), 'выключен' ]) ]));
+			zwCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin-top:-6px' }, 'Web UI — та же панель, но отдельной страницей без LuCI, удобно с телефона. Если вы ею не пользуетесь, выключите — её порт закроется. Включать, выключать и менять порт можно только здесь, в LuCI.'));
+			if (!zwD) { zwCard.appendChild(E('p', { 'class': 'zm-hint' }, 'Загружаем…')); return; }
+			if (!zwD.avail) { zwCard.appendChild(E('p', { 'class': 'zm-hint' }, 'На роутере нет веб-сервера uhttpd — Web UI работать не может.')); return; }
+			zwCard.appendChild(zm.swRow(!!zwD.on, zwD.on ? 'Web UI включён' : 'Web UI выключен', zwD.on ? 'Открывается по адресу http://' + window.location.hostname + ':' + zwD.port : 'Включится на порту ' + (zwOk(zwPort.value) ? zwPort.value.replace(/^0+/, '') : zwD.saved), zwToggle, zwBusy));
+			zwCard.appendChild(E('div', { 'class': 'zm-row' }, [ E('span', { 'class': 'zm-label' }, 'Порт'), zwPort, zwBtn,
+				zwD.on ? E('a', { 'href': 'http://' + window.location.hostname + ':' + zwD.port + '/', 'target': '_blank', 'rel': 'noreferrer' }, 'Открыть Web UI ↗') : E([]) ]));
+			zwCard.appendChild(E('p', { 'class': 'zm-hint' }, 'Порт — число от 1 до 65535, по умолчанию 7788. Занятый порт панель не примет: например 80 и 443 у LuCI, 53 у DNS, 22 у SSH.'));
+			if (!zwD.ubus && !zwD.on) zwCard.appendChild(E('p', { 'class': 'zm-hint' }, '⚠ Нет модуля uhttpd-mod-ubus — без него Web UI не откроется. Переустановите панель командой zmw.'));
+			if (zwErr) zwCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'color:#cf222e' }, zwErr));
+			renderZwBtn();
+		}
+		if (!document.body.classList.contains('zmw-body') && on('webui')) {
+			zm.webui('get', '').then(function(r) {
+				zwD = r && !r.error ? r : { avail: false };
+				zwPort.value = String(zwD.on ? zwD.port : (zwD.saved || 7788));
+				renderZw();
+			}).catch(function() { zwD = { avail: false }; renderZw(); });
+			renderZw();
+			put('webui', zwCard);
+		}
 
 		var bkCard = E('div', { 'class': 'zm-card zm-bk' }), bkD = null, bkBusy = '', bkErr = '';
 		var bkLog = E('pre', { 'class': 'zm-log' });
@@ -33261,6 +35177,7 @@ var CREDITS = [
 	{ g: 'dns', product: 'ios_rule_script (списки)', author: 'blackmatrix7', url: 'https://github.com/blackmatrix7/ios_rule_script' },
 	{ g: 'dns', product: 'b4geoip (списки игр и сервисов)', author: 'DanielLavrushin', url: 'https://github.com/DanielLavrushin/b4geoip' },
 	{ g: 'dns', product: 'b4geoip-forkop (сборка для sing-box)', author: 'Greeg0ry', url: 'https://github.com/Greeg0ry/b4geoip-forkop' },
+	{ g: 'dns', product: 'Tachyon Lists (списки для блокировки рекламы)', author: 'Dushnilin', url: 'https://github.com/Dushnilin/tachyon-lists' },
 	{ g: 'dns', product: 'sing-box-supercell-ruleset', author: 'ushan0v', url: 'https://github.com/ushan0v/sing-box-supercell-ruleset' },
 	{ g: 'other', product: 'ttyd (терминал)', author: 'tsl0922', url: 'https://github.com/tsl0922/ttyd' },
 	{ g: 'other', product: 'hls.js (радио в формате HLS)', author: 'video-dev', url: 'https://github.com/video-dev/hls.js' },
@@ -33448,6 +35365,21 @@ var FLOW = [
 	{ id: 'hw', label: 'Аппаратное', sub: 'требует поддержки оборудования и драйвера' }
 ];
 var POWER = [ { id: 'low', label: 'Низкая', d: 6 }, { id: 'mid', label: 'Средняя', d: 3 }, { id: 'high', label: 'Высокая', d: 0 } ];
+var WSEC = [
+	{ id: 'psk2', label: 'WPA2', note: 'Подключается любое устройство — даже старое.' },
+	{ id: 'sae-mixed', label: 'WPA2/WPA3', sae: true, note: 'Новые устройства подключаются по WPA3, старые — по WPA2. Если телефон не подключается к WPA2 или WPA3 — выберите этот режим.' },
+	{ id: 'sae', label: 'WPA3', sae: true, note: 'Только WPA3 — надёжнее всего, но старые телефоны, телевизоры и умные устройства не подключатся.' }
+];
+var WSEC_OTHER = { 'none': 'без пароля', 'psk-mixed': 'WPA/WPA2', 'psk': 'WPA', 'owe': 'OWE', 'wpa': 'WPA-Enterprise', 'wpa2': 'WPA2-Enterprise', 'wpa3': 'WPA3-Enterprise', 'wpa-mixed': 'WPA/WPA2-Enterprise', 'wpa3-mixed': 'WPA2/WPA3-Enterprise' };
+function wsecBase(e) {
+	e = String(e || 'none');
+	var b = e.split('+')[0];
+	return WSEC.some(function(x) { return x.id === b; }) ? b : e;
+}
+function wsecName(e) {
+	var b = wsecBase(e), p = WSEC.filter(function(x) { return x.id === b; })[0];
+	return p ? p.label : WSEC_OTHER[b.split('+')[0]] || b;
+}
 var DOWS = [ [ '1', 'понедельник' ], [ '2', 'вторник' ], [ '3', 'среду' ], [ '4', 'четверг' ], [ '5', 'пятницу' ], [ '6', 'субботу' ], [ '0', 'воскресенье' ] ];
 var DOW_SHORT = [ 'вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб' ];
 var MON_GEN = [ 'января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря' ];
@@ -33658,7 +35590,7 @@ return view.extend({
 		function wifiDraft() {
 			var w = st.wifi || {};
 			wd = { country: w.country || '', radios: (w.radios || []).map(function(r) {
-				return { id: r.id, on: !!r.on, ssid: r.ssid || '', key: r.key || '', channel: r.channel || 'auto', txp: r.txp || '', lvl: txLevel(r) };
+				return { id: r.id, on: !!r.on, ssid: r.ssid || '', key: r.key || '', channel: r.channel || 'auto', txp: r.txp || '', lvl: txLevel(r), enc: wsecBase(r.enc) };
 			}) };
 			wifiOrig = JSON.stringify(wd);
 		}
@@ -33685,15 +35617,17 @@ return view.extend({
 		function wifiDirty() { return JSON.stringify(wd) !== wifiOrig; }
 		function wifiSave() {
 			if (wifiSaving || !wifiDirty()) return;
-			var body = { country: wd.country && wd.country !== (st.wifi.country || '') ? wd.country : '', radios: wd.radios.map(function(d) {
-				return { id: d.id, on: d.on, ssid: d.ssid.trim() ? d.ssid : '', key: d.key, channel: d.channel, txp: d.txp };
+			var body = { country: wd.country && wd.country !== (st.wifi.country || '') ? wd.country : '', radios: wd.radios.map(function(d, i) {
+				var was = wsecBase((st.wifi.radios[i] || {}).enc);
+				return { id: d.id, on: d.on, ssid: d.ssid.trim() ? d.ssid : '', key: d.key, channel: d.channel, txp: d.txp, enc: d.enc !== was && WSEC.some(function(x) { return x.id === d.enc; }) ? d.enc : '' };
 			}) };
 			for (var i = 0; i < body.radios.length; i++) {
 				var b = body.radios[i], lab = (st.wifi.radios[i] || {}).label || '';
 				if (!b.on) continue;
 				if (!b.ssid) { zm.toast('Задайте имя сети ' + lab, 'warning'); return; }
-				var enc = (st.wifi.radios[i] || {}).enc || '';
+				var enc = b.enc || (st.wifi.radios[i] || {}).enc || '';
 				if ((/^(psk|sae)/.test(enc) || b.key) && /^(|none|psk.*|sae.*)$/.test(enc) && b.key.length < 8) { zm.toast('Пароль ' + lab + ' — не короче 8 символов', 'warning'); return; }
+				if (/^sae/.test(enc) && b.key.length > 63) { zm.toast('Пароль ' + lab + ' для WPA3 — не длиннее 63 символов', 'warning'); return; }
 			}
 			wifiSaving = true; renderWifi();
 			call('wifi', body, 'Сохраняем Wi-Fi').then(function(r) {
@@ -33729,7 +35663,19 @@ return view.extend({
 					return E('option', { 'value': c, 'selected': String(d.channel) === c ? '' : null }, c);
 				})));
 			box.appendChild(field('Имя сети', ssid));
-			box.appendChild(field(r.enc && /^sae/.test(r.enc) ? 'Пароль · WPA2/WPA3' : 'Пароль · WPA2-PSK', E('span', { 'class': 'zm-ow-pw' }, [ pw, eye ])));
+			var sae = (st.wifi || {}).sae !== false, known = WSEC.some(function(x) { return x.id === d.enc; }), selSec = WSEC.filter(function(x) { return x.id === d.enc; })[0];
+			var secNote = !known ? 'Сейчас: ' + wsecName(d.enc) + ' — так настроено в OpenWrt. Выберите режим, чтобы заменить.'
+				: (selSec.note + (!sae && !selSec.sae ? ' WPA3 недоступен: wpad на роутере собран без него.' : ''));
+			box.appendChild(E('div', { 'class': 'zm-ow-field' }, [ E('span', {}, 'Защита'),
+				E('div', { 'class': 'zm-seg zm-ow-seg3', 'role': 'radiogroup', 'aria-label': 'Защита ' + (r.label || '') }, WSEC.map(function(p) {
+					var off = p.sae && !sae && d.enc !== p.id;
+					return E('div', { 'class': 'zm-seg-item' + (d.enc === p.id ? ' zm-active' : '') + (off ? ' zm-ow-dis' : ''), 'role': 'radio', 'tabindex': '0',
+						'aria-checked': d.enc === p.id ? 'true' : 'false', 'aria-disabled': off ? 'true' : null, 'title': off ? 'wpad на роутере собран без WPA3' : p.note,
+						'click': function() { if (off || d.enc === p.id) return; d.enc = p.id; renderWifi(); },
+						'keydown': function(ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); this.click(); } } }, p.label);
+				})),
+				E('span', { 'class': 'zm-ow-txnote' + (!known && d.enc === 'none' ? ' zm-ow-warnnote' : '') }, secNote) ]));
+			box.appendChild(field('Пароль', E('span', { 'class': 'zm-ow-pw' }, [ pw, eye ])));
 			box.appendChild(field('Канал', ch));
 			var txNote = d.lvl === 'own' ? 'Своё значение: ' + d.txp + ' дБм — выберите уровень, чтобы заменить его.' : '';
 			box.appendChild(E('div', { 'class': 'zm-ow-field' }, [ E('span', {}, 'Сила сигнала'),
@@ -33825,26 +35771,34 @@ return view.extend({
 				]));
 			}
 
-			var v6seg = E('div', { 'class': 'zm-seg' + (busy ? ' zm-seg-busy' : '') }, [ [ 'on', 'Включён' ], [ 'off', 'Выключен' ] ].map(function(x) {
-				var on = (x[0] === 'on') === !!v6.on;
+			var v6mode = v6.mode || (v6.on ? 'on' : 'off');
+			var V6_GO = { on: 'Включаем IPv6', lan: 'Оставляем IPv6 только для домашней сети', off: 'Выключаем IPv6' };
+			var V6_DONE = { on: 'IPv6 включён', lan: 'IPv6 работает только в домашней сети', off: 'IPv6 выключен' };
+			var v6seg = E('div', { 'class': 'zm-seg zm-seg-fit' + (busy ? ' zm-seg-busy' : '') }, [ [ 'on', 'Включён' ], [ 'lan', 'Только дома' ], [ 'off', 'Выключен' ] ].map(function(x) {
+				var on = x[0] === v6mode;
 				return E('div', { 'class': 'zm-seg-item' + (on ? ' zm-active' : ''), 'role': 'button', 'tabindex': '0', 'click': function() {
 					if (on || busy) return;
-					var p = call('ipv6', x[0], x[0] === 'off' ? 'Выключаем IPv6 — сеть перезапустится на несколько секунд' : 'Включаем IPv6 — сеть перезапустится на несколько секунд');
+					var p = call('ipv6', x[0], V6_GO[x[0]] + ' — сеть перезапустится на несколько секунд');
 					renderRouter();
 					p.then(function(r) {
 						if (!r) { renderRouter(); return; }
 						v6.on = !!r.on;
-						zm.toast(r.same ? 'Без изменений' : r.on ? 'IPv6 включён' : 'IPv6 выключен', 'info');
+						v6.mode = r.mode || (r.on ? 'on' : 'off');
+						if (r.same) zm.toast('Без изменений', 'info');
+						else if (x[0] === 'on' && v6.mode === 'lan') zm.toast('У роутера нет подключения IPv6 к провайдеру (wan6) — IPv6 работает только в домашней сети', 'warning', 8000);
+						else zm.toast(V6_DONE[v6.mode] || 'Готово', 'info');
 						renderRouter();
 					});
 				} }, x[1]);
 			}));
-			var v6hint = v6.on
-				? 'Устройства получают адреса IPv6. Часть сайтов может идти по IPv6 мимо Zapret и VPN — тогда выключите.' + (v6.wan6 && !v6.up ? ' Провайдер IPv6 сейчас не выдаёт.' : '')
-				: 'Устройства и роутер работают только по IPv4 — сайты не уходят в обход Zapret и VPN по IPv6.';
-			if (v6.pppoe) v6hint += ' Соединение PPPoE при переключении переподключится.';
+			var v6hint = v6mode === 'on'
+				? 'Устройства получают адреса IPv6 и ходят по нему в интернет. Часть сайтов может идти по IPv6 мимо Zapret и VPN — тогда выберите «Только дома» или выключите.' + (v6.wan6 && !v6.up ? ' Провайдер IPv6 сейчас не выдаёт.' : '')
+				: v6mode === 'lan'
+					? 'IPv6 работает только внутри домашней сети: устройства получают локальные адреса — работают AirPlay, Chromecast, умный дом и Matter. В интернет IPv6 не выходит, поэтому сайты не уходят в обход Zapret и VPN.'
+					: 'Устройствам IPv6 не раздаётся, в интернет — только IPv4. Если перестали находить друг друга устройства умного дома, AirPlay или Chromecast — выберите «Только дома».';
+			if (v6.pppoe && v6mode !== 'lan') v6hint += ' Соединение PPPoE при переключении переподключится.';
 			var tV6 = E('div', { 'class': 'zm-sx-tile' }, [
-				E('div', { 'class': 'zm-sx-head' }, [ E('span', { 'class': 'zm-sx-title' }, 'IPv6'), badge(!!v6.on, 'включён', 'выключен') ]),
+				E('div', { 'class': 'zm-sx-head' }, [ E('span', { 'class': 'zm-sx-title' }, 'IPv6'), v6mode === 'lan' ? badge(true, 'только дома', '', 'zm-sx-info') : badge(v6mode === 'on', 'включён', 'выключен') ]),
 				E('p', { 'class': 'zm-hint' }, v6hint),
 				E('div', { 'class': 'zm-sx-fill' }), v6seg
 			]);
@@ -33995,6 +35949,125 @@ return view.extend({
 		renderDevices();
 		put('devices', devCard);
 		anchor('Адреса устройств', devCard);
+
+		/* ---------- Родительский контроль ---------- */
+		var pcCard = E('div', { 'class': 'zm-card' }), pcEd = null;
+		var PC_DAYS = [ [ '1', 'Пн' ], [ '2', 'Вт' ], [ '3', 'Ср' ], [ '4', 'Чт' ], [ '5', 'Пт' ], [ '6', 'Сб' ], [ '7', 'Вс' ] ];
+		var PC_PRESETS = [ [ '1234567', 'Каждый день' ], [ '12347', 'Перед учебными днями' ], [ '12345', 'Будни' ], [ '67', 'Выходные' ] ];
+		function pcSort(d) { return String(d || '').split('').filter(function(c, i, a) { return /[1-7]/.test(c) && a.indexOf(c) === i; }).sort().join(''); }
+		function pcDays(d) {
+			d = pcSort(d);
+			var p = { '1234567': 'каждый день', '12345': 'по будням', '67': 'по выходным', '12347': 'перед учебными днями (вс–чт)' };
+			if (p[d]) return p[d];
+			return PC_DAYS.filter(function(x) { return d.indexOf(x[0]) >= 0; }).map(function(x) { return x[1].toLowerCase(); }).join(', ');
+		}
+		function pcDev(mac) { return ((st.devices || {}).list || []).filter(function(d) { return d.mac === mac; })[0] || null; }
+		function pcName(r) { var d = pcDev(r.mac); return (d && d.name) || r.name || r.mac; }
+		function pcState(r) {
+			if (r.blocked && r.why === 'pause') return badge(true, 'на паузе', '', 'zm-bad');
+			if (r.blocked) return badge(true, 'без интернета' + (r.until ? ' до ' + r.until : ''), '', 'zm-bad');
+			return badge(true, 'интернет есть', '');
+		}
+		function pcSave(arg, text) {
+			return call('parental', arg, '').then(function(r) {
+				if (!r) { reload(renderParental); return null; }
+				st.parental = r.parental || st.parental;
+				if (text) zm.toast(text, 'info');
+				renderParental();
+				return r;
+			});
+		}
+		function pcEditor() {
+			var e = pcEd, list = (st.parental || {}).list || [], box = E('div', { 'class': 'zm-pc-ed' });
+			if (e.isNew) {
+				var taken = {}; list.forEach(function(r) { taken[r.mac] = 1; });
+				var cand = ((st.devices || {}).list || []).filter(function(d) { return !taken[d.mac]; });
+				if (!cand.length) {
+					box.appendChild(E('p', { 'class': 'zm-hint' }, 'Все устройства, которые видит роутер, уже в списке.'));
+					box.appendChild(E('div', { 'class': 'zm-actions' }, [ E('button', { 'class': 'cbi-button', 'click': function() { pcEd = null; renderParental(); } }, 'Закрыть') ]));
+					return box;
+				}
+				if (!e.mac || !cand.some(function(d) { return d.mac === e.mac; })) e.mac = cand[0].mac;
+				var sel = E('select', { 'class': 'cbi-input-select zm-pc-sel', 'aria-label': 'Устройство', 'change': function() { e.mac = sel.value; } },
+					cand.map(function(d) { return E('option', { 'value': d.mac, 'selected': d.mac === e.mac ? '' : null }, (d.name || 'Без имени') + ' · ' + (d.ip || d.mac) + (d.online ? '' : ' · не в сети')); }));
+				box.appendChild(E('div', { 'class': 'zm-pc-line' }, [ E('span', { 'class': 'zm-label' }, 'Устройство'), sel ]));
+			} else {
+				box.appendChild(E('div', { 'class': 'zm-pc-line' }, [ E('span', { 'class': 'zm-label' }, 'Устройство'), E('b', {}, pcName(e)), E('span', { 'class': 'zm-ow-muted' }, ' · ' + e.mac) ]));
+			}
+			box.appendChild(zm.swRow(e.sched, 'По расписанию', 'Интернет сам выключится в выбранное время и включится обратно. Без расписания устройство отключается только кнопкой «Пауза».', function() { e.sched = !e.sched; renderParental(); }, !!busy));
+			if (e.sched) {
+				var tf = E('input', { 'type': 'time', 'class': 'cbi-input-text zm-pc-time', 'value': e.from, 'aria-label': 'Без интернета с', 'change': function() { e.from = tf.value; } });
+				var tt = E('input', { 'type': 'time', 'class': 'cbi-input-text zm-pc-time', 'value': e.to, 'aria-label': 'Без интернета до', 'change': function() { e.to = tt.value; } });
+				box.appendChild(E('div', { 'class': 'zm-pc-line' }, [ E('span', { 'class': 'zm-label' }, 'Без интернета'), E('span', {}, 'с'), tf, E('span', {}, 'до'), tt ]));
+				var days = E('div', { 'class': 'zm-seg zm-pc-days', 'role': 'group', 'aria-label': 'Дни' });
+				PC_DAYS.forEach(function(x) {
+					var on = e.days.indexOf(x[0]) >= 0;
+					days.appendChild(E('div', { 'class': 'zm-seg-item' + (on ? ' zm-active' : ''), 'role': 'checkbox', 'tabindex': '0', 'aria-checked': on ? 'true' : 'false',
+						'click': function() { e.days = on ? e.days.replace(x[0], '') : pcSort(e.days + x[0]); renderParental(); },
+						'keydown': function(ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); this.click(); } } }, x[1]));
+				});
+				box.appendChild(E('div', { 'class': 'zm-pc-line' }, [ E('span', { 'class': 'zm-label' }, 'Дни'), days ]));
+				box.appendChild(E('div', { 'class': 'zm-pc-line zm-pc-presets' }, [ E('span', { 'class': 'zm-label' }, '') ].concat(PC_PRESETS.map(function(x) {
+					return E('button', { 'type': 'button', 'class': 'zm-abj-link' + (pcSort(e.days) === x[0] ? ' zm-pc-on' : ''), 'click': function() { e.days = x[0]; renderParental(); } }, x[1]);
+				}))));
+				box.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin:2px 0 0' }, (e.from > e.to ? 'Перерыв переходит через полночь — отмечайте день, когда он начинается: ночь с воскресенья на понедельник — это воскресенье. ' : '') + 'Время — по часам роутера' + ((st.parental || {}).now ? ', сейчас на нём ' + st.parental.now : '') + '.'));
+			}
+			box.appendChild(E('div', { 'class': 'zm-actions' }, [
+				E('button', { 'class': 'cbi-button cbi-button-positive', 'disabled': busy ? '' : null, 'click': function() {
+					if (e.sched && !pcSort(e.days)) { zm.toast('Выберите хотя бы один день', 'warning'); return; }
+					if (e.sched && (!/^\d\d:\d\d$/.test(e.from) || !/^\d\d:\d\d$/.test(e.to))) { zm.toast('Укажите время — часы и минуты', 'warning'); return; }
+					var d = pcDev(e.mac), nm = (d && d.name) || e.name || '';
+					pcSave({ op: 'save', mac: e.mac, name: nm, sched: !!e.sched, from: e.from, to: e.to, days: pcSort(e.days) || '1234567' },
+						(nm || e.mac) + (e.isNew ? ': добавлено в родительский контроль' : ': сохранено')).then(function(r) { if (r) { pcEd = null; renderParental(); } });
+				} }, e.isNew ? 'Добавить' : 'Сохранить'),
+				E('button', { 'class': 'cbi-button', 'click': function() { pcEd = null; renderParental(); } }, 'Отмена')
+			]));
+			return box;
+		}
+		function renderParental() {
+			var pc = st.parental || {}, list = pc.list || [], off = list.filter(function(r) { return r.blocked; }).length;
+			pcCard.innerHTML = '';
+			pcCard.appendChild(E('h3', {}, [ 'Родительский контроль ', off ? badge(true, 'без интернета: ' + off, '', 'zm-bad') : list.length ? badge(true, 'устройств: ' + list.length, '') : E([]) ]));
+			pcCard.appendChild(E('p', { 'class': 'zm-hint', 'style': 'margin-top:-6px' }, 'Выключает интернет выбранным устройствам по расписанию — например, ночью — или сразу, кнопкой «Пауза». Локальная сеть и страница роутера остаются доступны, так что снять паузу можно с любого устройства.'));
+			list.forEach(function(r) {
+				var editing = pcEd && !pcEd.isNew && pcEd.mac === r.mac;
+				pcCard.appendChild(E('div', { 'class': 'zm-pc-row' + (r.blocked ? ' zm-pc-off' : '') }, [
+					E('div', { 'class': 'zm-pc-text' }, [
+						E('div', { 'class': 'zm-pc-name' }, [ E('b', {}, pcName(r)), pcState(r) ]),
+						E('div', { 'class': 'zm-pc-meta' }, (r.sched ? 'Без интернета ' + pcDays(r.days) + ' с ' + r.from + ' до ' + r.to : 'Без расписания — только «Пауза»') + ' · ' + r.mac)
+					]),
+					E('div', { 'class': 'zm-pc-btns' }, [
+						E('button', { 'class': 'cbi-button' + (r.pause ? ' cbi-button-positive' : ''), 'disabled': busy ? '' : null, 'click': function() {
+							pcSave({ op: r.pause ? 'resume' : 'pause', mac: r.mac }, pcName(r) + (r.pause ? ': пауза снята' + (r.sched ? ' — дальше по расписанию' : '') : ': интернет на паузе'));
+						} }, r.pause ? 'Снять паузу' : 'Пауза'),
+						E('button', { 'class': 'cbi-button', 'disabled': busy || editing ? '' : null, 'click': function() {
+							pcEd = { mac: r.mac, name: r.name, isNew: false, sched: !!r.sched, from: r.from || '22:00', to: r.to || '07:00', days: r.days || '1234567' };
+							renderParental();
+						} }, 'Изменить'),
+						E('button', { 'class': 'cbi-button cbi-button-remove', 'disabled': busy ? '' : null, 'click': function() {
+							zm.ask('Убрать «' + pcName(r) + '» из родительского контроля?\n\nИнтернет на нём больше не будет выключаться — ни по расписанию, ни паузой.', { okText: 'Убрать' }).then(function(yes) {
+								if (!yes) return;
+								if (pcEd && pcEd.mac === r.mac) pcEd = null;
+								pcSave({ op: 'del', mac: r.mac }, pcName(r) + ': убрано из родительского контроля');
+							});
+						} }, 'Убрать')
+					])
+				]));
+				if (editing) pcCard.appendChild(pcEditor());
+			});
+			if (pcEd && pcEd.isNew) pcCard.appendChild(pcEditor());
+			else if (list.length < (+pc.max || 32)) pcCard.appendChild(E('div', { 'class': 'zm-actions' }, [
+				E('button', { 'class': 'cbi-button cbi-button-action', 'disabled': busy ? '' : null, 'click': function() {
+					pcEd = { mac: '', name: '', isNew: true, sched: true, from: '22:00', to: '07:00', days: '1234567' };
+					renderParental();
+				} }, 'Добавить устройство')
+			]));
+			if (list.length && pc.live === false) pcCard.appendChild(E('p', { 'class': 'zm-hint zm-dlg-warn' }, '⚠ Правило файрвола сейчас не загружено — роутер вернёт его сам в течение пары минут.'));
+			if (list.length) pcCard.appendChild(E('p', { 'class': 'zm-hint' }, 'Устройство узнаётся по MAC-адресу: на телефоне или планшете ребёнка отключите «случайный MAC-адрес» для этой сети Wi-Fi, иначе ограничение его не увидит.' + (pc.cut === false ? ' Уже открытые соединения могут доработать несколько минут после начала перерыва.' : '')));
+		}
+		renderParental();
+		put('parental', pcCard);
+		anchor('Родительский контроль', pcCard);
 
 		/* ---------- Перезагрузка по расписанию ---------- */
 		var rbCard = E('div', { 'class': 'zm-card' });
@@ -34506,10 +36579,11 @@ return view.extend({
 
 		function renderSnap() {
 			var s = snap; if (!s) return;
-			var ncpu = s.ncpu || (s.cores || []).length || 1;
+			var ncpu = s.ncpu || (s.cores || []).length || 1, ncore = +s.ncore > 0 && +s.ncore < ncpu ? +s.ncore : ncpu;
+			var cpuTxt = ncore + ' ' + plural(ncore, 'ядро', 'ядра', 'ядер') + (ncore < ncpu ? ' · ' + ncpu + ' ' + plural(ncpu, 'поток', 'потока', 'потоков') : '');
 			devEl.textContent = s.model || s.soc || 'Роутер';
 			var cl = prev ? cpuNow.all : 0;
-			gCpu.set(cl, prev ? pct(cl) : '…', ncpu + ' ' + plural(ncpu, 'ядро', 'ядра', 'ядер') + (s.freq ? ' · ' + num(s.freq / 1000, 1) + ' ГГц' : s.fmax ? ' · до ' + num(s.fmax / 1000, 1) + ' ГГц' : ''),
+			gCpu.set(cl, prev ? pct(cl) : '…', cpuTxt + (s.freq ? ' · ' + num(s.freq / 1000, 1) + ' ГГц' : s.fmax ? ' · до ' + num(s.fmax / 1000, 1) + ' ГГц' : ''),
 				'нагрузка ' + (s.load || []).map(function(x) { return num(x, 2); }).join(' · '), level(cl, 70, 90));
 			var tc = cpuTemp(s);
 			if (tc == null) gTemp.set(0, '—', 'нет датчика', 'роутер не сообщает температуру', 'off');
@@ -34525,7 +36599,7 @@ return view.extend({
 			} else gFlash.set(0, '—', 'нет данных', 'роутер не сообщил размер', 'off');
 			drawChart();
 			coresBox.innerHTML = '';
-			(prev ? cpuNow.cores : (s.cores || []).map(function() { return 0; })).forEach(function(v, i) { coresBox.appendChild(meter('Ядро ' + (i + 1), v, level(v, 80, 95) === 'ok' ? 'acc' : level(v, 80, 95))); });
+			(prev ? cpuNow.cores : (s.cores || []).map(function() { return 0; })).forEach(function(v, i) { coresBox.appendChild(meter((ncore < ncpu ? 'Поток ' : 'Ядро ') + (i + 1), v, level(v, 80, 95) === 'ok' ? 'acc' : level(v, 80, 95))); });
 			splitBox.innerHTML = '';
 			[ [ 'программы', cpuNow.user ], [ 'система', cpuNow.sys ], [ 'прерывания', cpuNow.irq ], [ 'ожидание диска', cpuNow.io ] ].forEach(function(x) { splitBox.appendChild(tile(x[0], prev ? pct(x[1]) : '…')); });
 			freqEl.textContent = s.freq ? num(s.freq, 0) + ' МГц' : '';
@@ -34548,7 +36622,7 @@ return view.extend({
 					E('div', { 'class': 'zm-mon-bar' }, [ E('div', { 'class': 'zm-mon-fill zm-mon-heat', 'style': 'width:' + Math.max(2, Math.min(100, c)).toFixed(0) + '%' }) ]) ]));
 			});
 			infoBox.innerHTML = '';
-			[ [ 'Модель', s.model ], [ 'Чип', s.soc ], [ 'Процессор', (s.cpu_model ? s.cpu_model + ' · ' : '') + ncpu + ' ' + plural(ncpu, 'ядро', 'ядра', 'ядер') ],
+			[ [ 'Модель', s.model ], [ 'Чип', s.soc ], [ 'Процессор', (s.cpu_model ? s.cpu_model + ' · ' : '') + cpuTxt ],
 				[ 'Частота', s.fmax ? 'до ' + num(s.fmax, 0) + ' МГц' : '' ], [ 'Оперативная память', s.mem && s.mem.total ? mb(s.mem.total) : '' ],
 				[ 'Флеш', s.flash && s.flash[0] ? mb(s.flash[0]) : '' ], [ 'OpenWrt', s.openwrt ], [ 'Ядро Linux', s.kernel ],
 				[ 'Работает', upText(s.t) ], [ 'Процессов', s.tasks ? String(s.tasks) : '' ] ].forEach(function(r) {
@@ -35611,6 +37685,48 @@ return view.extend({
 
 		var busyMap = {};
 
+		function restartBtn(v) {
+			return E('button', {
+				'class': 'cbi-button',
+				'disabled': busyMap[v.id] ? '' : null,
+				'click': function() {
+					if (busyMap[v.id]) { zm.toast('Дождитесь завершения текущей операции', 'warning'); return; }
+					busyMap[v.id] = true;
+					renderCards(data);
+					zm.toast('Перезапускаем ' + v.title, 'warning');
+					zm.tgAction(v.id, 'restart').then(function(res) {
+						busyMap[v.id] = false;
+						if (!res || res.error) { zm.toast((res && res.error) || 'Роутер не ответил', 'error'); renderCards(data); return; }
+						data = res;
+						renderCards(res);
+						renderLinks(res);
+						var ok = statusOf(res, v.id).running;
+						zm.toast(ok ? v.title + ' перезапущен' : v.title + ' не запустился — проверьте порт и параметры', ok ? 'info' : 'error');
+					}).catch(function() { busyMap[v.id] = false; renderCards(data); zm.toast('Роутер не ответил', 'error'); });
+				}
+			}, 'Перезапустить');
+		}
+
+		function reinstallAsk(v) {
+			var proto = v.kind !== 'socks';
+			zm.dialog({
+				title: 'Переустановить ' + v.title + '?',
+				intro: 'Программа скачается и встанет заново. Пока идёт переустановка, Telegram через этот прокси не подключится. Если нужен просто перезапуск — нажмите «Перезапустить».',
+				blocks: [ { type: 'choice', id: 'how', value: 'keep', title: 'Настройки', options: [
+					{ id: 'keep', label: 'Сохранить', hint: proto ? 'Порт, ключ и параметры останутся — ссылка для Telegram не изменится' : 'Порт и параметры останутся прежними' },
+					{ id: 'clean', label: 'С нуля', warn: true, hint: proto ? 'Новый ключ и настройки по умолчанию — старая ссылка перестанет работать на всех устройствах' : 'Порт и параметры вернутся к настройкам по умолчанию' }
+				] } ],
+				okText: 'Переустановить'
+			}).then(function(r) {
+				if (!r) return;
+				if (r.how !== 'clean') { doAction(v.id, 'reinstall'); return; }
+				if (!proto) { doAction(v.id, 'reinstall_clean'); return; }
+				zm.dialog({ title: 'Сбросить ключ ' + v.title + '?', danger: true, okText: 'Сбросить и переустановить',
+					blocks: [ { type: 'note', kind: 'warn', text: 'Старая ссылка перестанет работать. Новую придётся заново отправить на все телефоны и компьютеры, где настроен этот прокси.' } ]
+				}).then(function(ok) { if (ok) doAction(v.id, 'reinstall_clean'); });
+			});
+		}
+
 		function renderCards(d) {
 			cards.innerHTML = '';
 			VARIANTS.forEach(function(v) {
@@ -35619,6 +37735,7 @@ return view.extend({
 				if (st.uci) {
 					var web = document.body.classList.contains('zmw-body');
 					actions.push(E('a', { 'class': 'cbi-button', 'href': L.url('admin/services/tg-ws-proxy-rs'), 'target': web ? '_blank' : null, 'rel': web ? 'noopener' : null }, 'Настройки пакета'));
+					if (st.enabled) actions.push(restartBtn(v));
 					pkgNote = E('p', { 'class': 'zm-hint' }, st.enabled
 						? 'Установлен пакетом luci-app-tg-ws-proxy-rs: порт, ключ и остальное меняются в его настройках, обновление и удаление — через менеджер пакетов.'
 						: 'Установлен пакетом luci-app-tg-ws-proxy-rs и выключен в его настройках — включите там «Enabled» и сохраните.');
@@ -35630,6 +37747,7 @@ return view.extend({
 						'aria-expanded': editOpen[v.id] ? 'true' : 'false',
 						'click': function() { editOpen[v.id] = !editOpen[v.id]; if (!editOpen[v.id]) delete editDraft[v.id]; renderCards(data); }
 					}, v.kind === 'socks' ? (hasArgs(v, st) ? 'Порт и параметры' : 'Изменить порт') : hasArgs(v, st) ? 'Порт, ключ и параметры' : 'Порт и ключ'));
+					actions.push(restartBtn(v));
 					actions.push(E('button', {
 						'class': 'cbi-button cbi-button-remove',
 						'click': function() {
@@ -35644,7 +37762,7 @@ return view.extend({
 					}, 'Удалить'));
 					actions.push(E('button', {
 						'class': 'cbi-button',
-						'click': function() { doAction(v.id, 'reinstall'); }
+						'click': function() { reinstallAsk(v); }
 					}, 'Переустановить'));
 					if (st.installed && st.newer) {
 						actions.push(E('button', {
@@ -35683,7 +37801,6 @@ return view.extend({
 			layoutCards();
 		}
 
-		// Две независимые колонки: раскрытая панель сдвигает вниз только свою колонку. На узком экране — одна колонка в прежнем порядке.
 		function layoutCards() {
 			var els = [], block = null, col = 0, n = 0;
 			Array.prototype.forEach.call(cards.children, function(ch) {
@@ -35710,7 +37827,7 @@ return view.extend({
 			busyMap[variantId] = true;
 			var job = action === 'remove' ? ('tg_remove_' + (variantId === 'mtproto' ? 'mtproto' : variantId))
 				: ('tg_install_' + (variantId === 'mtproto' ? 'mtproto' : variantId));
-			zm.toast((action === 'remove' ? 'Удаляем…' : action === 'reinstall' ? 'Переустанавливаем…' : action === 'update' ? 'Обновляем…' : 'Устанавливаем…'), 'warning');
+			zm.toast((action === 'remove' ? 'Удаляем…' : /^reinstall/.test(action) ? 'Переустанавливаем…' : action === 'update' ? 'Обновляем…' : 'Устанавливаем…'), 'warning');
 			zm.tgAction(variantId, action).then(function(res) {
 				if (res.error) { busyMap[variantId] = false; zm.toast(res.error, 'error'); return; }
 				if (res.started) {
@@ -35752,7 +37869,12 @@ return view.extend({
 				}, 'Удалить'));
 				actions.push(E('button', {
 					'class': 'cbi-button',
-					'click': function() { doTgwsAction('reinstall'); }
+					'click': function() {
+						zm.dialog({ title: 'Переустановить sTGWS?', okText: 'Переустановить',
+							intro: 'Программа удалится и встанет заново с начальными настройками. Пока идёт переустановка, Telegram через sTGWS не подключится.',
+							blocks: [ { type: 'note', text: 'Если нужен просто перезапуск — нажмите «Перезапустить».' } ]
+						}).then(function(v) { if (v) doTgwsAction('reinstall'); });
+					}
 				}, 'Переустановить'));
 				if (d.version && d.newer) {
 					actions.push(E('button', {
@@ -35966,7 +38088,7 @@ cat > '/www/zm/app.js' << 'ZM_INSTALLER_EOF'
 (function () {
 'use strict';
 
-var BUILD = '2831987345784290';
+var BUILD = '842146273571514';
 var RES = '/luci-static/resources/';
 var NULL_SID = '00000000000000000000000000000000';
 var K_SID = 'zmw.sid', K_THEME = 'zmw.theme', K_USER = 'zmw.user', K_NOTE = 'zmw.note', K_ANIM = 'zmw.anim', K_ANIMFOR = 'zmw.animfor', K_NAV = 'zmw.nav', K_LOOK = 'zmw.look';
@@ -37221,7 +39343,7 @@ var LOOK_ACC = [ '#2d5bff', '#7c5cff', '#0ea5e9', '#14b8a6', '#16a34a', '#f59e0b
 var LOOK_ZOOM = [ [ 0.9, '90%' ], [ 1, '100%' ], [ 1.1, '110%' ], [ 1.2, '120%' ] ];
 var ANIM_RE = /^(stars|traffic|music|matrix|neon|synth|noir|metro|embers|lava|fire|metal|silk|ink|plasma|warp)$/, ANIM_HEAVY = /^(matrix|neon|synth|noir|metro|embers|lava|fire|metal|silk|ink|plasma|warp)$/, ANIM_DARK = /^(matrix|neon|synth|noir|embers|lava|fire|metal|silk|ink|plasma|warp)$/;
 var LOOK_VIS = [ 'acc', 'tint', 'tcol', 'font', 'mono', 'rad', 'bord', 'shad', 'glass' ];
-var LOOK_DEF = { acc: '', tint: '', tcol: '', font: 'theme', mono: 'theme', zoom: 1, dens: 'n', rad: 'md', bord: 'md', shad: 'md', ctr: 'n', motion: 1, glass: 1, radio: 1, fps: 60, dpr: 2, pause: 1, batt: 0, react: 1, my: null };
+var LOOK_DEF = { acc: '', tint: '', tcol: '', font: 'theme', mono: 'theme', zoom: 1, dens: 'n', rad: 'md', bord: 'md', shad: 'md', ctr: 'n', motion: 1, glass: 1, radio: 1, fps: 60, dpr: 2, pause: 1, batt: 0, react: 1, bg: '', bgt: '', my: null };
 function lookPick(list, v) { return list.filter(function (x) { return x.id === v; })[0]; }
 function lookClean(o) {
 	var r = {}, k;
@@ -37241,6 +39363,7 @@ function lookClean(o) {
 	[ 'motion', 'glass', 'radio', 'pause', 'batt', 'react' ].forEach(function (b) { if (o[b] === 0 || o[b] === 1) r[b] = o[b]; });
 	if ([ 15, 30, 60 ].indexOf(+o.fps) >= 0) r.fps = +o.fps;
 	if (+o.dpr === 1 || +o.dpr === 2) r.dpr = +o.dpr;
+	if ((o.bg === '0' || ANIM_RE.test(o.bg || '')) && /^[a-z]+$/.test(o.bgt || '')) { r.bg = o.bg; r.bgt = o.bgt; }
 	r.my = myClean(o.my);
 	return r;
 }
@@ -37287,6 +39410,7 @@ function lookSync() {
 		LOOK = o;
 		sset(K_LOOK, lookJson(), true);
 		if (themePref() === 'custom' && LOOK.my) { sset(K_ANIM, LOOK.my.a || '0', true); animMark(); }
+		bgFromRouter();
 		lookApply(); applyTheme(); dustSync();
 		if (lookPageRender) lookPageRender();
 	}).catch(function () {});
@@ -37427,12 +39551,24 @@ function mySnap() {
 	return myClean(o);
 }
 function animMark() { sset(K_ANIMFOR, themePref() || 'auto', true); }
+function bgKeep() {
+	var t = themePref() || 'auto', v = themeAnimNorm(sget(K_ANIM)) || '0';
+	if (LOOK.bg === v && LOOK.bgt === t) return;
+	LOOK.bg = v; LOOK.bgt = t;
+	lookSave();
+}
+function bgFromRouter() {
+	if (!LOOK.bg || LOOK.bgt !== (themePref() || 'auto') || sget(K_ANIM) === LOOK.bg) return;
+	sset(K_ANIM, LOOK.bg, true);
+	animMark();
+}
 function animFix() {
 	var t = themePref() || 'auto', f = sget(K_ANIMFOR), v = sget(K_ANIM);
 	if (f === t && v != null) return;
 	if (f == null && v != null && !(v === '0' && themeFx())) { animMark(); return; }
 	sset(K_ANIM, themeFx() || '0', true);
 	animMark();
+	bgFromRouter();
 }
 function animKind() { var v = sget(K_ANIM); if (lookOnBattery()) return ''; if (v === '1') return 'stars'; if (v === 'theme') return themeFx(); return ANIM_RE.test(v || '') ? v : ''; }
 function animReact() { var k = animKind(); return !!k && (k === 'music' || !!LOOK.react); }
@@ -38582,6 +40718,7 @@ var animMenuEls = null;
 function animSet(id) {
 	sset(K_ANIM, id || '0', true);
 	animMark();
+	bgKeep();
 	if (LOOK.my && themePref() === 'custom') { var a = themeAnimNorm(id || ''); if (LOOK.my.a !== a) { LOOK.my.a = a; lookSave(); } }
 	dustSync();
 	animMenuPaint();
@@ -38642,6 +40779,7 @@ function themeSync() {
 		sset(K_THEME, t === 'auto' ? null : t, true);
 		sset(K_ANIM, themeFx() || '0', true);
 		animMark();
+		bgFromRouter();
 		applyTheme();
 		lookApply();
 		dustSync();
@@ -38660,6 +40798,7 @@ function setTheme(id, keep) {
 	themeSave(id);
 	if (!keep) sset(K_ANIM, themeFx() || '0', true);
 	animMark();
+	bgKeep();
 	document.documentElement.classList.add('zmw-theme-anim');
 	applyTheme();
 	lookApply();
@@ -38958,7 +41097,7 @@ function lookPage() {
 			LOOK = lookClean(o.look); lookSave();
 			if (radio.show !== !!LOOK.radio) window.zmwRadio.set(!!LOOK.radio);
 			th = o.theme === 'minimal' ? 'micro' : o.theme === 'blocks' ? 'contrast' : o.theme;
-			if (o.anim === '0' || o.anim === 'theme' || o.anim === '1' || ANIM_RE.test(o.anim || '')) { sset(K_ANIM, o.anim, true); animMark(); }
+			if (o.anim === '0' || o.anim === 'theme' || o.anim === '1' || ANIM_RE.test(o.anim || '')) { sset(K_ANIM, o.anim, true); animMark(); bgKeep(); }
 			if (th && (th === 'auto' || themeById(th))) setTheme(th, true);
 			else { lookApply(); applyTheme(); dustSync(); }
 			toast('Настройки оформления применены', 'info');
@@ -39515,8 +41654,8 @@ function applyBoard(i) {
 }
 function applySys(i) {
 	if (!i || i.error) return;
-	var ru = parseSize(i.root_used), rf = parseSize(i.root_free);
-	if (isFinite(ru) && isFinite(rf)) memRow('flash', 'Флеш', ru, ru + rf);
+	var ru = parseSize(i.root_used), rf = parseSize(i.root_free), rt = parseSize(i.root_total);
+	if (isFinite(ru) && isFinite(rf)) memRow('flash', 'Флеш', ru, rt > 0 ? rt : ru + rf);
 	var t = parseFloat(i.cpu_temp);
 	if (!isNaN(t)) tempRow(t);
 	var cl = parseInt(i.cpu_load, 10);
@@ -39553,8 +41692,13 @@ function refreshShellStatus() {
 		});
 	}).then(applyHealth).catch(function () {}).then(function () { statusBusy = false; });
 }
+var lastZapretDot = null;
 function applyHealth(h) {
 	if (!h) return;
+	if (typeof h.zapret === 'number') {
+		if (lastZapretDot !== null && lastZapretDot !== h.zapret) { try { window.dispatchEvent(new Event('zm:zstatus')); } catch (e) {} }
+		lastZapretDot = h.zapret;
+	}
 	navFromHealth(h);
 	renderAlerts(h);
 	Object.keys(navDots).forEach(function(k) {
@@ -41418,12 +43562,6 @@ html[data-theme="bento"] #zmw-view .zm-seg-item.zm-active, html[data-theme="retr
 .zmw-theme-group:first-child { padding-top: 4px; }
 .zmw-theme-opt { min-width: 0; }
 .zmw-theme-opt > span:nth-of-type(1) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.zmw-anim-group { margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--border); }
-.zmw-anim-seg { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; padding: 3px; margin: 0 2px 2px; border-radius: 12px; background: var(--surface-2); }
-.zmw-anim-seg .zmw-theme-opt { flex-direction: column; justify-content: center; gap: 4px; padding: 8px 2px 7px; font-size: 12px; font-weight: 600; text-align: center; }
-.zmw-anim-seg .zmw-theme-opt > span:nth-of-type(1) { flex: none; max-width: 100%; }
-.zmw-anim-seg.zmw-anim-seg5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-.zmw-anim-seg.zmw-anim-seg5 .zmw-theme-opt { font-size: 11px; padding-left: 0; padding-right: 0; }
 .zmw-bg-head { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin-top: 4px; padding: 10px 6px 4px 10px; border-top: 1px solid var(--border); }
 .zmw-bg-title { flex: 1; min-width: 0; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
 .zmw-bg-hide { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 10px 0 8px; border-radius: 9px; border: 1px solid var(--border-2); background: var(--surface-solid); color: var(--text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap; }
@@ -41455,9 +43593,6 @@ html.zm-bgo-idle, html.zm-bgo-idle * { cursor: none !important; }
 .zmw-bgo-hint.zmw-bgo-off { opacity: 0; }
 @media (max-width: 480px) { .zmw-bg-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } .zmw-bg-hide span { display: none; } .zmw-bg-hide { padding: 0 8px; } }
 @media (prefers-reduced-motion: reduce) { .zmw-bgo, .zmw-bgo-hint, html.zm-bg-only body > * { transition: none !important; } }
-html[data-theme="micro"] .zmw-anim-group { border-top-color: #e3e6ee; }
-html[data-theme="micro"] .zmw-anim-seg { background: #f0f3fa; }
-html[data-theme="retro"] .zmw-anim-seg, html[data-theme="matrix"] .zmw-anim-seg, html[data-theme="neon"] .zmw-anim-seg, html[data-theme="noir"] .zmw-anim-seg { border-radius: 0; }
 html[data-theme="micro"] .zmw-bg-head { border-top-color: #e3e6ee; }
 html[data-theme="micro"] .zmw-bg-react { background: #f0f3fa; }
 html[data-theme="retro"] :is(.zmw-bg-tile, .zmw-bg-react, .zmw-bg-hide), html[data-theme="matrix"] :is(.zmw-bg-tile, .zmw-bg-react, .zmw-bg-hide), html[data-theme="neon"] :is(.zmw-bg-tile, .zmw-bg-react, .zmw-bg-hide), html[data-theme="noir"] :is(.zmw-bg-tile, .zmw-bg-react, .zmw-bg-hide), html[data-zm-rad="sharp"] :is(.zmw-bg-tile, .zmw-bg-react, .zmw-bg-hide) { border-radius: 0; }
@@ -42310,8 +44445,6 @@ html[data-theme="ink"] #zmw-view .zm-zp-own { border-color: #0a0a0a; }
 html[data-theme="micro"] #zmw-view :is(.zm-zp-note, .zm-zp-sum, .zm-zp-legend, .zm-zp-cur summary, .zm-zp-own) { color: #000000; }
 html[data-theme="micro"] #zmw-view .zm-zp-own { border-color: #000000; }
 html[data-theme="matrix"] #zmw-view .zm-zp-note { color: var(--text); }
-html[data-theme="metro"] .zmw-anim-group { border-top-color: #e1e1dc; }
-html[data-theme="metro"] .zmw-anim-seg { background: #efefeb; }
 html[data-theme="metro"] .zmw-bg-head { border-top-color: #e1e1dc; }
 html[data-theme="metro"] .zmw-bg-react { background: #efefeb; }
 html[data-theme="metro"] {
@@ -42416,7 +44549,7 @@ html[data-zm-acc] { --a1: var(--zm-acc) !important; --a2: var(--zm-acc) !importa
 html[data-zm-acc] #zmw-view .zm-seg-item.zm-active, html[data-zm-acc] .zm-dock .zm-seg-item.zm-active, html[data-zm-acc] .zmw-modal .zm-seg-item.zm-active,
 html[data-zm-acc] #zmw-view .cbi-button-positive, html[data-zm-acc] .zm-dock .cbi-button-positive, html[data-zm-acc] .zmw-modal .cbi-button-positive, html[data-zm-acc] .zm-refresh-banner .cbi-button-positive,
 html[data-zm-acc] #zmw-view .zmw-tabs .cbi-button-positive, html[data-zm-acc] #zmw-view .zm-tile.zm-active, html[data-zm-acc] #zmw-view .zm-svc-dom.zm-active,
-html[data-zm-acc] .zmw-nav-item.zmw-active .zmw-nav-ico, html[data-zm-acc] .zmw-btn-primary, html[data-zm-acc] .zmw-nav-gear.zmw-on, html[data-zm-acc] .zmw-anim-seg .zmw-theme-opt.zmw-on {
+html[data-zm-acc] .zmw-nav-item.zmw-active .zmw-nav-ico, html[data-zm-acc] .zmw-btn-primary, html[data-zm-acc] .zmw-nav-gear.zmw-on {
 	background: var(--zm-acc) !important; color: var(--zm-on) !important; border-color: transparent !important; box-shadow: none !important; outline-color: var(--zm-acc) !important;
 }
 html[data-zm-acc] #zmw-view .cbi-button-positive:hover, html[data-zm-acc] .zm-dock .cbi-button-positive:hover, html[data-zm-acc] .zmw-modal .cbi-button-positive:hover { background: color-mix(in srgb, var(--zm-acc) 86%, #000) !important; color: var(--zm-on) !important; }
@@ -42598,7 +44731,7 @@ cat > '/www/zm-webui.html' << 'ZM_INSTALLER_EOF'
 <title>Zapret Manager</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%201250%201250%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27z%27%20x1=%270%27%20y1=%270%27%20x2=%270%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%2300b6ff%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%230090ff%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg%20fill=%27url%28%23z%29%27%20stroke=%27%230a0a0a%27%20stroke-width=%2722%27%20stroke-linejoin=%27miter%27%3E%3Cpolygon%20points=%27455,170%201072,118%201215,25%20688,615%2025,1235%20735,338%20262,383%27/%3E%3Cpolygon%20points=%271025,462%20722,860%201215,800%201005,1022%20315,1095%27/%3E%3C/g%3E%3C/svg%3E">
 <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%201250%201250%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27z%27%20x1=%270%27%20y1=%270%27%20x2=%270%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%2300b6ff%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%230090ff%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg%20fill=%27url%28%23z%29%27%20stroke=%27%230a0a0a%27%20stroke-width=%2722%27%20stroke-linejoin=%27miter%27%3E%3Cpolygon%20points=%27455,170%201072,118%201215,25%20688,615%2025,1235%20735,338%20262,383%27/%3E%3Cpolygon%20points=%271025,462%20722,860%201215,800%201005,1022%20315,1095%27/%3E%3C/g%3E%3C/svg%3E">
-<link rel="stylesheet" href="/zm/app.css?v=2831987345784290">
+<link rel="stylesheet" href="/zm/app.css?v=842146273571514">
 <script>
 (function(){try{var h=document.documentElement,t=null,b=null,re=/^(micro|light|dark|ink|bento|retro|depth|graphite|oled|matrix|neon|synth|noir|contrast|metro|custom)$/,bre=/^(micro|light|dark|ink|bento|retro|depth|graphite|oled|matrix|neon|synth|noir|contrast|metro)$/;function fix(v){v=String(v||'').trim();return v==='blocks'?'contrast':v==='minimal'?'micro':v;}function get(u){try{var x=new XMLHttpRequest();x.open('GET',u+'?t='+Date.now(),false);x.send(null);return x.status===200?String(x.responseText||''):'';}catch(e){return '';}}var v=fix(get('/zm/theme.txt'));if(re.test(v)){t=v;try{localStorage.setItem('zmw.theme',v);}catch(e){}}if(!t){try{t=fix(localStorage.getItem('zmw.theme')||sessionStorage.getItem('zmw.theme'));}catch(e){}}if(!re.test(t||''))t='micro';if(t==='custom'){var j=null;try{j=JSON.parse(get('/zm/look.json')||'null');}catch(e){}if(!j||!j.my){try{j=JSON.parse(localStorage.getItem('zmw.look')||'null');}catch(e){}}b=j&&j.my&&bre.test(j.my.b||'')?j.my.b:'micro';}else b=t;h.setAttribute('data-theme',b);if(/^(dark|depth|graphite|oled|matrix|neon|synth|noir|contrast)$/.test(b))h.classList.add('zm-theme-dark');}catch(e){}})();
 </script>
@@ -42606,7 +44739,7 @@ cat > '/www/zm-webui.html' << 'ZM_INSTALLER_EOF'
 <body class="zmw-body">
 <div id="zmw-root"></div>
 <noscript><p style="padding:24px;font-family:sans-serif">Для работы панели Zapret Manager нужен JavaScript.</p></noscript>
-<script src="/zm/app.js?v=2831987345784290"></script>
+<script src="/zm/app.js?v=842146273571514"></script>
 </body>
 </html>
 ZM_INSTALLER_EOF
@@ -42625,7 +44758,7 @@ if [ -s /opt/zapret-manager-luci/state/cron.saved ]; then
         esac
         _zm_cmd="${_zm_l#*/opt/zapret-manager-luci/backend.sh }"
         case "${_zm_cmd%% *}" in
-            zm_watch|versions_cron|autoupd_run|zm_cleanup|adblock_cron|adblock_stats_tick|tg_auto_tick|awg_action|tsc_watch|tsc_lan_ip|owrt_reboot_run) ;;
+            zm_watch|versions_cron|autoupd_run|zm_cleanup|adblock_cron|adblock_stats_tick|tg_auto_tick|awg_action|tsc_watch|tsc_lan_ip|owrt_reboot_run|pc_tick) ;;
             *) continue ;;
         esac
 		grep -qxF "$_zm_l" /etc/crontabs/root 2>/dev/null || echo "$_zm_l" >> /etc/crontabs/root
@@ -42660,20 +44793,35 @@ if [ -s /opt/zapret-manager-luci/state/ui.look ]; then
 fi
 
 _zmi_ok "Файлы Web UI записаны"
-_zmi_say "Включаем Web UI"
 ZMW_OK=1
-if [ ! -f /etc/config/uhttpd ]; then
+ZMW_P=7788
+if [ -s /opt/zapret-manager-luci/state/webui ]; then
+	_zm_p="$(sed -n 's/^port=\([0-9][0-9]*\)$/\1/p' /opt/zapret-manager-luci/state/webui | head -n 1)"
+	[ -n "$_zm_p" ] && [ "${#_zm_p}" -le 5 ] && [ "$_zm_p" -ge 1 ] 2>/dev/null && [ "$_zm_p" -le 65535 ] && ZMW_P="$_zm_p"
+	grep -qx 'on=0' /opt/zapret-manager-luci/state/webui && ZMW_OK=2
+fi
+if [ "$ZMW_OK" = 2 ]; then
+	_zmi_say "Web UI выключен в «Система» — оставляем выключенным"
+	mv -f /www/zm-webui.html /opt/zapret-manager-luci/state/webui.html 2>/dev/null || true
+	if uci -q get uhttpd.zmweb >/dev/null; then uci -q delete uhttpd.zmweb; uci commit uhttpd; fi
+else
+	_zmi_say "Включаем Web UI"
+	rm -f /opt/zapret-manager-luci/state/webui.html
+fi
+if [ "$ZMW_OK" = 2 ]; then
+	:
+elif [ ! -f /etc/config/uhttpd ]; then
 	ZMW_OK=0
 elif [ ! -e /usr/lib/uhttpd_ubus.so ]; then
 	_zmi_pkg uhttpd-mod-ubus "Web UI без него не откроется, панель в LuCI работает." || true
 	[ -e /usr/lib/uhttpd_ubus.so ] || ZMW_OK=0
 fi
-if [ "$ZMW_OK" = 0 ]; then
+if [ "$ZMW_OK" != 1 ]; then
 	:
 elif ! uci -q get uhttpd.zmweb >/dev/null; then
 	uci set uhttpd.zmweb=uhttpd
-	uci add_list uhttpd.zmweb.listen_http='0.0.0.0:7788'
-	uci add_list uhttpd.zmweb.listen_http='[::]:7788'
+	uci add_list uhttpd.zmweb.listen_http="0.0.0.0:$ZMW_P"
+	uci add_list uhttpd.zmweb.listen_http="[::]:$ZMW_P"
 	uci set uhttpd.zmweb.home='/www'
 	uci set uhttpd.zmweb.index_page='zm-webui.html'
 	uci set uhttpd.zmweb.ubus_prefix='/ubus'
@@ -42734,7 +44882,9 @@ umask 077
 installer="$(mktemp /tmp/zm-install.XXXXXX)"
 trap 'rm -f "$installer"' EXIT HUP INT TERM
 url="https://raw.githubusercontent.com/Ra1nek/Zapret-Manager/main/ZapretManager_LuCI.sh"
-if command -v curl >/dev/null 2>&1; then
+if [ -x /opt/zapret-manager-luci/backend.sh ]; then
+    /opt/zapret-manager-luci/backend.sh gh_get "$url" "$installer" 180
+elif command -v curl >/dev/null 2>&1; then
     curl -fL --connect-timeout 15 --max-time 180 "$url" -o "$installer"
 else
     wget -O "$installer" "$url"
@@ -42792,6 +44942,7 @@ if [ -x /etc/init.d/rpcd ] || [ -x /etc/init.d/uhttpd ]; then
 	fi
 fi
 if [ "$ZMW_OK" = 1 ]; then _zmi_ok "Web UI включён на порту ${ZMW_PORT:-7788}"
+elif [ "$ZMW_OK" = 2 ]; then _zmi_ok "Web UI выключен — включить его и сменить порт можно в LuCI: Zapret Manager → Система → Web UI"
 else _zmi_warn "Web UI не включён: на роутере нет веб-сервера uhttpd или не установился uhttpd-mod-ubus"; fi
 echo -e "\n${GREEN}Готово: Zapret Manager для LuCI и Web $ZM_NEW_VER установлен${NC}\n"
 echo -e "${CYAN}LuCI:   ${NC}Службы → Zapret Manager"

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Based on StressOzz/Zapret-Manager 5.050; modified for Forkop and NFQWS2.
+# Based on StressOzz/Zapret-Manager 5.064; modified for Forkop and NFQWS2.
 GREEN="\033[1;32m"; CYAN="\033[1;36m"; YELLOW="\033[1;33m"; MAGENTA="\033[1;35m"; NC="\033[0m"; DGRAY="\033[38;5;244m"
 ZMS_URL="${ZM_INSTALLER_URL:-https://raw.githubusercontent.com/Ra1nek/Zapret-Manager/main/ZapretManager_LuCI.sh}"
 ZMS_MIRRORS="gh-proxy.org ghfast.top gh.llkk.cc ghproxy.net"
