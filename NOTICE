@@ -10,3 +10,10 @@ This product includes software developed by StressOzz
 Zapret Manager downloads, installs and configures third-party software
 (Zapret, sing-box, Mihomo, WARP and others). That software is not part of
 Zapret Manager and is distributed by its authors under their own licenses.
+
+Proton VPN profile generation adapts the approach of avatarDD/zapret-gui.
+Copyright (c) 2026 avatarDD. MIT License.
+https://github.com/avatarDD/zapret-gui
+The MIT license is included in the installer and installed as
+/opt/zapret-manager-luci/licenses/avatarDD-zapret-gui.txt.
+The Proton generation service is provided by https://proton-generation.github.io/.
