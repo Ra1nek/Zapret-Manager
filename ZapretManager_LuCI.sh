@@ -1,8 +1,8 @@
 #!/bin/sh
-# Modified from StressOzz/Zapret-Manager 5.064 for Forkop/NFQWS2.
+# Modified from StressOzz/Zapret-Manager 5.069 for Forkop/NFQWS2.
 # Original project: https://github.com/StressOzz/Zapret-Manager
 read -r _ _ ZM_NEW_VER <<'ZM_VERSION_EOF'
-# Version: 5.064.1
+# Version: 5.069
 ZM_VERSION_EOF
 set -e
 
@@ -177,7 +177,7 @@ if [ "$1" = zm_watch ]; then
 fi
 
 CONF="/etc/config/zapret"
-ZM_VERSION="5.064.1"
+ZM_VERSION="5.069"
 ZM_SCRIPT_URL="https://raw.githubusercontent.com/Ra1nek/Zapret-Manager/refs/heads/main/ZapretManager_LuCI.sh"
 ZM_STATS_URL="http://89.191.225.101:8787"
 ZM_STATS_OFF="/etc/zapret-manager.nostats"
@@ -1494,9 +1494,11 @@ _zm_arch_alts() {
 	return 0
 }
 _zm_arch_accept() {
-	local a="$1" c="${ZM_OPKG_CONF:-/etc/opkg.conf}" f="${ZM_APK_ARCH:-/etc/apk/arch}" n
+	local a="$1" c="${ZM_OPKG_CONF:-/etc/opkg.conf}" f="${ZM_APK_ARCH:-/etc/apk/arch}" n cur
 	case " $ZM_A73_ALTS " in *" $a "*) ;; *) return 0 ;; esac
-	[ "$(_zm_arch)" = "$ZM_A73" ] || return 0
+	cur="$(_zm_arch)"
+	[ "$cur" = "$a" ] && return 0
+	case "$cur" in aarch64_*) ;; *) return 0 ;; esac
 	if [ "$PKG" = apk ]; then
 		[ -d "${f%/*}" ] || return 0
 		if [ ! -s "$f" ]; then
@@ -1510,14 +1512,14 @@ _zm_arch_accept() {
 		[ -f "$c" ] || return 0
 		if ! grep -q '^[[:space:]]*arch[[:space:]]' "$c"; then
 			n="$(opkg print-architecture 2>/dev/null | awk '$1 == "arch" && NF >= 3 { print "arch " $2 " " $3 }')"
-			case "$n" in *"$ZM_A73"*) ;; *) return 0 ;; esac
+			case "$n" in *aarch64*) ;; *) return 0 ;; esac
 			{ [ -z "$(tail -c 1 "$c")" ] || echo; printf '%s\n' "$n"; } >> "$c" || return 1
 		fi
 		grep -qE "^[[:space:]]*arch[[:space:]]+$a([[:space:]]|\$)" "$c" && return 0
 		{ [ -z "$(tail -c 1 "$c")" ] || echo; echo "arch $a 5"; } >> "$c" || return 1
 	fi
-	echo "   · Разрешили ставить пакеты $a — на $ZM_A73 они работают (тот же набор команд ARMv8.0)" >&2
-	logger -t zapret-manager "Разрешены пакеты $a (совместимы с $ZM_A73)"
+	echo "   · Разрешили ставить пакеты $a — на $cur они работают (тот же набор команд ARMv8.0)" >&2
+	logger -t zapret-manager "Разрешены пакеты $a (совместимы с $cur)"
 	return 0
 }
 
@@ -2276,7 +2278,79 @@ zapret_restart() {
 	_zs2_sync
 	chmod -R a+rX /opt/zapret/ipset /opt/zapret/files 2>/dev/null
 	[ -x /opt/zapret/sync_config.sh ] && /opt/zapret/sync_config.sh >/dev/null 2>&1
+	_zp_rsp_fix; rm -f "$ZP_RSP_WAIT"
 	/etc/init.d/zapret restart >/dev/null 2>&1
+}
+
+# Автоперезапуск nfqws/tpws: procd поднимает упавший процесс через 5 с. Строка живёт в init-скрипте
+# пакета Zapret, обновление Zapret её стирает — панель возвращает её при установке, перезапуске и в стороже.
+# 300 — сколько секунд процесс должен проработать, чтобы счётчик сбоев обнулился; 5 — пауза перед подъёмом;
+# 5 — сколько раз подряд поднимать, если процесс падает быстрее: при битой стратегии procd не крутит его вечно.
+ZP_RSP_INIT="/opt/zapret/init.d/openwrt/zapret"
+ZP_RSP_LINE='	procd_set_param respawn 300 5 5 # zm-respawn'
+ZP_RSP_WAIT="$JOBS_DIR/zp.respawn"
+ZP_RSP_SKIP="$JOBS_DIR/zp.respawn.skip"
+
+_zp_rsp_ok() {
+	awk -v add="$ZP_RSP_LINE" '/^run_daemon\(\)/ { fn = 1 } fn && /^}/ { fn = 0 }
+		fn && /procd_set_param[[:space:]]+respawn/ { n++; if ($0 == add) m++ } END { exit !(n == 1 && m == 1) }' "$ZP_RSP_INIT" 2>/dev/null
+}
+
+# 0 — строка вписана сейчас; 1 — уже стоит или Zapret нет; 2 — init-скрипт непривычного вида, его не трогаем
+_zp_rsp_fix() {
+	local f="$ZP_RSP_INIT" t
+	[ -f "$f" ] || return 1
+	_zp_rsp_ok && return 1
+	[ -f "$ZP_RSP_SKIP" ] && [ ! "$f" -nt "$ZP_RSP_SKIP" ] && return 2
+	t="$f.zm.$$"
+	if awk -v add="$ZP_RSP_LINE" '/^run_daemon\(\)/ { fn = 1 } fn && /^}/ { fn = 0 }
+		fn && /procd_set_param[[:space:]]+respawn/ { next } { print }
+		fn && !done && /^[[:space:]]*procd_open_instance[[:space:]]*$/ { print add; done = 1 }
+		END { exit !done }' "$f" > "$t" 2>/dev/null && sh -n "$t" 2>/dev/null; then
+		if [ -x "$f" ]; then chmod 755 "$t"; else chmod 644 "$t"; fi
+		if mv -f "$t" "$f"; then
+			rm -f "$ZP_RSP_SKIP"
+			logger -t zapret-manager "Zapret: включён автоперезапуск nfqws при сбое"
+			return 0
+		fi
+	fi
+	rm -f "$t"
+	mkdir -p "$JOBS_DIR"; : > "$ZP_RSP_SKIP"
+	logger -t zapret-manager "Zapret: init-скрипт непривычного вида — автоперезапуск nfqws не включён, файл не тронут"
+	return 2
+}
+
+# 0 — у запущенного Zapret автоперезапуск уже действует (или Zapret не запущен)
+_zp_rsp_live() {
+	local j r a
+	pgrep -f "/opt/zapre[t]/" >/dev/null 2>&1 || return 0
+	j="$(ubus -t 5 call service list '{"name":"zapret"}' 2>/dev/null)"
+	[ -n "$j" ] || return 0
+	r="$(printf '%s' "$j" | jsonfilter -e '@.zapret.instances[*].running' 2>/dev/null | grep -c true)"
+	a="$(printf '%s' "$j" | jsonfilter -e '@.zapret.instances[*].respawn.retry' 2>/dev/null | grep -c .)"
+	[ "${r:-0}" -le "${a:-0}" ] 2>/dev/null
+}
+
+# Вписывает строку и, если Zapret сейчас работает без автоперезапуска, перезапускает его —
+# но не во время операций панели, теста стратегий и неприменённых изменений: тогда откладывает до сторожа.
+# now — без этих проверок: так зовёт сама установка Zapret, пакет уже запустил его со старым init-скриптом
+_zp_rsp_sync() {
+	local ch=false rs=false
+	if [ ! -f "$ZP_RSP_INIT" ]; then rm -f "$ZP_RSP_WAIT"
+	else
+		_zp_rsp_fix && ch=true
+		if _zp_rsp_ok && ! _zp_rsp_live; then
+			if [ "$1" != now ] && { _zm_busy_job >/dev/null 2>&1 || _pend_on || [ -s "$TEST_BACKUP" ]; }; then
+				mkdir -p "$JOBS_DIR"; : > "$ZP_RSP_WAIT"
+			else
+				rm -f "$ZP_RSP_WAIT"
+				/etc/init.d/zapret restart >/dev/null 2>&1
+				logger -t zapret-manager "Zapret перезапущен, чтобы включился автоперезапуск nfqws"
+				rs=true
+			fi
+		else rm -f "$ZP_RSP_WAIT"; fi
+	fi
+	printf '{"changed":%s,"restarted":%s}\n' "$ch" "$rs"
 }
 
 _strat_label() {
@@ -2373,6 +2447,7 @@ _z2_luci_path() {
 }
 
 _z2_arch() { awk -F\' '/DISTRIB_ARCH/ {print $2}' /etc/openwrt_release 2>/dev/null; }
+_z2_arch_ok() { case "$(_z2_arch)" in aarch64_*) return 0 ;; esac; return 1; }
 
 ZM_STR_DIR="$ZM_STATE_DIR/str"
 ZM_STR_URL="${GH_RAW}/StressOzz/Zapret-Manager/refs/heads/main/files"
@@ -5081,7 +5156,14 @@ _mx_installed() { [ -x "$MIHOMO_BIN" ] || [ -x /etc/init.d/mihomo ]; }
 
 MT_ALL_GID="2a11c0de"
 MT_ALL_RID="2a11c0d1"
-_mt_all_on() { [ -f "$MAGITRICKLE_CONF" ] && grep -qE "^- id: [\"']?${MT_ALL_GID}[\"']?[[:space:]]*\$" "$MAGITRICKLE_CONF"; }
+_mt_all_on() {
+	[ -f "$MAGITRICKLE_CONF" ] && awk -v g="$MT_ALL_GID" '
+		/^- id:/ { v = $0; sub(/^- id:[ \t]*/, "", v); gsub(/["\047 \t\r]/, "", v); ing = (v == g); if (ing) found = 1; next }
+		/^[^ -]/ { ing = 0 }
+		ing && /^  enable:[ \t]*["\047]?false/ { goff = 1 }
+		ing && /^    enable:/ { rany = 1; if ($0 ~ /^    enable:[ \t]*["\047]?true/) ron = 1 }
+		END { exit !(found && !goff && (ron || !rany)) }' "$MAGITRICKLE_CONF"
+}
 
 _mx_secret_get() {
 	local sec
@@ -8931,6 +9013,7 @@ case "$cmd" in
 	zsec2_status)                         zsec2_status ;;
 	zsec2_action)                         zsec2_action "$1" "$2" ;;
 	zsec2_sync)                           zsec2_sync ;;
+	zapret_respawn_sync)                  _zp_rsp_sync ;;
 	zram_action)                          zram_action "$1" ;;
 	events)                               zm_events "$1" ;;
 	events_clear)                         zm_events_clear ;;
@@ -8998,6 +9081,7 @@ _zm_pkg_fmt() {
 		/linuxfw: clear ip6?tables: exec: "ip6?tables": executable file not found/ { next }
 		/router: enumerating tailscale0 addresses for cleanup failed/ { next }
 		/^steer: / && /apk database|Resource temporarily unavailable/ { if (!stlk++) print "     · плагины ядра steer поставим сразу после пакета"; next }
+		/^  [A-Za-z0-9][^ ]*-[0-9][^ ]*:$/ { l = $0; sub(/^ +/, "", l); sub(/:$/, "", l); if (!seen[l]++) print "     ! пакет " l; next }
 		/[Ee]rror|ERROR|Collected errors|^ \* |[Uu]nknown package|not found|No such|unable|cannot|failed|Failed|unsatisfiable|breaks:/ { l = $0; sub(/^[ *]+/, "", l); if (l != "" && !seen[l]++) print "     ! " l; next }
 	'
 }
@@ -14625,7 +14709,13 @@ _do_autobest_core() {
 
 _ver_feed_latest() {
 	if [ "$PKG" = apk ]; then
-		apk list "$1" 2>/dev/null | sed -n "s/^$1-\([0-9][^ ]*\) .*/\1/p" | head -n1
+		apk list "$1" 2>/dev/null | sed -n "s/^$1-\([0-9][^ ]*\) .*/\1/p" | {
+			local b="" v
+			while read -r v; do
+				if [ -z "$b" ] || _st_ver_lt "$(echo "$b" | tr - .)" "$(echo "$v" | tr - .)"; then b="$v"; fi
+			done
+			[ -n "$b" ] && echo "$b"
+		}
 	else
 		opkg list "$1" 2>/dev/null | awk -v p="$1" '$1 == p { v = $3 } END { print v }'
 	fi
@@ -14649,6 +14739,7 @@ _vl() { [ -n "$ZM_VER_LOCAL" ] && return 0; "$@"; }
 do_versions_refresh() {
 	local out="" sep="" j tmp="$VERSIONS_CACHE.tmp" ts at via
 	ZM_VER_OLD="$JOBS_DIR/versions.old"
+	[ -n "$ZM_VER_LOCAL" ] || [ -n "$(_zm_busy_job)" ] || $UPDATE >/dev/null 2>&1
 	sed 's/},{/}\n{/g' "$VERSIONS_CACHE" 2>/dev/null | sed -n 's/.*"name":"\([^"]*\)","installed":"[^"]*","latest":"\([^"]*\)".*/\1\t\2/p' > "$ZM_VER_OLD"
 	add() { [ -n "$1" ] && { out="$out$sep$1"; sep=","; }; }
 	j="$(zm_update_status)"
@@ -14665,6 +14756,7 @@ do_versions_refresh() {
 	if _awg_installed; then
 		v="$(_awg_pkg_ver amneziawg-tools)"; add "$(_ver_item AmneziaWG "$v" "$v")"
 	fi
+	_tsc_installed && _zmL remote && add "$(_ver_item Tailscale "$(_tsc_ver)" "$(_vl _tsc_gh_latest)")"
 	if [ -n "$ZM_VER_LOCAL" ]; then
 		ts="$(sed -n 's/^{"ts":"\([^"]*\)".*/\1/p' "$VERSIONS_CACHE" 2>/dev/null)"
 		at="$(sed -n 's/.*"at":\([0-9]*\).*/\1/p' "$VERSIONS_CACHE" 2>/dev/null)"
@@ -16514,6 +16606,7 @@ watch_status_upstream() {
 	b=false; _st_installed && [ ! -f "$ST_OFF" ] && b=true
 	b=false; [ -f "$TG_WATCH_FLAG" ] && _tg_any_installed && b=true
 	_wi tg "TG WS Proxy" "Перезапускает прокси для Telegram, если он перестал работать" "$b"
+	b=false; [ -f "$ZP_RSP_INIT" ] && b=true
 	b=false; [ "$(_dn_get ru off)" = isp ] && b=true
 	b=false; [ "$(_ver_mode)" = day ] && b=true
 	_wi ver "Поиск новых версий" "$([ "$(_ver_every)" = 24 ] && echo "Раз в сутки, в $(_ver_time)" || echo "Каждые $(_ver_every) ч, начиная с $(_ver_time)"), узнаёт, вышли ли обновления панели и компонентов. Выключено — Дашборд проверит сам при открытии, если с прошлой проверки прошли сутки" "$b"
@@ -20960,7 +21053,14 @@ _st_tun_check() {
 	fi
 	tr="$(curl -s --interface "$d" --connect-timeout 5 --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
 	ip="$(printf '%s\n' "$tr" | sed -n 's/^ip=//p')"
-	if [ -n "$ip" ]; then echo "[ OK ] $nm · $i: трафик идёт (выход $ip)"; return 0; fi
+	if [ -n "$ip" ]; then
+		if ping -c 2 -W 2 -I "$d" 1.1.1.1 >/dev/null 2>&1 || ping -c 2 -W 2 -I "$d" 8.8.8.8 >/dev/null 2>&1; then
+			echo "[ OK ] $nm · $i: трафик идёт (выход $ip)"; return 0
+		fi
+		echo "[FAIL] $nm · $i: сайты через туннель открываются (выход $ip), но на ping он не отвечает — а ядро steer проверяет готовые туннели именно пингом (1.1.1.1, 8.8.8.8) и сочтёт этот нерабочим"
+		echo "       Туннель поверх SOCKS-прокси (hev-socks5-tunnel): добавьте в его конфиг в раздел tunnel строку «icmp: 'reply'» и перезапустите его"
+		return 1
+	fi
 	case "$(_zm_tun_kind "$i")" in
 		awg) echo "[FAIL] $nm · $i: трафик через туннель не идёт — почините его на вкладке AmneziaWG" ;;
 		*) echo "[FAIL] $nm · $i: трафик через туннель не идёт — проверьте подключение в Сеть → Интерфейсы" ;;
@@ -22155,6 +22255,20 @@ _stl_vpn_outs() {
 	printf '%s' "$o"
 }
 
+_stl_world_drop() {
+	local w=/etc/apk/world
+	[ -f "$w" ] || return 0
+	awk -v drop=" $* " '{ n = $0; sub(/[<>=~].*$/, "", n) } index(drop, " " n " ") { next } { print }' "$w" > "$w.zm" && cat "$w.zm" > "$w"
+	rm -f "$w.zm"
+}
+
+_stl_world_unban() {
+	[ -f /etc/apk/world ] || return 0
+	grep -qE '^!(steer|steer-core|steer-extended|libsteer|libsteer-wolfssl)$' /etc/apk/world || return 0
+	sed -i -E '/^!(steer|steer-core|steer-extended|libsteer|libsteer-wolfssl)$/d' /etc/apk/world
+	_stl_say "Сняли старый запрет на пакеты steer из списка пакетов роутера — он мешал новому ядру"
+}
+
 _test_prepare_urls() {
 	local out="$1"
 	: > "$out"
@@ -22684,6 +22798,15 @@ stl_engine_install() {
 		[ "$p" = steer-core ] && STL_CORE_ARCH="$pa"
 		files="$files $f"
 	done
+	local needk freek
+	needk=$(( $(cat $files 2>/dev/null | wc -c) * 3 / 1024 ))
+	freek="$(df -k /usr 2>/dev/null | awk 'END { print $(NF-2) }')"
+	case "$freek" in ''|*[!0-9]*) freek="" ;; esac
+	if [ -n "$freek" ] && [ "$freek" -lt "$needk" ]; then
+		rm -f $files
+		echo "ОШИБКА: на роутере мало места для ядра steer $ver — нужно около $(( needk / 1024 + 1 )) МБ, свободно $(( freek / 1024 )) МБ. Ядро не трогали: освободите место и повторите"
+		return 1
+	fi
 	stl_enabled && was_on=1
 	case " $pkgs " in *" steer-core "*) _stl_say "Ставим ядро steer $ver: $(echo $pkgs | sed 's/ /, /g')" ;; *) _stl_say "Ставим к ядру steer $ver: $(echo $pkgs | sed 's/ /, /g')" ;; esac
 	$UPDATE >&2
@@ -22705,10 +22828,22 @@ stl_engine_install() {
 			$INSTALL --force-reinstall $files >&2; rc=$?
 		fi
 	elif [ "$PKG" = apk ]; then
-		for n in $legacy; do if [ "$n" = steer ]; then apk add steer >/dev/null 2>&1; else old="$old !$n"; fi; done
-		[ -n "$p21" ] && old="$old $(awk -F'><' 'NF > 1 && $1 ~ /^steer-(vless|hysteria2|proxy|xsteer|obfs|warpbox|tgws|extended)$/ { print $1 }' /etc/apk/world 2>/dev/null)"
-		$INSTALL $files $old >&2; rc=$?
-		[ "$rc" = 0 ] && for n in $legacy; do apk del "$n" >/dev/null 2>&1; done
+		_stl_world_unban
+		if [ -n "$p21" ]; then
+			# Ядро 2.1+ само «содержит» steer, steer-extended и libsteer: запрет «!имя» запретил бы и его.
+			# Прежние пакеты убираем из world — apk снимет их в той же операции, что ставит новое ядро
+			cp -f /etc/apk/world "$STL_TMP/world.zm" 2>/dev/null
+			[ -n "$legacy" ] && _stl_world_drop $legacy
+			old="$(awk -F'><' 'NF > 1 && $1 ~ /^steer-(vless|hysteria2|proxy|xsteer|obfs|warpbox|tgws|extended)$/ { print $1 }' /etc/apk/world 2>/dev/null)"
+			$INSTALL $files $old >&2; rc=$?
+			[ "$rc" = 0 ] || { [ -s "$STL_TMP/world.zm" ] && cat "$STL_TMP/world.zm" > /etc/apk/world; }
+			rm -f "$STL_TMP/world.zm"
+		else
+			for n in $legacy; do if [ "$n" = steer ]; then apk add steer >/dev/null 2>&1; else old="$old !$n"; fi; done
+			$INSTALL $files $old >&2; rc=$?
+			[ "$rc" = 0 ] && for n in $legacy; do apk del "$n" >/dev/null 2>&1; done
+			_stl_world_unban
+		fi
 	else
 		if [ -n "$legacy" ]; then
 			old="$(stl_version)"; back=""
@@ -22754,6 +22889,8 @@ stl_engine_install() {
 	_stl_say "Ядро steer $(stl_version) установлено$( [ -n "$mods" ] && printf ', модули: %s' "$(echo $mods | sed 's/ /, /g')")"
 	return 0
 }
+
+# Убирает из /etc/apk/world запреты «!steer…», которые оставляли прежние установки: с ними новое ядро не ставится
 
 stl_spec_restore() { if [ -s "$STL_KEEP" ]; then mv -f "$STL_KEEP" "$STL_SPEC"; else rm -f "$STL_SPEC"; fi; }
 
@@ -24541,7 +24678,7 @@ chmod 0644 /www/luci-static/resources/view/zapret-manager/nfqws2.js
 
 mkdir -p /www/luci-static/resources/zapret-manager
 cat > /www/luci-static/resources/zapret-manager/build.txt << 'ZM_INSTALLER_EOF'
-1452834946117785
+391798713407788
 view/zapret-manager/adblock.js
 view/zapret-manager/awg.js
 view/zapret-manager/dashboard.js
@@ -25644,7 +25781,7 @@ function detectMissingThemeVar() {
 	} catch (e) {  }
 }
 
-var ZM_BUILD = '1452834946117785';
+var ZM_BUILD = '391798713407788';
 
 function cssUrl(path) {
 	return L.resource(path) + (/^[0-9]{6,}$/.test(ZM_BUILD) ? '?v=' + ZM_BUILD : '');
@@ -28141,6 +28278,120 @@ function settle(fetch, done, onStep, maxMs) {
 }
 function changed(detail) { try { window.dispatchEvent(new CustomEvent('zm:changed', { detail: detail || {} })); } catch (e) {} }
 
+var FIND_SCOPES = [
+	[ 'svc', 'Сервисы и категории', 'Плитки «Сервисы» и «Категории» этой вкладки' ],
+	[ 'extra', 'Дополнительные списки', 'Готовые наборы: Tachyon, b4geoip и ваши «Мои списки»' ],
+	[ 'all', 'Везде', 'Сервисы, категории и дополнительные списки сразу' ]
+];
+var findMem = {};
+function findPref(k, v) {
+	if (v !== undefined) { findMem[k] = v; try { localStorage.setItem('zm-find-' + k, v); } catch (e) {} return v; }
+	if (findMem[k] !== undefined) return findMem[k];
+	try { return localStorage.getItem('zm-find-' + k); } catch (e) { return null; }
+}
+function findScopeGet() { var s = findPref('scope'); return s === 'extra' || s === 'all' ? s : 'svc'; }
+function findDlOk(on) { if (on) findPref('dl', '1'); return findPref('dl') === '1'; }
+function findIsExtra(h) { var g = String((h && h.group) || ''); return !!g && !/^c_itdoginfo_/.test(String(h.id || '')) && !/^itdoginfo/i.test(g); }
+function findInScope(h, sc) { return !h || h.id === 'custom' || sc === 'all' || (sc === 'extra') === findIsExtra(h); }
+function findPlural(n, a, b, c) { var x = n % 100, y = n % 10; return x > 10 && x < 20 ? c : y === 1 ? a : y >= 2 && y <= 4 ? b : c; }
+function findLists(n) { return n + ' ' + findPlural(n, 'список', 'списка', 'списков'); }
+
+function findScopeRow(sc, onPick) {
+	var row = E('div', { 'class': 'zm-find-scope' });
+	function draw() {
+		row.innerHTML = '';
+		var chips = E('div', { 'class': 'zm-find-chips', 'role': 'group', 'aria-label': 'Где искать' }, [ E('span', { 'class': 'zm-find-scope-k' }, 'Где искать') ]);
+		var hint = '';
+		FIND_SCOPES.forEach(function(s) {
+			var on = s[0] === sc;
+			if (on) hint = s[2];
+			chips.appendChild(E('button', { 'type': 'button', 'class': 'zm-find-chip' + (on ? ' zm-active' : ''), 'aria-pressed': on ? 'true' : 'false',
+				'click': function() { if (on) return; sc = s[0]; findPref('scope', sc); draw(); onPick(sc); } }, s[1]));
+		});
+		row.appendChild(chips);
+		row.appendChild(E('div', { 'class': 'zm-find-scope-hint' }, hint));
+	}
+	draw();
+	row.set = function(v) { sc = v; findPref('scope', v); draw(); };
+	return row;
+}
+
+function findStateNew() { return { total: 0, last: -1, at: 0, stopped: false, stalled: false, skip: false, dl: 0 }; }
+function findRem(r) { return (parseInt(r.missing, 10) || 0) + (parseInt(r.pend, 10) || 0); }
+function findWorking(r, st) { return !!r && !r.error && !(r.ask && !st.skip) && findRem(r) > 0 && !st.stopped && !st.stalled; }
+// Через сколько мс спросить роутер ещё раз (0 — больше не спрашивать): пока списки готовятся и есть движение, без ограничения по числу раз
+function findNext(r, st) {
+	if (!r || r.error || r.ask || st.stopped) return 0;
+	var rem = findRem(r);
+	if (rem > st.total) st.total = rem;
+	if (rem <= 0) return 0;
+	if (rem !== st.last) { st.last = rem; st.at = Date.now(); }
+	if (!st.at) st.at = Date.now();
+	if (Date.now() - st.at > 120000) { st.stalled = true; return 0; }
+	return r.dl === 'wait' ? 5000 : 2500;
+}
+
+var FIND_DL_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 4v11"/><path d="M7 10.5l5 5 5-5"/><path d="M5 20h14"/></svg>';
+var FIND_WARN_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 3.5l9 16.5H3z"/><path d="M12 10v4.5"/><path d="M12 17.6v.1"/></svg>';
+function findIco(cls, svg) { var el = E('span', { 'class': 'zm-find-card-ico ' + cls, 'aria-hidden': 'true' }); el.innerHTML = svg; return el; }
+function findBtn(txt, prim, fn) { return E('button', { 'type': 'button', 'class': 'cbi-button' + (prim ? ' cbi-button-action' : ''), 'click': fn }, txt); }
+
+// Карточки состояния под результатами: спросить про скачивание, прогресс, итог со сбоями
+function findState(r, st, act) {
+	var out = [];
+	if (!r || r.error) return out;
+	var miss = parseInt(r.missing, 10) || 0, fail = parseInt(r.failed, 10) || 0, rem = findRem(r);
+	if (r.ask && !st.skip) {
+		out.push(E('div', { 'class': 'zm-find-card zm-find-card-ask' }, [
+			findIco('zm-find-ico-dl', FIND_DL_ICO),
+			E('div', { 'class': 'zm-find-card-t' }, [ E('b', {}, findLists(miss) + ' ещё нет на роутере'), E('span', {}, 'Скачаем один раз — дальше поиск по ним сразу') ]),
+			E('div', { 'class': 'zm-find-card-a' }, [ findBtn('Скачать и искать', true, act.download), findBtn('Без них', false, act.skip) ])
+		]));
+		return out;
+	}
+	if (findWorking(r, st)) {
+		var total = Math.max(st.total, rem), done = Math.max(0, total - rem), pct = total ? Math.round(done * 100 / total) : 0;
+		var label = r.dl === 'wait' ? 'Скачаем после операции Steer' : miss > 0 ? 'Скачиваем списки' : 'Готовим списки к поиску';
+		out.push(E('div', { 'class': 'zm-find-card zm-find-card-run', 'aria-live': 'polite' }, [
+			E('div', { 'class': 'zm-find-run-top' }, [
+				E('span', { 'class': 'zm-find-spin', 'aria-hidden': 'true' }),
+				E('div', { 'class': 'zm-find-card-t' }, [ E('b', {}, label), E('span', {}, done + ' из ' + total) ]),
+				miss > 0 ? findBtn('Остановить', false, act.stop) : ''
+			]),
+			E('div', { 'class': 'zm-find-bar', 'role': 'progressbar', 'aria-label': label, 'aria-valuemin': '0', 'aria-valuemax': String(total), 'aria-valuenow': String(done) }, [
+				E('span', { 'style': 'width:' + pct + '%' })
+			]),
+			E('div', { 'class': 'zm-find-run-hint' }, 'Найденное появляется сразу — окно можно закрыть')
+		]));
+		return out;
+	}
+	if (st.stopped && rem > 0) {
+		out.push(E('div', { 'class': 'zm-find-card zm-find-card-warn' }, [
+			findIco('zm-find-ico-warn', FIND_WARN_ICO),
+			E('div', { 'class': 'zm-find-card-t' }, [ E('b', {}, 'Скачивание остановлено'), E('span', {}, 'Не проверено: ' + findLists(rem)) ]),
+			E('div', { 'class': 'zm-find-card-a' }, [ findBtn('Продолжить', false, act.retry) ])
+		]));
+	} else if (fail > 0 || (st.stalled && rem > 0)) {
+		var nb = fail + (st.stalled ? miss : 0);
+		out.push(E('div', { 'class': 'zm-find-card zm-find-card-warn' }, [
+			findIco('zm-find-ico-warn', FIND_WARN_ICO),
+			E('div', { 'class': 'zm-find-card-t' }, nb > 0
+				? [ E('b', {}, findLists(nb) + ' не ' + (nb % 10 === 1 && nb % 100 !== 11 ? 'скачался' : 'скачались')), E('span', {}, 'Нет связи с GitHub — поиск шёл по остальным') ]
+				: [ E('b', {}, 'Не все списки готовы'), E('span', {}, 'Роутер долго их собирает — поиск шёл по готовым') ]),
+			E('div', { 'class': 'zm-find-card-a' }, [ findBtn('Повторить', false, act.retry) ])
+		]));
+	}
+	return out;
+}
+// Пусто ли окончательно: поиск закончен и смотреть больше негде
+function findDone(r, st) { return !!r && !r.error && !findWorking(r, st); }
+// Пустой результат: заголовок и куда искать дальше
+function findEmptyNext(sc) {
+	return sc === 'svc' ? { title: 'В сервисах и категориях сайта нет', go: 'extra', btn: 'Искать в дополнительных списках' }
+		: sc === 'extra' ? { title: 'В дополнительных списках сайта нет', go: 'all', btn: 'Искать везде' }
+		: { title: 'Сайта нет ни в одном списке', go: '', btn: '' };
+}
+
 return baseclass.extend({
 	injectCss: injectCss,
 	badge: badge,
@@ -28299,6 +28550,15 @@ return baseclass.extend({
 	forkopAction: bigArg2(callForkopAction),
 	dock: dock,
 	riCovers: riCovers,
+	findScopeRow: findScopeRow,
+	findScopeGet: findScopeGet,
+	findDlOk: findDlOk,
+	findInScope: findInScope,
+	findStateNew: findStateNew,
+	findNext: findNext,
+	findState: findState,
+	findDone: findDone,
+	findEmptyNext: findEmptyNext,
 	svcPickToggle: svcPickToggle,
 	svcIco: svcIco,
 	riNote: riNote,
@@ -28738,7 +28998,7 @@ return view.extend(managerAdapt({
 		if (!document.body.classList.contains('zmw-body')) wrap.appendChild(zm.alertBanners(healthData, function() { location.reload(); }));
 		if (!document.body.classList.contains('zmw-body')) wrap.appendChild(E('div', { 'class': 'zm-header' }, [
 			E('h2', {}, 'Zapret Manager для LuCI и Web'),
-			E('span', { 'class': 'zm-header-by' }, 'На основе версии 5.064 · StressOzz'),
+			E('span', { 'class': 'zm-header-by' }, 'На основе версии 5.069 · StressOzz'),
 			E('div', { 'class': 'zm-header-links' }, [
 				E('a', { 'href': 'http://stresskvn.lol/', 'target': '_blank', 'rel': 'noreferrer' }, 'StressKVN — обход белых списков!'),
 				E('a', { 'href': 'https://t.me/stressozz_manager', 'target': '_blank', 'rel': 'noreferrer' }, 'Сообщество Telegram'),
@@ -32534,6 +32794,38 @@ html.zm-theme-dark .zm-find-tag-dom { color: #c4b5fd; } html.zm-theme-dark .zm-f
 .zm-find-foot .cbi-button { flex: 1; margin: 0; min-height: 44px; font-weight: 700; }
 .zm-find-spin { display: inline-block; flex-shrink: 0; width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(124,92,255,.25); border-top-color: #7c5cff; animation: zmFindSpin .8s linear infinite; }
 .zm-find-empty > .zm-find-spin { width: 20px; height: 20px; opacity: 1; }
+.zm-find-scope { flex-shrink: 0; display: flex; flex-direction: column; gap: 7px; padding: 11px 22px 12px; border-bottom: 1px solid rgba(110,118,129,.14); }
+.zm-find-chips { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.zm-find-scope-k { font-size: 11.5px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; opacity: .65; margin-right: 3px; }
+.zm-find-chip { height: 32px; margin: 0; padding: 0 13px; border-radius: 10px; border: 1px solid rgba(110,118,129,.3); background: rgba(110,118,129,.06); color: inherit; font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
+.zm-find-chip:not(.zm-active):hover { border-color: rgba(124,92,255,.55); }
+.zm-find-chip:focus-visible { outline: 2px solid #6d4cff; outline-offset: 2px; }
+.zm-find-chip.zm-active { background: #6d4cff; border-color: #6d4cff; color: #fff; cursor: default; }
+.zm-find-scope-hint { font-size: 12.5px; opacity: .7; }
+.zm-find-go { display: flex; align-items: center; gap: 11px; width: 100%; box-sizing: border-box; margin: 4px 0 0; padding: 12px 14px; border-radius: 14px; border: 1px dashed rgba(124,92,255,.5); background: transparent; color: inherit; font: inherit; font-size: 14px; font-weight: 700; text-align: left; cursor: pointer; }
+.zm-find-go:hover { background: rgba(124,92,255,.07); }
+.zm-find-go:focus-visible { outline: 2px solid #6d4cff; outline-offset: 2px; }
+.zm-find-go > span:nth-child(2) { flex: 1; }
+.zm-find-go .zm-find-go-ico { display: inline-flex; width: 17px; height: 17px; color: #6d4cff; }
+.zm-find-go .zm-find-go-ico > svg { width: 100%; height: 100%; }
+.zm-find-go-arr { color: #6d4cff; font-size: 16px; }
+.zm-find-card { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 12px; margin: 10px 0 0; padding: 12px 14px; border-radius: 14px; border: 1px solid rgba(124,92,255,.28); background: rgba(124,92,255,.06); }
+.zm-find-card-ico { display: inline-flex; flex-shrink: 0; width: 20px; height: 20px; }
+.zm-find-card-ico > svg { width: 100%; height: 100%; }
+.zm-find-ico-dl { color: #6d4cff; }
+.zm-find-ico-warn { color: #9a6700; }
+.zm-find-card-t { flex: 1 1 220px; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 13.5px; }
+.zm-find-card-t > span { font-size: 12.5px; opacity: .75; }
+.zm-find-card-a { display: flex; gap: 8px; flex-wrap: wrap; }
+.zm-find-card .cbi-button { margin: 0; min-height: 36px; font-weight: 700; }
+.zm-find-card-warn { border-color: rgba(154,103,0,.35); background: rgba(212,167,44,.1); }
+.zm-find-card-run { flex-direction: column; align-items: stretch; }
+.zm-find-run-top { display: flex; align-items: center; gap: 11px; }
+.zm-find-run-top .zm-find-card-t { flex-direction: row; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.zm-find-bar { height: 6px; border-radius: 999px; background: rgba(124,92,255,.16); overflow: hidden; }
+.zm-find-bar > span { display: block; height: 100%; border-radius: 999px; background: #6d4cff; transition: width .4s ease; }
+.zm-find-run-hint { font-size: 12px; opacity: .7; }
+html.zm-theme-dark .zm-find-ico-warn { color: #e3b341; }
 @keyframes zmFindFade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes zmFindIn { from { opacity: 0; transform: translateY(-8px) scale(.985); } to { opacity: 1; transform: none; } }
 @keyframes zmFindSpin { to { transform: rotate(360deg); } }
@@ -32543,6 +32835,8 @@ html.zm-theme-dark .zm-find-tag-dom { color: #c4b5fd; } html.zm-theme-dark .zm-f
 	.zm-find-field { height: 58px; padding: 0 12px 0 16px; }
 	.zm-find-input { font-size: 16px; }
 	.zm-find-tag { display: none; }
+	.zm-find-scope { padding: 10px 14px 11px; }
+	.zm-find-chip { height: 36px; }
 }
 @media (prefers-reduced-motion: reduce) { .zm-find-wrap, .zm-find { animation: none; } .zm-find-spin { animation: zmFindSpin .9s linear infinite !important; } }
 .zm-st-stats.zm-st-stats-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -38430,7 +38724,7 @@ cat > '/www/zm/app.js' << 'ZM_INSTALLER_EOF'
 (function () {
 'use strict';
 
-var BUILD = '1452834946117785';
+var BUILD = '391798713407788';
 var RES = '/luci-static/resources/';
 var NULL_SID = '00000000000000000000000000000000';
 var K_SID = 'zmw.sid', K_THEME = 'zmw.theme', K_USER = 'zmw.user', K_NOTE = 'zmw.note', K_ANIM = 'zmw.anim', K_ANIMFOR = 'zmw.animfor', K_NAV = 'zmw.nav', K_LOOK = 'zmw.look';
@@ -41481,7 +41775,7 @@ function currentRoute() {
 
 var root, shell = null, viewEl, titleEl, subEl, navLinks = {}, navDots = {}, deviceEl, verEl, updateEl, memEl;
 
-var NAV_LOCK = { dashboard: 1, pages: 1, thanks: 1 }, NAV_BUILTIN = { dashboard: 1, look: 1, system: 1, openwrt: 1, watch: 1, monitor: 1, cleanup: 1, sysinfo: 1, backup: 1, pages: 1, thanks: 1 };
+var NAV_LOCK = { dashboard: 1, thanks: 1 }, NAV_BUILTIN = { dashboard: 1, look: 1, system: 1, openwrt: 1, watch: 1, monitor: 1, cleanup: 1, sysinfo: 1, backup: 1, pages: 1, thanks: 1 };
 var PAGES_OFF = navParse(sget('zmw.pgoff')), navHidden = navParse(sget(K_NAV)), navEdit = null, navSaving = false, navGroups = [], navGear = null, navNav = null, navHealth = null;
 var K_NAVFOLD = 'zmw.navfold', navFold = (function () { var o = {}; try { (JSON.parse(sget(K_NAVFOLD) || '[]') || []).forEach(function (k) { if (typeof k === 'string') o[k] = 1; }); } catch (e) {} return o; })();
 function navFoldSet(g, shut) {
@@ -41570,12 +41864,14 @@ function navUninstalled() {
 	if (!navEdit) return;
 	var h = navHealth || {}, d = h.dots || {}, n = 0;
 	ROUTES.forEach(function (r) {
-		if (!r.dot || NAV_BUILTIN[r.id]) return;
+		if (NAV_LOCK[r.id]) return;
+		if (NAV_BUILTIN[r.id]) { if (!navEdit[r.id]) { navEdit[r.id] = 1; n++; } return; }
+		if (!r.dot) return;
 		var st = typeof d[r.dot] === 'number' ? d[r.dot] : h[r.dot];
 		if (st === 0 && !navEdit[r.id]) { navEdit[r.id] = 1; n++; }
 	});
 	navApply();
-	toast(n ? 'Отмечено неустановленных и невключённых: ' + n + ' — нажмите «Готово»' : (navHealth ? 'Неустановленных разделов нет' : 'Состояние компонентов ещё загружается — попробуйте через пару секунд'), 'info');
+	toast(n ? 'Отмечено неустановленных, невключённых и разделов «Сервис»: ' + n + ' — нажмите «Готово»' : (navHealth ? 'Неустановленных разделов нет' : 'Состояние компонентов ещё загружается — попробуйте через пару секунд'), 'info');
 }
 function navAll() { if (navEdit) { navEdit = {}; navApply(); } }
 function navDone() {
@@ -44109,6 +44405,18 @@ html.zm-theme-dark .zm-find { background: var(--surface-solid, #1c2128); color: 
 .zm-find .zm-switch.zm-switch-on { background: var(--grad, #1aa3ff); }
 .zm-find .cbi-button { border-radius: 12px; }
 .zm-find .cbi-button-action { background: var(--grad); border-color: transparent; color: #fff; }
+.zm-find-scope { border-bottom-color: var(--border, rgba(110,118,129,.14)); }
+.zm-find-scope-k, .zm-find-scope-hint, .zm-find-card-t > span, .zm-find-run-hint { color: var(--muted); opacity: 1; }
+.zm-find-chip { border-color: var(--border-2, var(--border)); background: var(--surface-2); color: var(--text); }
+.zm-find-chip:not(.zm-active):hover { border-color: var(--a1, #6d4cff); }
+.zm-find-chip.zm-active { background: var(--grad, #6d4cff); border-color: transparent; color: #fff; }
+.zm-find-go { border-color: var(--a1, rgba(124,92,255,.5)); color: var(--text); }
+.zm-find-go:hover { background: var(--surface-2); }
+.zm-find-go .zm-find-go-ico, .zm-find-go-arr, .zm-find-ico-dl { color: var(--a1, #6d4cff); }
+.zm-find-card { background: var(--surface-2); border-color: var(--border-2, var(--border)); }
+.zm-find-card-warn { background: rgba(212,167,44,.12); border-color: rgba(212,167,44,.45); }
+.zm-find-bar { background: var(--border, rgba(124,92,255,.16)); }
+.zm-find-bar > span { background: var(--grad, #6d4cff); }
 .zm-find .cbi-button[disabled] { opacity: .55; }
 .zmw-modal.zm-find { width: 100%; max-width: 640px; max-height: 82vh; padding: 0; overflow: hidden; border-radius: 22px; border: 1px solid rgba(124,92,255,.42); }
 .zmw-modal.zm-find .zm-find-input, .zmw-modal.zm-find .zm-find-input:focus { width: auto; height: 44px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; font-size: 19px; }
@@ -45073,7 +45381,7 @@ cat > '/www/zm-webui.html' << 'ZM_INSTALLER_EOF'
 <title>Zapret Manager</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%201250%201250%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27z%27%20x1=%270%27%20y1=%270%27%20x2=%270%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%2300b6ff%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%230090ff%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg%20fill=%27url%28%23z%29%27%20stroke=%27%230a0a0a%27%20stroke-width=%2722%27%20stroke-linejoin=%27miter%27%3E%3Cpolygon%20points=%27455,170%201072,118%201215,25%20688,615%2025,1235%20735,338%20262,383%27/%3E%3Cpolygon%20points=%271025,462%20722,860%201215,800%201005,1022%20315,1095%27/%3E%3C/g%3E%3C/svg%3E">
 <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%201250%201250%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27z%27%20x1=%270%27%20y1=%270%27%20x2=%270%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%2300b6ff%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%230090ff%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg%20fill=%27url%28%23z%29%27%20stroke=%27%230a0a0a%27%20stroke-width=%2722%27%20stroke-linejoin=%27miter%27%3E%3Cpolygon%20points=%27455,170%201072,118%201215,25%20688,615%2025,1235%20735,338%20262,383%27/%3E%3Cpolygon%20points=%271025,462%20722,860%201215,800%201005,1022%20315,1095%27/%3E%3C/g%3E%3C/svg%3E">
-<link rel="stylesheet" href="/zm/app.css?v=1452834946117785">
+<link rel="stylesheet" href="/zm/app.css?v=391798713407788">
 <script>
 (function(){try{var h=document.documentElement,t=null,b=null,re=/^(micro|light|dark|ink|bento|retro|depth|graphite|oled|matrix|neon|synth|noir|contrast|metro|custom)$/,bre=/^(micro|light|dark|ink|bento|retro|depth|graphite|oled|matrix|neon|synth|noir|contrast|metro)$/;function fix(v){v=String(v||'').trim();return v==='blocks'?'contrast':v==='minimal'?'micro':v;}function get(u){try{var x=new XMLHttpRequest();x.open('GET',u+'?t='+Date.now(),false);x.send(null);return x.status===200?String(x.responseText||''):'';}catch(e){return '';}}var v=fix(get('/zm/theme.txt'));if(re.test(v)){t=v;try{localStorage.setItem('zmw.theme',v);}catch(e){}}if(!t){try{t=fix(localStorage.getItem('zmw.theme')||sessionStorage.getItem('zmw.theme'));}catch(e){}}if(!re.test(t||''))t='micro';if(t==='custom'){var j=null;try{j=JSON.parse(get('/zm/look.json')||'null');}catch(e){}if(!j||!j.my){try{j=JSON.parse(localStorage.getItem('zmw.look')||'null');}catch(e){}}b=j&&j.my&&bre.test(j.my.b||'')?j.my.b:'micro';}else b=t;h.setAttribute('data-theme',b);if(/^(dark|depth|graphite|oled|matrix|neon|synth|noir|contrast)$/.test(b))h.classList.add('zm-theme-dark');}catch(e){}})();
 </script>
@@ -45081,7 +45389,7 @@ cat > '/www/zm-webui.html' << 'ZM_INSTALLER_EOF'
 <body class="zmw-body">
 <div id="zmw-root"></div>
 <noscript><p style="padding:24px;font-family:sans-serif">Для работы панели Zapret Manager нужен JavaScript.</p></noscript>
-<script src="/zm/app.js?v=1452834946117785"></script>
+<script src="/zm/app.js?v=391798713407788"></script>
 </body>
 </html>
 ZM_INSTALLER_EOF
