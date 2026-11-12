@@ -2,7 +2,7 @@
 # Modified from StressOzz/Zapret-Manager 5.064 for Forkop/NFQWS2.
 # Original project: https://github.com/StressOzz/Zapret-Manager
 read -r _ _ ZM_NEW_VER <<'ZM_VERSION_EOF'
-# Version: 5.064
+# Version: 5.064.1
 ZM_VERSION_EOF
 set -e
 
@@ -177,7 +177,7 @@ if [ "$1" = zm_watch ]; then
 fi
 
 CONF="/etc/config/zapret"
-ZM_VERSION="5.064"
+ZM_VERSION="5.064.1"
 ZM_SCRIPT_URL="https://raw.githubusercontent.com/Ra1nek/Zapret-Manager/refs/heads/main/ZapretManager_LuCI.sh"
 ZM_STATS_URL="http://89.191.225.101:8787"
 ZM_STATS_OFF="/etc/zapret-manager.nostats"
@@ -19436,6 +19436,167 @@ _fk_dnsmasq_clean() {
 	return 0
 }
 
+_hosts_add_lines() {
+	local list="$HOSTS_FILE.zmadd" add="$HOSTS_FILE.zmnew"
+	cat > "$list"
+	[ -f "$HOSTS_FILE" ] || : > "$HOSTS_FILE"
+	awk -v hf="$HOSTS_FILE" 'function n(s) { gsub(/\r/, "", s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+		BEGIN { while ((getline l < hf) > 0) have[n(l)] = 1; close(hf) }
+		{ k = n($0); if (k == "" || (k in have)) next; have[k] = 1; print }' "$list" > "$add"
+	if [ -s "$add" ]; then
+		[ -s "$HOSTS_FILE" ] && [ -n "$(tail -c 1 "$HOSTS_FILE" 2>/dev/null)" ] && echo >> "$HOSTS_FILE"
+		cat "$add" >> "$HOSTS_FILE"
+	fi
+	rm -f "$list" "$add"
+}
+
+_hosts_auto_cron() {
+	mkdir -p /etc/crontabs 2>/dev/null
+	[ -f "$CRON_FILE" ] || : > "$CRON_FILE"
+	sed -i "/$HOSTS_AUTO_TAG\$/d" "$CRON_FILE"
+	[ "$1" = on ] && echo "$(( $(date +%s) / 7 % 50 + 5 )) 4 * * * /opt/zapret-manager-luci/backend.sh hosts_auto_tick >/dev/null 2>&1 $HOSTS_AUTO_TAG" >> "$CRON_FILE"
+	/etc/init.d/cron restart >/dev/null 2>&1
+	return 0
+}
+
+_hosts_auto_put() {
+	mkdir -p "$ZM_STATE_DIR"
+	printf 'src=%s\nlast=%s\nerr=%s\n' "$1" "${2:-$(_hosts_auto_get last)}" "$3" > "$HOSTS_AUTO.t" && mv -f "$HOSTS_AUTO.t" "$HOSTS_AUTO"
+}
+
+_hosts_base_put() { mkdir -p "$ZM_STATE_DIR"; gzip -c "$1" > "$HOSTS_BASE.t" 2>/dev/null && mv -f "$HOSTS_BASE.t" "$HOSTS_BASE" || rm -f "$HOSTS_BASE.t"; }
+
+_hosts_base_src() {
+	[ -s "$HOSTS_BASE" ] || return 0
+	gunzip -c "$HOSTS_BASE" 2>/dev/null | head -n 40 > "$JOBS_DIR/hosts.bsrc.$$" 2>/dev/null
+	_hosts_src "$JOBS_DIR/hosts.bsrc.$$"
+	rm -f "$JOBS_DIR/hosts.bsrc.$$"
+}
+
+_hosts_block_status() {
+	local block="$1" content
+	content="$(_hosts_block "$block")" || return 1
+	[ -f "$HOSTS_FILE" ] || { echo false; return; }
+	printf '%s\n' "$content" | awk -v hf="$HOSTS_FILE" 'function n(s) { gsub(/\r/, "", s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+		BEGIN { while ((getline l < hf) > 0) have[n(l)] = 1; close(hf) }
+		{ k = n($0); if (k == "" || (k in seen)) next; seen[k] = 1; total++; if (k in have) found++ }
+		END { print (total > 0 && found == total) ? "true" : "false" }'
+}
+
+_hosts_blocks_dump() { local b; for b in ${1:-$HOSTS_BLOCKS}; do echo "@@ZMB $b"; _hosts_block "$b"; done; }
+
+_hosts_dns_reload() {
+	local p
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	sleep 1
+	pidof dnsmasq >/dev/null 2>&1 || { /etc/init.d/dnsmasq start >/dev/null 2>&1; sleep 1; }
+	p="$(cat "$AB_FREE_PID" 2>/dev/null)"
+	[ -n "$p" ] && kill -HUP "$p" 2>/dev/null
+	return 0
+}
+
+_hosts_extras() {
+	local b="$JOBS_DIR/hosts.base.$$" i
+	mkdir -p "$JOBS_DIR"
+	gunzip -c "$HOSTS_BASE" > "$b.raw" 2>/dev/null
+	cp -f "$b.raw" "$b.unc"
+	if [ -s "$HOSTS_ON" ]; then
+		for i in $(cat "$HOSTS_ON"); do _hosts_block "$i"; done 2>/dev/null | _hosts_hostnames > "$b.h"
+		[ -s "$b.h" ] && _hosts_unclaim "$b.unc" "$b.h"
+	fi
+	{ cat "$b.raw" "$b.unc"; _hosts_blocks_dump; } | _hosts_norm > "$b"
+	rm -f "$b.raw" "$b.unc" "$b.h"
+	awk -v B="$b" 'BEGIN { while ((getline l < B) > 0) s[l] = 1; close(B) }
+		{ sub(/\r$/, ""); k = $0; gsub(/[ \t]+/, " ", k); sub(/^ /, "", k); sub(/ $/, "", k) }
+		k != "" && k !~ /^#/ && !(k in s) && !d[k]++ { print }' "$HOSTS_FILE"
+	rm -f "$b"
+}
+
+_hosts_hostnames() { awk '{ sub(/\r$/, ""); sub(/#.*/, ""); for (i = 2; i <= NF; i++) print tolower($i) }' "$@" | sort -u; }
+
+_hosts_norm() { awk '{ gsub(/\r/, ""); gsub(/[ \t]+/, " "); sub(/^ /, ""); sub(/ $/, "") } $0 != "" && $0 !~ /^#/'; }
+
+_hosts_on_detect() {
+	local b="$JOBS_DIR/hosts.det.$$"
+	mkdir -p "$JOBS_DIR"
+	: > "$b"
+	[ "$(_hosts_base_src)" = "$(_hosts_src)" ] && gunzip -c "$HOSTS_BASE" 2>/dev/null | _hosts_norm > "$b"
+	_hosts_blocks_dump | awk -v hf="$HOSTS_FILE" -v B="$b" 'function n(s) { gsub(/\r/, "", s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+		function flush() { if (id != "" && dt > 0 && dt == df && (hd == hf2 || own > 0)) print id }
+		BEGIN { while ((getline l < hf) > 0) have[n(l)] = 1; close(hf); while ((getline l < B) > 0) base[l] = 1; close(B) }
+		/^@@ZMB / { flush(); id = substr($0, 7); dt = df = hd = hf2 = own = 0; split("", seen); next }
+		{ k = n($0); if (k == "" || (k in seen)) next; seen[k] = 1
+		  if (k ~ /^#/) { hd++; if (k in have) hf2++; next }
+		  dt++; if (k in have) { df++; if (!(k in base)) own++ } }
+		END { flush() }'
+	rm -f "$b"
+}
+
+_hosts_on_init() {
+	[ -f "$HOSTS_ON" ] && return 0
+	mkdir -p "$ZM_STATE_DIR"
+	_hosts_on_detect > "$HOSTS_ON.t" && mv -f "$HOSTS_ON.t" "$HOSTS_ON"
+}
+
+_hosts_on_set() {
+	_hosts_on_init
+	{ grep -vx "$1" "$HOSTS_ON" 2>/dev/null; [ "$2" = on ] && echo "$1"; } > "$HOSTS_ON.t"
+	mv -f "$HOSTS_ON.t" "$HOSTS_ON"
+}
+
+_hosts_on_sync() {
+	local keep="" b
+	[ -f "$HOSTS_ON" ] || return 0
+	for b in $(cat "$HOSTS_ON"); do
+		_hosts_block "$b" | awk -v hf="$HOSTS_FILE" 'function n(s) { gsub(/\r/, "", s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+			BEGIN { while ((getline l < hf) > 0) have[n(l)] = 1; close(hf) }
+			{ k = n($0); if (k == "" || k ~ /^#/) next; t++; if (k in have) f++ }
+			END { exit !(t > 0 && f == t) }' && keep="$keep $b"
+	done
+	for b in $(hosts_status | grep -o '"id":"[^"]*","enabled":true' | sed 's/"id":"\([^"]*\)".*/\1/'); do
+		case " $keep " in *" $b "*) ;; *) keep="$keep $b" ;; esac
+	done
+	printf '%s\n' $keep | grep . > "$HOSTS_ON.t"; mv -f "$HOSTS_ON.t" "$HOSTS_ON"
+}
+
+_hosts_overlay() {
+	local f="$1" ids b blk="$JOBS_DIR/hosts.ovl.$$"
+	_hosts_on_init
+	ids="$(cat "$HOSTS_ON" 2>/dev/null)"
+	[ -n "$ids" ] || return 0
+	mkdir -p "$JOBS_DIR"
+	for b in $ids; do _hosts_block "$b"; done > "$blk" 2>/dev/null
+	[ -s "$blk" ] || { rm -f "$blk"; return 0; }
+	_hosts_hostnames "$blk" > "$blk.h"
+	_hosts_unclaim "$f" "$blk.h"
+	awk -v hf="$f" 'function n(s) { gsub(/\r/, "", s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+		BEGIN { while ((getline l < hf) > 0) have[n(l)] = 1; close(hf) }
+		{ k = n($0); if (k == "" || (k in have)) next; have[k] = 1; print }' "$blk" > "$blk.add"
+	if [ -s "$blk.add" ]; then
+		[ -s "$f" ] && [ -n "$(tail -c 1 "$f" 2>/dev/null)" ] && echo >> "$f"
+		cat "$blk.add" >> "$f"
+	fi
+	rm -f "$blk" "$blk.h" "$blk.add"
+}
+
+_hosts_src_name() { case "$1" in eu) echo "GeoHide EU" ;; us) echo "GeoHide US" ;; malw) echo "dns.malw.link" ;; *) echo "$1" ;; esac; }
+
+_hosts_unclaim() {
+	local f="$1" h="$2" t="$1.unc"
+	_hosts_blocks_dump | _hosts_norm > "$t.blk"
+	awk -v H="$h" -v K="$t.blk" 'function n(s) { gsub(/\r/, "", s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+		BEGIN { while ((getline l < H) > 0) if (l != "") hn[l] = 1; close(H); while ((getline l < K) > 0) blk[l] = 1; close(K) }
+		{ line = $0; c = line; sub(/\r$/, "", c)
+		  if (c ~ /^[ \t]*#/ || c !~ /[^ \t]/ || (n(c) in blk)) { print line; next }
+		  cm = ""; if (match(c, /#/)) { cm = " " substr(c, RSTART); c = substr(c, 1, RSTART - 1) }
+		  sub(/^[ \t]+/, "", c); sub(/[ \t]+$/, "", c)
+		  m = split(c, a, /[ \t]+/); if (m < 2) { print line; next }
+		  out = a[1]; k = 0; d = 0
+		  for (i = 2; i <= m; i++) if (tolower(a[i]) in hn) d++; else { out = out " " a[i]; k++ }
+		  if (!d) print line; else if (k) print out cm }' "$f" > "$t" && mv -f "$t" "$f"
+	rm -f "$t" "$t.blk"
+}
+
 _kill_match() {
 	local p
 	for p in $(ps w | grep -F -- "$1" | grep -v -e grep -e "_kill_match" | awk '{print $1}'); do
@@ -22202,6 +22363,187 @@ do_steer_warp_own() {
 	_rb_say "Готово, свой WARP подключён"
 }
 
+hosts_auto() {
+	local src
+	case "$1" in
+		on)
+			src="$(_hosts_src)"
+			case "$src" in eu|us|malw) ;; *) echo '{"error":"сначала замените hosts на один из готовых списков выше"}'; return 1 ;; esac
+			mkdir -p "$JOBS_DIR"
+			gunzip -c "$HOSTS_BASE" > "$JOBS_DIR/hosts.chk.$$" 2>/dev/null
+			if [ "$(_hosts_src "$JOBS_DIR/hosts.chk.$$")" != "$src" ]; then
+				{ for b in $HOSTS_BLOCKS; do _hosts_block "$b"; done; } | _hosts_norm > "$JOBS_DIR/hosts.blk.$$"
+				awk -v B="$JOBS_DIR/hosts.blk.$$" 'BEGIN { while ((getline l < B) > 0) s[l] = 1; close(B) }
+					{ k = $0; gsub(/\r/, "", k); gsub(/[ \t]+/, " ", k); sub(/^ /, "", k); sub(/ $/, "", k) } !(k in s)' "$HOSTS_FILE" > "$JOBS_DIR/hosts.b0.$$"
+				_hosts_base_put "$JOBS_DIR/hosts.b0.$$"
+				rm -f "$JOBS_DIR/hosts.blk.$$" "$JOBS_DIR/hosts.b0.$$"
+			fi
+			rm -f "$JOBS_DIR/hosts.chk.$$"
+			_hosts_auto_put "$src" "" ""
+			_hosts_auto_cron on
+			logger -t zapret-manager "Hosts: список $(_hosts_src_name "$src") будет обновляться раз в сутки" ;;
+		off)
+			rm -f "$HOSTS_AUTO"
+			_hosts_auto_cron off ;;
+		*) echo '{"error":"неизвестное действие"}'; return 1 ;;
+	esac
+	hosts_status
+}
+
+hosts_auto_tick() {
+	local src cur tmp="$JOBS_DIR/hosts.auto.$$" ex="$JOBS_DIR/hosts.ex.$$" lk="$JOBS_DIR/hosts.auto.lock" r
+	src="$(_hosts_auto_get src)"
+	case "$src" in eu|us|malw) ;; *) rm -f "$HOSTS_AUTO"; _hosts_auto_cron off; return 0 ;; esac
+	mkdir -p "$JOBS_DIR"
+	mkdir "$lk" 2>/dev/null || { _zm_aged "$lk" 10 && rmdir "$lk" 2>/dev/null; return 0; }
+	cur="$(_hosts_src)"
+	if [ "$cur" != "$src" ]; then
+		rm -f "$HOSTS_AUTO" "$HOSTS_BASE"; _hosts_auto_cron off; rmdir "$lk"
+		logger -t zapret-manager "Hosts: список $(_hosts_src_name "$src") в /etc/hosts заменён вручную — ежедневное обновление выключено"
+		return 0
+	fi
+	_hosts_on_init
+	[ -s "$HOSTS_BASE" ] && _hosts_extras > "$ex"
+	r="$(ZM_HOSTS_NOAPPLY="$tmp" hosts_replace_geohide "$src" 2>/dev/null)"
+	case "$r" in
+		*'"ok":true'*) ;;
+		*)
+			_hosts_auto_put "$src" "" "$(printf '%s' "$r" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p' | head -c 200)"
+			rm -f "$tmp" "$ex"; rmdir "$lk"
+			logger -t zapret-manager "Hosts: свежий список $(_hosts_src_name "$src") не скачался — остался прежний"
+			return 1 ;;
+	esac
+	_hosts_base_put "$tmp"
+	_hosts_overlay "$tmp"
+	if [ -s "$ex" ]; then
+		[ -n "$(tail -c 1 "$tmp" 2>/dev/null)" ] && echo >> "$tmp"
+		cat "$ex" >> "$tmp"
+	fi
+	if cmp -s "$tmp" "$HOSTS_FILE"; then
+		rm -f "$tmp"
+	elif cat "$tmp" > "$HOSTS_FILE" 2>/dev/null; then
+		rm -f "$tmp"
+		_hosts_dns_reload
+		logger -t zapret-manager "Hosts: список $(_hosts_src_name "$src") обновлён$([ -s "$HOSTS_ON" ] && echo ", отмеченные сервисы ($(echo $(cat "$HOSTS_ON") | sed 's/ /, /g')) добавлены поверх")$([ -s "$ex" ] && echo ", ваши записи сохранены")"
+	else
+		rm -f "$tmp" "$ex"; rmdir "$lk"
+		_hosts_auto_put "$src" "" "не удалось записать /etc/hosts — мало места на роутере"
+		return 1
+	fi
+	rm -f "$ex"; rmdir "$lk"
+	_hosts_auto_put "$src" "$(date +%s)" ""
+	return 0
+}
+
+hosts_file_get() {
+	local sz n
+	[ -f "$HOSTS_FILE" ] || { echo '{"error":"файл hosts не найден"}'; return 1; }
+	sz="$(wc -c < "$HOSTS_FILE" | tr -d ' ')"
+	if [ "${sz:-0}" -gt "$HOSTS_EDIT_MAX" ]; then
+		n="$(wc -l < "$HOSTS_FILE" | tr -d ' ')"
+		printf '{"too_big":true,"size":%s,"lines":%s}\n' "$sz" "${n:-0}"
+		return 0
+	fi
+	printf '{"content":"%s"}\n' "$(esc_ml "$(cat "$HOSTS_FILE")")"
+}
+
+hosts_file_set() {
+	local content="$1"
+	[ -n "$content" ] || { echo '{"error":"пустой файл — сохранение отменено"}'; return 1; }
+	[ "$(printf '%s' "$content" | wc -c)" -gt "$HOSTS_EDIT_MAX" ] && { echo '{"error":"файл слишком большой для редактора"}'; return 1; }
+	cp "$HOSTS_FILE" "$HOSTS_FILE.zm-bak" 2>/dev/null
+	printf '%s\n' "$content" | tr -d '\r' > "$HOSTS_FILE.zmtmp" 2>/dev/null
+	if ! [ -s "$HOSTS_FILE.zmtmp" ] || ! cat "$HOSTS_FILE.zmtmp" > "$HOSTS_FILE" 2>/dev/null || ! cmp -s "$HOSTS_FILE.zmtmp" "$HOSTS_FILE"; then
+		rm -f "$HOSTS_FILE.zmtmp"
+		[ -s "$HOSTS_FILE.zm-bak" ] && cat "$HOSTS_FILE.zm-bak" > "$HOSTS_FILE" 2>/dev/null
+		echo '{"error":"не удалось записать /etc/hosts — проверьте свободное место на роутере"}'; return 1
+	fi
+	rm -f "$HOSTS_FILE.zmtmp"
+	_hosts_on_sync
+	_hosts_dns_reload
+	printf '{"ok":true}\n'
+}
+
+hosts_replace_geohide() {
+	local region="$1" url tmp kept
+	case "$region" in
+		eu) url="${GH_RAW}/Internet-Helper/GeoHideDNS/refs/heads/main/hosts/eu/hosts" ;;
+		us) url="${GH_RAW}/Internet-Helper/GeoHideDNS/refs/heads/main/hosts/us/hosts" ;;
+		malw) url="${GH_RAW}/ImMALWARE/dns.malw.link/refs/heads/master/hosts" ;;
+		*) echo '{"error":"неизвестный регион"}'; return 1 ;;
+	esac
+	tmp="$JOBS_DIR/geohide_hosts.tmp"
+	_zm_fetch "$url" "$tmp" 60
+	if [ ! -s "$tmp" ]; then
+		rm -f "$tmp"
+		printf '{"error":"%s"}\n' "$([ "$region" = malw ] && echo "не удалось скачать hosts dns.malw.link" || echo "не удалось скачать GeoHide hosts")"
+		return 1
+	fi
+	if [ "$(grep -cE '^[[:space:]]*[0-9a-fA-F.:]+[[:space:]]+[A-Za-z0-9]' "$tmp")" -lt 20 ]; then
+		rm -f "$tmp"
+		echo '{"error":"скачался не файл hosts — попробуйте ещё раз позже"}'
+		return 1
+	fi
+	if [ -n "$ZM_HOSTS_NOAPPLY" ]; then
+		mv -f "$tmp" "$ZM_HOSTS_NOAPPLY"
+		printf '{"ok":true,"region":"%s"}\n' "$region"
+		return 0
+	fi
+	_hosts_on_init
+	_hosts_base_put "$tmp"
+	_hosts_overlay "$tmp"
+	if ! mv "$tmp" "$HOSTS_FILE" 2>/dev/null; then
+		rm -f "$tmp"
+		echo '{"error":"не удалось записать /etc/hosts — проверьте свободное место на роутере"}'
+		return 1
+	fi
+	_hosts_dns_reload
+	[ -s "$HOSTS_AUTO" ] && _hosts_auto_put "$region" "$(date +%s)" ""
+	kept="$(grep -c . "$HOSTS_ON" 2>/dev/null)"
+	printf '{"ok":true,"region":"%s","kept":%s}\n' "$region" "${kept:-0}"
+}
+
+hosts_reset() {
+	[ -f "$HOSTS_AUTO" ] && { rm -f "$HOSTS_AUTO"; _hosts_auto_cron off; }
+	rm -f "$HOSTS_BASE"; mkdir -p "$ZM_STATE_DIR"; : > "$HOSTS_ON"
+	printf '%s\n' "127.0.0.1	localhost" "" "::1	localhost ip6-localhost ip6-loopback" "ff02::1 ip6-allnodes" "ff02::2 ip6-allrouters" > "$HOSTS_FILE"
+	_hosts_dns_reload
+	printf '{"ok":true}\n'
+}
+
+hosts_toggle() {
+	local block="$1" content enabled src h="$JOBS_DIR/hosts.tgl.$$"
+	content="$(_hosts_block "$block")" || { echo '{"error":"неизвестный блок"}'; return 1; }
+	_hosts_on_init
+	enabled="$(_hosts_block_status "$block")"
+	src="$(_hosts_src)"
+	mkdir -p "$JOBS_DIR"
+	printf '%s\n' "$content" | _hosts_hostnames > "$h"
+	if [ "$enabled" = "true" ]; then
+		printf '%s\n' "$content" | _hosts_drop_lines
+		_hosts_on_set "$block" off
+		if [ -n "$src" ] && [ "$(_hosts_base_src)" = "$src" ]; then
+			gunzip -c "$HOSTS_BASE" 2>/dev/null | awk -v H="$h" 'BEGIN { while ((getline l < H) > 0) if (l != "") hn[l] = 1; close(H) }
+				{ c = $0; sub(/\r$/, "", c); if (c ~ /^[ \t]*#/) next; sub(/#.*/, "", c); sub(/^[ \t]+/, "", c)
+				  m = split(c, a, /[ \t]+/); for (i = 2; i <= m; i++) if (tolower(a[i]) in hn) { print; next } }' > "$h.back"
+			if [ -s "$h.back" ]; then
+				cp -f "$h.back" "$h.part"
+				_hosts_unclaim "$h.part" "$h"
+				[ -s "$h.part" ] && _hosts_drop_lines < "$h.part"
+				_hosts_add_lines < "$h.back"
+			fi
+			rm -f "$h.back" "$h.part"
+		fi
+	else
+		_hosts_on_set "$block" on
+		[ -n "$src" ] && _hosts_unclaim "$HOSTS_FILE" "$h"
+		printf '%s\n' "$content" | _hosts_add_lines
+	fi
+	rm -f "$h"
+	_hosts_dns_reload
+	printf '{"ok":true,"block":"%s","enabled":%s}\n' "$(esc "$block")" "$([ "$enabled" = "true" ] && echo false || echo true)"
+}
+
 mixomo_warp_config_set() {
 	local content="$1"
 	[ -n "$content" ] || { echo '{"error":"пустая конфигурация — сохранение отменено"}'; return 1; }
@@ -24199,7 +24541,7 @@ chmod 0644 /www/luci-static/resources/view/zapret-manager/nfqws2.js
 
 mkdir -p /www/luci-static/resources/zapret-manager
 cat > /www/luci-static/resources/zapret-manager/build.txt << 'ZM_INSTALLER_EOF'
-842146273571514
+1452834946117785
 view/zapret-manager/adblock.js
 view/zapret-manager/awg.js
 view/zapret-manager/dashboard.js
@@ -25302,7 +25644,7 @@ function detectMissingThemeVar() {
 	} catch (e) {  }
 }
 
-var ZM_BUILD = '842146273571514';
+var ZM_BUILD = '1452834946117785';
 
 function cssUrl(path) {
 	return L.resource(path) + (/^[0-9]{6,}$/.test(ZM_BUILD) ? '?v=' + ZM_BUILD : '');
@@ -38088,7 +38430,7 @@ cat > '/www/zm/app.js' << 'ZM_INSTALLER_EOF'
 (function () {
 'use strict';
 
-var BUILD = '842146273571514';
+var BUILD = '1452834946117785';
 var RES = '/luci-static/resources/';
 var NULL_SID = '00000000000000000000000000000000';
 var K_SID = 'zmw.sid', K_THEME = 'zmw.theme', K_USER = 'zmw.user', K_NOTE = 'zmw.note', K_ANIM = 'zmw.anim', K_ANIMFOR = 'zmw.animfor', K_NAV = 'zmw.nav', K_LOOK = 'zmw.look';
@@ -44731,7 +45073,7 @@ cat > '/www/zm-webui.html' << 'ZM_INSTALLER_EOF'
 <title>Zapret Manager</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%201250%201250%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27z%27%20x1=%270%27%20y1=%270%27%20x2=%270%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%2300b6ff%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%230090ff%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg%20fill=%27url%28%23z%29%27%20stroke=%27%230a0a0a%27%20stroke-width=%2722%27%20stroke-linejoin=%27miter%27%3E%3Cpolygon%20points=%27455,170%201072,118%201215,25%20688,615%2025,1235%20735,338%20262,383%27/%3E%3Cpolygon%20points=%271025,462%20722,860%201215,800%201005,1022%20315,1095%27/%3E%3C/g%3E%3C/svg%3E">
 <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%201250%201250%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27z%27%20x1=%270%27%20y1=%270%27%20x2=%270%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%2300b6ff%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%230090ff%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg%20fill=%27url%28%23z%29%27%20stroke=%27%230a0a0a%27%20stroke-width=%2722%27%20stroke-linejoin=%27miter%27%3E%3Cpolygon%20points=%27455,170%201072,118%201215,25%20688,615%2025,1235%20735,338%20262,383%27/%3E%3Cpolygon%20points=%271025,462%20722,860%201215,800%201005,1022%20315,1095%27/%3E%3C/g%3E%3C/svg%3E">
-<link rel="stylesheet" href="/zm/app.css?v=842146273571514">
+<link rel="stylesheet" href="/zm/app.css?v=1452834946117785">
 <script>
 (function(){try{var h=document.documentElement,t=null,b=null,re=/^(micro|light|dark|ink|bento|retro|depth|graphite|oled|matrix|neon|synth|noir|contrast|metro|custom)$/,bre=/^(micro|light|dark|ink|bento|retro|depth|graphite|oled|matrix|neon|synth|noir|contrast|metro)$/;function fix(v){v=String(v||'').trim();return v==='blocks'?'contrast':v==='minimal'?'micro':v;}function get(u){try{var x=new XMLHttpRequest();x.open('GET',u+'?t='+Date.now(),false);x.send(null);return x.status===200?String(x.responseText||''):'';}catch(e){return '';}}var v=fix(get('/zm/theme.txt'));if(re.test(v)){t=v;try{localStorage.setItem('zmw.theme',v);}catch(e){}}if(!t){try{t=fix(localStorage.getItem('zmw.theme')||sessionStorage.getItem('zmw.theme'));}catch(e){}}if(!re.test(t||''))t='micro';if(t==='custom'){var j=null;try{j=JSON.parse(get('/zm/look.json')||'null');}catch(e){}if(!j||!j.my){try{j=JSON.parse(localStorage.getItem('zmw.look')||'null');}catch(e){}}b=j&&j.my&&bre.test(j.my.b||'')?j.my.b:'micro';}else b=t;h.setAttribute('data-theme',b);if(/^(dark|depth|graphite|oled|matrix|neon|synth|noir|contrast)$/.test(b))h.classList.add('zm-theme-dark');}catch(e){}})();
 </script>
@@ -44739,7 +45081,7 @@ cat > '/www/zm-webui.html' << 'ZM_INSTALLER_EOF'
 <body class="zmw-body">
 <div id="zmw-root"></div>
 <noscript><p style="padding:24px;font-family:sans-serif">Для работы панели Zapret Manager нужен JavaScript.</p></noscript>
-<script src="/zm/app.js?v=842146273571514"></script>
+<script src="/zm/app.js?v=1452834946117785"></script>
 </body>
 </html>
 ZM_INSTALLER_EOF
